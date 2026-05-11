@@ -623,6 +623,29 @@ class RelationalAggregationTarget:
         self.predicate_func = predicate_func
         self.target_type = TaskType.RELATIONAL_AGGREGATION_PREDICTION
 
+    def compute_aggregated_value(self, instance_graph: InstanceGraph) -> float:
+        """Compute the raw aggregated value for this target, without applying the predicate.
+
+        Useful for callers that want to choose a data-driven threshold (e.g. the
+        median of aggregated values) instead of the predicate's hard-coded one.
+
+        Parameters
+        ----------
+        instance_graph : InstanceGraph
+            The instance graph to extract data from.
+
+        Returns
+        -------
+        float
+            The aggregated value (``0`` if the target record set is empty).
+        """
+        target_records = self.target_node_set.get_records(instance_graph)
+        if target_records.empty:
+            return 0
+        return AggregationProcessor.apply_aggregation(
+            target_records, self.aggregation_column, self.aggregation_func
+        )
+
     def compute_label(self, instance_graph: InstanceGraph) -> bool:
         """
         Apply aggregation and predicate to target nodes.
@@ -637,20 +660,8 @@ class RelationalAggregationTarget:
         bool
             The label after applying aggregation and predicate
         """
-        # Get target records
-        target_records = self.target_node_set.get_records(instance_graph)
-        if target_records.empty:
-            aggregated_value = 0
-            # raise ValueError(f"No records found for table {self.target_node_set.table_name}")
-        else:
-            # Apply aggregation
-            aggregated_value = AggregationProcessor.apply_aggregation(
-                target_records, self.aggregation_column, self.aggregation_func
-            )
-
-        # Apply predicate
+        aggregated_value = self.compute_aggregated_value(instance_graph)
         label = int(self.predicate_func.apply(aggregated_value))
-
         return label
 
     def __repr__(self):

@@ -131,9 +131,7 @@ class TableGenerationSchema:
         masks: Dict = None,
     ):
         self.table_name = table_name
-        self.generation_type = (
-            generation_type  # "self_generated", "parent_based", "timestamp_based"
-        )
+        self.generation_type = generation_type  # "self_generated" | "parent_based"
         self.parent_tables = parent_tables or []
         self.uses_timestamp = uses_timestamp
         self.eta = eta
@@ -1140,37 +1138,20 @@ class TableGenerator:
         self.pending_fk_ids: torch.Tensor | None = None
         self.pending_parent_tables: List[str] | None = None
 
+        # HSBM FK generation config
+        self.hsbm_num_levels: int = 1
+        self.hsbm_clusters_per_level: int = 1
+
     def init_table_SCM(
         self,
         **kwargs: Dict[str, Any],
-        # seq_len: int,
-        # num_layers: int,
-        # hidden_dim: int,
-        # num_outputs: int,
-        # num_causes: int,
-        # mlp_activations: nn.Module,
-        # other_causes: int,
-        # sampling_ratio: float,
-        # masks: Dict[str, int],
-        # device: str,
-        # use_timestamp_sampling: bool = False,
-        # eta: float = 1.0,
     ) -> None:
+        # Extract and store HSBM config before passing to MLPSCM
+        self.hsbm_num_levels = kwargs.pop("hsbm_num_levels", 1)
+        self.hsbm_clusters_per_level = kwargs.pop("hsbm_clusters_per_level", 1)
+
         self.table_SCM = MLPSCM(
             **kwargs,
-            # seq_len=seq_len,
-            # num_layers=num_layers,
-            # hidden_dim=hidden_dim,
-            # num_outputs=num_outputs,
-            # num_causes=num_causes,
-            # mlp_activations=mlp_activations,
-            # other_causes=other_causes,
-            # sampling_ratio=sampling_ratio,
-            # masks=masks,
-            # device=device,
-            # use_timestamp_sampling=use_timestamp_sampling,
-            # # Enhanced sampling parameters
-            # eta=eta,
         )
 
         # Store the actual generated indices from the SCM (not the input mask numbers)
@@ -1182,44 +1163,59 @@ class TableGenerator:
             )
             self.mask_idx_dict[mask_key] = indices
 
+    def _compute_hsbm_fk_ids(
+        self,
+        fk_seed: int,
+        parent_data_list: list,
+    ) -> torch.Tensor:
+        """Compute FK connections via HSBM for each parent table.
+
+        Returns tensor of shape ``(child_rows, num_parents)``.
+        """
+        from src.prior.hsbm import compute_hsbm_fk_ids  # noqa: PLC0415
+
+        child_rows = self.num_rows
+        fk_ids_list = []
+        for parent_data in parent_data_list:
+            parent_rows = parent_data[MASK_TYPE.FULL].shape[0]
+            # Row-count-aware clipping: max leaf blocks must fit in both sides
+            max_leaf = self.hsbm_clusters_per_level ** self.hsbm_num_levels
+            if max_leaf > min(parent_rows, child_rows):
+                # Reduce levels until clusters fit
+                num_levels = self.hsbm_num_levels
+                while num_levels > 0 and self.hsbm_clusters_per_level ** num_levels > min(parent_rows, child_rows):
+                    num_levels -= 1
+                num_levels = max(num_levels, 1)
+            else:
+                num_levels = self.hsbm_num_levels
+            hierarchy_a = [self.hsbm_clusters_per_level] * num_levels
+            hierarchy_b = [self.hsbm_clusters_per_level] * num_levels
+            fk_ids = compute_hsbm_fk_ids(
+                parent_rows, child_rows, hierarchy_a, hierarchy_b, seed=fk_seed,
+            )
+            fk_ids_list.append(fk_ids)
+        return torch.tensor(np.array(fk_ids_list).T, device=self.device).long()
+
     def generate_data(self, **kwargs) -> torch.Tensor:
-        # currently, only support parent_data_list
         with torch.no_grad():
             if "parent_data_list" in kwargs:
                 parent_data_list = kwargs["parent_data_list"]
+                fk_ids = self._compute_hsbm_fk_ids(
+                    fk_seed=kwargs.get("fk_seed", 0),
+                    parent_data_list=parent_data_list,
+                )
+                X, FK_ids, outputs_flat = self.table_SCM.forward_with_input(
+                    parent_data_list, fk_ids
+                )
 
-                # Check if we should use timestamp-based sampling
-                if (
-                    hasattr(self.table_SCM, "use_timestamp_sampling")
-                    and self.table_SCM.use_timestamp_sampling
-                ):
-                    # print("Using enhanced temporal sampling")
-                    # Always use enhanced temporal sampling when timestamps are enabled
-                    X, FK_ids, outputs_flat = (
-                        self.table_SCM.forward_with_enhanced_temporal_sampling(
-                            parent_data_list
-                        )
-                    )
-                else:
-                    # print("Using Plain Parent method")
-                    # Use original method
-                    X, FK_ids, outputs_flat = self.table_SCM.forward_with_input(
-                        parent_data_list
-                    )
-
-                # Save full SCM outputs and all masked outputs
                 self.all_scm_outputs = X.copy()
 
-                # Return the full X dict (includes TIMESTAMP if available)
                 return X, FK_ids
             else:
-                # print("Using Non-parent method")
                 X, outputs_flat = self.table_SCM.forward_without_input()
 
-                # Save full SCM outputs and all masked outputs
                 self.all_scm_outputs = X.copy()
 
-                # Return the full X dict
                 return X
 
     def cache_pending_outputs(
@@ -1300,6 +1296,9 @@ class RDB:
         self.table_generation_schemas: Dict[str, TableGenerationSchema] = {}
         self.task_generation_schemas: List[TaskGenerationSchema] = []
         self.row_gnn_runner: RowGNNRunner | None = None
+        # Optional: ``{"prob", "time_dim", "time_embed_mode"}`` from DAG generator YAML.
+        self.timestamp_config: Dict[str, Any] = {}
+        self._seed: int = 0
 
     def add_table(self, table_name: str, table: Table) -> None:
         """
@@ -1476,6 +1475,7 @@ class RDB:
         """
         if self.graph is None:
             self.convert_to_graph()
+        self._seed = seed
         hpsampler = HpSamplerList(DEFAULT_SAMPLED_HP, device=self.device, seed=seed)
 
         for table_name in nx.topological_sort(self.graph):
@@ -1488,13 +1488,6 @@ class RDB:
             # num_causes = 10  # Set to 10 for now
             masks = {MASK_TYPE.X: table.num_features}
 
-            # Check if we should use timestamp-based sampling
-            # based on whether the table has a timestamp column
-            if table.is_time_table:
-                use_timestamp_sampling = True
-            else:
-                use_timestamp_sampling = False
-
             if parent_tables:
                 other_causes = np.sum(
                     [
@@ -1502,23 +1495,22 @@ class RDB:
                         for parent_table in parent_tables
                     ]
                 )
-                masks[MASK_TYPE.EDGE_PROB] = 1
-
-                # Add timestamp mask for timestamp-based sampling
-                if use_timestamp_sampling:
-                    sampling_ratio = 1.0  # Set to 1 for now
-                    masks[MASK_TYPE.TIMESTAMP] = 1
-                else:
-                    sampling_ratio = 10.0  # Set to 10 for now
+                sampling_ratio = 1.0
             else:
                 other_causes = 0
                 sampling_ratio = 1.0
 
-            # Determine generation type
+            ts_cfg = getattr(self, "timestamp_config", {}) or {}
+            if table.is_time_table:
+                base_time_dim = int(ts_cfg.get("time_dim", 8))
+                base_time_embed_mode = str(ts_cfg.get("time_embed_mode", "fourier"))
+            else:
+                base_time_dim = 0
+                base_time_embed_mode = "raw"
+
+            # Determine generation type (timestamp tables remain parent_based or self_generated)
             if len(parent_tables) == 0:
                 generation_type = "self_generated"
-            elif use_timestamp_sampling:
-                generation_type = "timestamp_based"
             else:
                 generation_type = "parent_based"
 
@@ -1532,11 +1524,11 @@ class RDB:
             # 2nd dict: base parameters (without masks)
             base_params = {
                 "seq_len": seq_len,
-                # "num_outputs": num_outputs,
-                # "num_causes": num_causes,
                 "other_causes": other_causes,
                 "sampling_ratio": sampling_ratio,
-                "use_timestamp_sampling": use_timestamp_sampling,
+                "use_timestamp_sampling": False,
+                "time_dim": base_time_dim,
+                "time_embed_mode": base_time_embed_mode,
             }
 
             # 3rd dict: combine sampled and base parameters
@@ -1557,7 +1549,7 @@ class RDB:
                 table_name=table_name,
                 generation_type=generation_type,
                 parent_tables=parent_tables,
-                uses_timestamp=use_timestamp_sampling,
+                uses_timestamp=table.is_time_table,
                 eta=combined_params["eta"],
                 num_parents=len(parent_tables),
                 is_timestamp_table=table.is_time_table,
@@ -1586,9 +1578,9 @@ class RDB:
                 # Use all SCM outputs instead of just latent embeddings
                 parent_data = self.table_generators[parent_table].all_scm_outputs
                 parent_data_list.append(parent_data)
-            # Returns X_dict (dict with TIMESTAMP if available), FK_ids
+            fk_seed = hash((self._seed, table_name)) & 0x7FFFFFFF
             X_dict, FK_ids = table_generator.generate_data(
-                parent_data_list=parent_data_list
+                parent_data_list=parent_data_list, fk_seed=fk_seed,
             )
         else:
             # Returns X_dict (dict)

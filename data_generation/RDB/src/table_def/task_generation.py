@@ -6,6 +6,7 @@ This module defines Task classes and utilities for generating prediction tasks
 on RDB tables. Currently supports single-table column prediction tasks.
 """
 
+import math
 import os
 import random
 import numpy as np
@@ -404,32 +405,101 @@ class TaskDataGenerator:
         key_table_name: str,
         key_table: Table,
         num_samples: int = 10,
-    ) -> Dict:
+        max_retries: int = 5,
+    ) -> Optional[pd.DataFrame]:
+        """Generate instance graphs and compute labels for a task.
+
+        For :class:`RelationalAggregationTarget` tasks, labels are prone to
+        collapsing to a single value when the predicate's hard-coded threshold
+        does not match the empirical distribution of the aggregated values.
+        To avoid discarding otherwise-valid tasks, this method:
+
+        1. First collects the raw aggregated value per instance graph.
+        2. Uses the **median** of those values as the predicate threshold, so
+           that ~50/50 positive/negative labels are produced whenever the
+           aggregated distribution has at least two distinct values.
+        3. Retries with a freshly sampled ``(aggregation_column,
+           aggregation_func, predicate_func)`` recipe when labels still
+           collapse, up to ``max_retries`` times.
         """
-        Generate instance graphs and compute labels for a task.
-        """
-        # random select some idx from key_table
         assert num_samples <= key_table.dataframe.shape[0]
         idx = random.sample(range(key_table.dataframe.shape[0]), num_samples)
         combined_df = key_table.dataframe.iloc[idx]
-        removed_idx = []
-        labels = []
+
+        # Build instance graphs once; reuse them across retries.
+        instance_graphs: List[Tuple[int, InstanceGraph]] = []
         for i in idx:
-            instance_graph = InstanceGraph(
-                FocalEntity(key_table_name, i), task.schema_graph
+            ig = InstanceGraph(FocalEntity(key_table_name, i), task.schema_graph)
+            ig.generate(self.rdb)
+            instance_graphs.append((i, ig))
+
+        target_computation = task.target_computation
+        is_agg = isinstance(target_computation, RelationalAggregationTarget)
+
+        for attempt in range(max_retries + 1):
+            removed_idx: List[int] = []
+            labels: List[Any] = []
+
+            if is_agg:
+                # Pass 1: collect raw aggregated values without applying predicate.
+                raw_values: List[float] = []
+                for i, ig in instance_graphs:
+                    try:
+                        v = target_computation.compute_aggregated_value(ig)
+                    except Exception:
+                        v = None
+                    if v is None:
+                        removed_idx.append(i)
+                        continue
+                    v = float(v)
+                    if not math.isfinite(v):
+                        removed_idx.append(i)
+                        continue
+                    raw_values.append(v)
+
+                if len(raw_values) >= 2 and len(set(raw_values)) > 1:
+                    threshold = float(np.median(raw_values))
+                    # Replace with a fresh PredicateFunction instance to avoid
+                    # mutating the shared entries inside ``PredicateFunctionList``.
+                    target_computation.predicate_func = PredicateFunction(
+                        target_computation.predicate_func.operator, threshold
+                    )
+                    labels = [
+                        int(target_computation.predicate_func.apply(v))
+                        for v in raw_values
+                    ]
+            else:
+                for i, ig in instance_graphs:
+                    label = target_computation.compute_label(ig)
+                    if label is None:
+                        removed_idx.append(i)
+                        continue
+                    labels.append(label)
+
+            if len(labels) > 0 and len(set(labels)) > 1:
+                result = combined_df.drop(removed_idx)
+                result[task.real_name_for_target_column] = labels
+                return result
+
+            # Degenerate labels. Only aggregation tasks can be retried with
+            # a different recipe; direct-attribute tasks have no knobs to tweak.
+            if not is_agg or attempt == max_retries:
+                return None
+
+            target_table = self.rdb.tables[
+                target_computation.target_node_set.table_name
+            ]
+            float_cols = target_table.get_feature_columns(only_float=True)
+            if not float_cols:
+                return None
+            target_computation.aggregation_column = random.choice(float_cols)
+            target_computation.aggregation_func = random.choice(AggregationFunctionList)
+            template = random.choice(PredicateFunctionList)
+            target_computation.predicate_func = PredicateFunction(
+                template.operator, template.threshold
             )
-            instance_graph.generate(self.rdb)
-            label = task.target_computation.compute_label(instance_graph)
-            if label is None:
-                removed_idx.append(i)
-                continue
-            labels.append(label)
-        # check if all labels are the same
-        if len(set(labels)) == 1:
-            return None
-        combined_df = combined_df.drop(removed_idx)
-        combined_df[task.real_name_for_target_column] = labels
-        return combined_df
+
+        return None
 
     def combine_features_and_labels(
         self,
