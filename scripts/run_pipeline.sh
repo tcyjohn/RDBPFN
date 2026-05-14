@@ -157,7 +157,9 @@ pixi run torchrun \
     --nproc_per_node=2 \
     run_train.py \
     --config-name=RDBPFN_hsbm_test \
-    "train.datasets.0.path=pretrain_datasets/${RUN_NAME}.h5"
+    "train.datasets.0.path=pretrain_datasets/${RUN_NAME}.h5" \
+    "train.save_model_path=checkpoints/${RUN_NAME}/model.pt" \
+    "wandb.run_name=${RUN_NAME}"
 
 echo ""
 echo "╔══════════════════════════════════════════════════╗"
