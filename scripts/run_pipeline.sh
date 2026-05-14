@@ -1,10 +1,21 @@
 #!/bin/bash
 # Full pipeline: data generation → preprocessing → merge to h5 → training
-# Usage: bash scripts/run_pipeline.sh [num_rdbs] [start_index] [skip_gen] [skip_preprocess]
+# Usage: bash scripts/run_pipeline.sh [num_rdbs] [start_index] [run_name] [skip_gen] [skip_preprocess]
 #   num_rdbs: number of RDBs to generate (default: 4)
 #   start_index: starting index (default: 0)
+#   run_name: output subdirectory name (default: auto-generated with timestamp, e.g. "run_20260515_003000")
 #   skip_gen: "true" to skip data generation (default: false)
 #   skip_preprocess: "true" to skip preprocessing (default: false)
+#
+# Output layout:
+#   data_generation/RDB_datasets/<run_name>/          raw 4DBInfer data
+#   data_generation/RDB_datasets/<run_name>-processed/  DFS-preprocessed data
+#   model_pretrain/pretrain_datasets/<run_name>.h5       merged training data
+#
+# Examples:
+#   bash scripts/run_pipeline.sh                        # quick test (4 RDBs, timestamped name)
+#   bash scripts/run_pipeline.sh 128 0 my_experiment    # production run
+#   bash scripts/run_pipeline.sh 4 0 my_run false true  # gen only, skip preprocess
 
 set -euo pipefail
 
@@ -14,15 +25,16 @@ ROOT="$(dirname "$SCRIPT_DIR")"
 # --- Config ---
 NUM_RDBS="${1:-4}"
 START_INDEX="${2:-0}"
-SKIP_GEN="${3:-false}"
-SKIP_PREPROCESS="${4:-false}"
+RUN_NAME="${3:-run_$(date +%Y%m%d_%H%M%S)}"
+SKIP_GEN="${4:-false}"
+SKIP_PREPROCESS="${5:-false}"
 END_INDEX=$((START_INDEX + NUM_RDBS))
 
 RDB_GEN_DIR="${ROOT}/data_generation/RDB"
-RAW_OUTPUT_DIR="${ROOT}/data_generation/RDB_datasets/pipeline_test"
+RAW_OUTPUT_DIR="${ROOT}/data_generation/RDB_datasets/${RUN_NAME}"
 TMP_DIR="${RAW_OUTPUT_DIR}-tmp"
 PROCESSED_DIR="${RAW_OUTPUT_DIR}-processed"
-H5_OUTPUT="${ROOT}/model_pretrain/pretrain_datasets/pipeline_test.h5"
+H5_OUTPUT="${ROOT}/model_pretrain/pretrain_datasets/${RUN_NAME}.h5"
 
 PREPROCESS_SCRIPT="${ROOT}/data_preprocessing/run_preprocess.py"
 MERGE_SCRIPT="${ROOT}/data_preprocessing/merge_dbinfer_to_h5.py"
@@ -38,11 +50,12 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export HF_ENDPOINT="https://hf-mirror.com"
 
 echo "╔══════════════════════════════════════════════════╗"
-echo "║     RDBPFN Full Pipeline (Test Mode)             ║"
+echo "║     RDBPFN Full Pipeline                         ║"
 echo "╠══════════════════════════════════════════════════╣"
+echo "║ Run : ${RUN_NAME}"
 echo "║ RDBs: ${NUM_RDBS} (indices ${START_INDEX}-$((END_INDEX - 1)))"
-echo "║ Output: ${RAW_OUTPUT_DIR}"
-echo "║ H5: ${H5_OUTPUT}"
+echo "║ Raw : ${RAW_OUTPUT_DIR}"
+echo "║ H5  : ${H5_OUTPUT}"
 echo "╚══════════════════════════════════════════════════╝"
 echo ""
 
@@ -144,7 +157,7 @@ pixi run torchrun \
     --nproc_per_node=2 \
     run_train.py \
     --config-name=RDBPFN_hsbm_test \
-    "train.datasets.0.path=pretrain_datasets/pipeline_test.h5"
+    "train.datasets.0.path=pretrain_datasets/${RUN_NAME}.h5"
 
 echo ""
 echo "╔══════════════════════════════════════════════════╗"
