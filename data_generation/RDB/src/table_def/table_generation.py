@@ -1249,15 +1249,26 @@ class TableGenerator:
         with torch.no_grad():
             if "parent_data_list" in kwargs:
                 parent_data_list = kwargs["parent_data_list"]
-                parent_names = kwargs.get("parent_names", None)
-                fk_ids = self._compute_hsbm_fk_ids(
-                    fk_seed=kwargs.get("fk_seed", 0),
-                    parent_data_list=parent_data_list,
-                    parent_names=parent_names,
-                )
-                X, FK_ids, outputs_flat = self.table_SCM.forward_with_input(
-                    parent_data_list, fk_ids
-                )
+
+                if (
+                    hasattr(self.table_SCM, "use_timestamp_sampling")
+                    and self.table_SCM.use_timestamp_sampling
+                ):
+                    X, FK_ids, outputs_flat = (
+                        self.table_SCM.forward_with_enhanced_temporal_sampling(
+                            parent_data_list
+                        )
+                    )
+                else:
+                    parent_names = kwargs.get("parent_names", None)
+                    fk_ids = self._compute_hsbm_fk_ids(
+                        fk_seed=kwargs.get("fk_seed", 0),
+                        parent_data_list=parent_data_list,
+                        parent_names=parent_names,
+                    )
+                    X, FK_ids, outputs_flat = self.table_SCM.forward_with_input(
+                        parent_data_list, fk_ids
+                    )
 
                 self.all_scm_outputs = X.copy()
 
@@ -1347,8 +1358,6 @@ class RDB:
         self.table_generation_schemas: Dict[str, TableGenerationSchema] = {}
         self.task_generation_schemas: List[TaskGenerationSchema] = []
         self.row_gnn_runner: RowGNNRunner | None = None
-        # Optional: ``{"prob", "time_dim", "time_embed_mode"}`` from DAG generator YAML.
-        self.timestamp_config: Dict[str, Any] = {}
         self._seed: int = 0
 
     def add_table(self, table_name: str, table: Table) -> None:
@@ -1556,17 +1565,16 @@ class RDB:
                 other_causes = 0
                 sampling_ratio = 1.0
 
-            ts_cfg = getattr(self, "timestamp_config", {}) or {}
             if table.is_time_table:
-                base_time_dim = int(ts_cfg.get("time_dim", 8))
-                base_time_embed_mode = str(ts_cfg.get("time_embed_mode", "fourier"))
+                use_timestamp_sampling = True
             else:
-                base_time_dim = 0
-                base_time_embed_mode = "raw"
+                use_timestamp_sampling = False
 
-            # Determine generation type (timestamp tables remain parent_based or self_generated)
+            # Determine generation type
             if len(parent_tables) == 0:
                 generation_type = "self_generated"
+            elif use_timestamp_sampling:
+                generation_type = "timestamp_based"
             else:
                 generation_type = "parent_based"
 
@@ -1591,9 +1599,7 @@ class RDB:
                 "seq_len": seq_len,
                 "other_causes": other_causes,
                 "sampling_ratio": sampling_ratio,
-                "use_timestamp_sampling": False,
-                "time_dim": base_time_dim,
-                "time_embed_mode": base_time_embed_mode,
+                "use_timestamp_sampling": use_timestamp_sampling,
             }
 
             # 3rd dict: combine sampled and base parameters
