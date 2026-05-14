@@ -187,15 +187,6 @@ DEFAULT_SAMPLED_HP = {
         "round": False,
         "lower_bound": 0.0,
     },
-    # HSBM FK generation (replaces Selective SCM)
-    "hsbm_num_levels": {
-        "distribution": "meta_choice",
-        "choice_values": [1, 2, 3, 4, 5],
-    },
-    "hsbm_clusters_per_level": {
-        "distribution": "meta_choice",
-        "choice_values": [1, 2, 3],
-    },
     # --- Deprecated: kept for backward compat, ignored by HSBM path ---
     "parent_sampling_dist": {
         "distribution": "meta_choice",
@@ -205,5 +196,18 @@ DEFAULT_SAMPLED_HP = {
         "distribution": "uniform",
         "max": 2.0,
         "min": 1.1,
+    },
+}
+
+
+# HSBM FK generation hyperparameters — sampled per parent relation independently.
+DEFAULT_HSBM_HP = {
+    "hsbm_num_levels": {
+        "distribution": "meta_choice",
+        "choice_values": [1, 2, 3, 4, 5],
+    },
+    "hsbm_clusters_per_level": {
+        "distribution": "meta_choice",
+        "choice_values": [1, 2, 3],
     },
 }

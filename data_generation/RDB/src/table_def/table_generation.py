@@ -29,7 +29,7 @@ from src.table_def.dataset_meta import (
     DTYPE_EXTRA_FIELDS,
 )
 from src.prior.hp_sampling import HpSamplerList
-from src.prior.prior_config import DEFAULT_SAMPLED_HP
+from src.prior.prior_config import DEFAULT_SAMPLED_HP, DEFAULT_HSBM_HP
 
 
 # Utility functions for robust data preprocessing
@@ -129,6 +129,7 @@ class TableGenerationSchema:
         is_timestamp_table: bool = False,
         scm_params: Dict = None,
         masks: Dict = None,
+        hsbm_per_parent: Dict[str, Dict[str, int]] = None,
     ):
         self.table_name = table_name
         self.generation_type = generation_type  # "self_generated" | "parent_based"
@@ -139,6 +140,7 @@ class TableGenerationSchema:
         self.is_timestamp_table = is_timestamp_table
         self.scm_params = scm_params or {}
         self.masks = masks or {}
+        self.hsbm_per_parent = hsbm_per_parent or {}
 
     def to_dict(self) -> Dict:
         """Convert to dictionary for YAML serialization."""
@@ -152,6 +154,7 @@ class TableGenerationSchema:
             "is_timestamp_table": self.is_timestamp_table,
             "scm_params": self.scm_params,
             "masks": self.masks,
+            "hsbm_per_parent": self.hsbm_per_parent,
         }
 
 
@@ -1138,17 +1141,22 @@ class TableGenerator:
         self.pending_fk_ids: torch.Tensor | None = None
         self.pending_parent_tables: List[str] | None = None
 
-        # HSBM FK generation config
-        self.hsbm_num_levels: int = 1
-        self.hsbm_clusters_per_level: int = 1
+        # HSBM FK generation config — per parent relation.
+        # key = parent_table_name, value = sampled parameter value.
+        self.hsbm_num_levels: Dict[str, int] = {}
+        self.hsbm_clusters_per_level: Dict[str, int] = {}
 
     def init_table_SCM(
         self,
+        hsbm_per_parent: Dict[str, Dict[str, int]] | None = None,
         **kwargs: Dict[str, Any],
     ) -> None:
-        # Extract and store HSBM config before passing to MLPSCM
-        self.hsbm_num_levels = kwargs.pop("hsbm_num_levels", 1)
-        self.hsbm_clusters_per_level = kwargs.pop("hsbm_clusters_per_level", 1)
+        if hsbm_per_parent:
+            for parent_name, params in hsbm_per_parent.items():
+                self.hsbm_num_levels[parent_name] = params["hsbm_num_levels"]
+                self.hsbm_clusters_per_level[parent_name] = params[
+                    "hsbm_clusters_per_level"
+                ]
 
         self.table_SCM = MLPSCM(
             **kwargs,
@@ -1163,46 +1171,89 @@ class TableGenerator:
             )
             self.mask_idx_dict[mask_key] = indices
 
+    @staticmethod
+    def _clip_hierarchy(
+        num_levels: int,
+        clusters_per_level: int,
+        parent_rows: int,
+        child_rows: int,
+    ) -> tuple[int, list[int]]:
+        """Row-count-aware clipping: max leaf blocks must fit in both sides."""
+        max_leaf = clusters_per_level ** num_levels
+        if max_leaf > min(parent_rows, child_rows):
+            while num_levels > 0 and clusters_per_level ** num_levels > min(
+                parent_rows, child_rows
+            ):
+                num_levels -= 1
+            num_levels = max(num_levels, 1)
+        hierarchy = [clusters_per_level] * num_levels
+        return num_levels, hierarchy
+
     def _compute_hsbm_fk_ids(
         self,
         fk_seed: int,
         parent_data_list: list,
+        parent_names: list[str] | None = None,
     ) -> torch.Tensor:
-        """Compute FK connections via HSBM for each parent table.
+        """Compute FK connections via HSBM.
+
+        Single parent: uses ``compute_hsbm_fk_ids`` directly.
+        Multiple parents: uses ``compute_hsbm_fk_ids_multi`` with a shared
+        latent cluster path for joint tuple sampling.
 
         Returns tensor of shape ``(child_rows, num_parents)``.
         """
-        from src.prior.hsbm import compute_hsbm_fk_ids  # noqa: PLC0415
+        from src.prior.hsbm import compute_hsbm_fk_ids, compute_hsbm_fk_ids_multi  # noqa: PLC0415
 
         child_rows = self.num_rows
-        fk_ids_list = []
-        for parent_data in parent_data_list:
-            parent_rows = parent_data[MASK_TYPE.FULL].shape[0]
-            # Row-count-aware clipping: max leaf blocks must fit in both sides
-            max_leaf = self.hsbm_clusters_per_level ** self.hsbm_num_levels
-            if max_leaf > min(parent_rows, child_rows):
-                # Reduce levels until clusters fit
-                num_levels = self.hsbm_num_levels
-                while num_levels > 0 and self.hsbm_clusters_per_level ** num_levels > min(parent_rows, child_rows):
-                    num_levels -= 1
-                num_levels = max(num_levels, 1)
-            else:
-                num_levels = self.hsbm_num_levels
-            hierarchy_a = [self.hsbm_clusters_per_level] * num_levels
-            hierarchy_b = [self.hsbm_clusters_per_level] * num_levels
+        num_parents = len(parent_data_list)
+
+        # Collect per-parent sizes and clipped hierarchies
+        parent_sizes = []
+        hierarchies_parent = []
+        for i, parent_data in enumerate(parent_data_list):
+            parent_rows_val = parent_data[MASK_TYPE.FULL].shape[0]
+            parent_sizes.append(parent_rows_val)
+            pname = parent_names[i] if parent_names and i < len(parent_names) else str(i)
+            nlv = self.hsbm_num_levels.get(pname, 1)
+            cpl = self.hsbm_clusters_per_level.get(pname, 1)
+            _, hierarchy_a = self._clip_hierarchy(nlv, cpl, parent_rows_val, child_rows)
+            hierarchies_parent.append(hierarchy_a)
+
+        if num_parents == 1:
+            # Single parent: use original path (backward compatible)
             fk_ids = compute_hsbm_fk_ids(
-                parent_rows, child_rows, hierarchy_a, hierarchy_b, seed=fk_seed,
+                size_a=parent_sizes[0],
+                size_b=child_rows,
+                hierarchy_a=hierarchies_parent[0],
+                hierarchy_b=hierarchies_parent[0],
+                seed=fk_seed,
             )
-            fk_ids_list.append(fk_ids)
-        return torch.tensor(np.array(fk_ids_list).T, device=self.device).long()
+            return torch.tensor(fk_ids, device=self.device).long().unsqueeze(-1)
+
+        # Multi-parent joint sampling with shared latent cluster path.
+        # Child-side cluster is sampled at max depth; each parent reads its prefix.
+        max_levels = max(len(h) for h in hierarchies_parent)
+        hierarchy_child = max(hierarchies_parent, key=len)
+
+        fk_ids_np = compute_hsbm_fk_ids_multi(
+            parent_sizes=parent_sizes,
+            child_size=child_rows,
+            hierarchies_parent=hierarchies_parent,
+            hierarchy_child=hierarchy_child,
+            seed=fk_seed,
+        )
+        return torch.tensor(fk_ids_np, device=self.device).long()
 
     def generate_data(self, **kwargs) -> torch.Tensor:
         with torch.no_grad():
             if "parent_data_list" in kwargs:
                 parent_data_list = kwargs["parent_data_list"]
+                parent_names = kwargs.get("parent_names", None)
                 fk_ids = self._compute_hsbm_fk_ids(
                     fk_seed=kwargs.get("fk_seed", 0),
                     parent_data_list=parent_data_list,
+                    parent_names=parent_names,
                 )
                 X, FK_ids, outputs_flat = self.table_SCM.forward_with_input(
                     parent_data_list, fk_ids
@@ -1477,6 +1528,11 @@ class RDB:
             self.convert_to_graph()
         self._seed = seed
         hpsampler = HpSamplerList(DEFAULT_SAMPLED_HP, device=self.device, seed=seed)
+        hsbm_sampler = HpSamplerList(
+            DEFAULT_HSBM_HP,
+            device=self.device,
+            seed=hash((seed, "hsbm")) & 0x7FFFFFFF,
+        )
 
         for table_name in nx.topological_sort(self.graph):
             table = self.tables[table_name]
@@ -1515,11 +1571,20 @@ class RDB:
                 generation_type = "parent_based"
 
             # Create and store table generation schema
-            # 1st dict: sampled parameters from hpsampling
+            # 1st dict: sampled parameters from hpsampling (SCM only, no HSBM)
             sampled_scm = hpsampler.sample()
             sampled_scm_params = {
                 k: v() if callable(v) else v for k, v in sampled_scm.items()
             }
+
+            # HSBM parameters sampled per parent relation
+            hsbm_per_parent: Dict[str, Dict[str, int]] = {}
+            for parent_name in parent_tables:
+                hsbm_sample = hsbm_sampler.sample()
+                hsbm_per_parent[parent_name] = {
+                    "hsbm_num_levels": hsbm_sample["hsbm_num_levels"],
+                    "hsbm_clusters_per_level": hsbm_sample["hsbm_clusters_per_level"],
+                }
 
             # 2nd dict: base parameters (without masks)
             base_params = {
@@ -1555,10 +1620,12 @@ class RDB:
                 is_timestamp_table=table.is_time_table,
                 scm_params=combined_params,
                 masks=schema_masks,
+                hsbm_per_parent=hsbm_per_parent,
             )
             self.table_generation_schemas[table_name] = table_schema
 
             self.table_generators[table_name].init_table_SCM(
+                hsbm_per_parent=hsbm_per_parent,
                 **combined_params,
                 masks=scm_masks,
                 device=self.device,
@@ -1580,7 +1647,9 @@ class RDB:
                 parent_data_list.append(parent_data)
             fk_seed = hash((self._seed, table_name)) & 0x7FFFFFFF
             X_dict, FK_ids = table_generator.generate_data(
-                parent_data_list=parent_data_list, fk_seed=fk_seed,
+                parent_data_list=parent_data_list,
+                fk_seed=fk_seed,
+                parent_names=parent_tables,
             )
         else:
             # Returns X_dict (dict)
