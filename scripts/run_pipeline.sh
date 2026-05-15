@@ -41,6 +41,8 @@ MERGE_SCRIPT="${ROOT}/data_preprocessing/merge_dbinfer_to_h5.py"
 PRE_DFS_CONFIG="${ROOT}/data_preprocessing/configs/transform/pre-dfs.yaml"
 DFS_CONFIG="${ROOT}/data_preprocessing/configs/dfs/dfs-1-ft.yaml"
 POST_DFS_CONFIG="${ROOT}/data_preprocessing/configs/transform/post-dfs.yaml"
+CONFIG="${1:-RDBPFN_hsbm}"
+NUM_GPUS="${2:-2}"
 
 # Build LD_LIBRARY_PATH from pixi env's nvidia libs
 PIXI_ENV="${ROOT}/.pixi/envs/default/lib/python3.10/site-packages"
@@ -156,12 +158,7 @@ pixi run torchrun \
     --nnodes=1 \
     --nproc_per_node=2 \
     run_train.py \
-    --config-name=RDBPFN_hsbm_test \
+    --config-name="$CONFIG" \
     "train.datasets.0.path=pretrain_datasets/${RUN_NAME}.h5" \
     "train.save_model_path=checkpoints/${RUN_NAME}/model.pt" \
     "wandb.run_name=${RUN_NAME}"
-
-echo ""
-echo "╔══════════════════════════════════════════════════╗"
-echo "║     Pipeline Complete!                            ║"
-echo "╚══════════════════════════════════════════════════╝"

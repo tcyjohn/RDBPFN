@@ -187,13 +187,21 @@ def main(cfg: Config):
         return evaluate_classifier(classifier, eval_splits)
 
     if cfg.wandb.enabled and accelerator.is_main_process:
-        # Force wandb relogin using WANDB_API_KEY from environment
         wandb_api_key = os.environ.get("WANDB_API_KEY")
         if not wandb_api_key:
+            try:
+                import netrc as _netrc
+                _auth = _netrc.netrc(os.path.expanduser("~/.netrc"))
+                _creds = _auth.authenticators("api.wandb.ai")
+                wandb_api_key = _creds[2] if _creds and len(_creds) > 2 else None
+                if wandb_api_key:
+                    logger.info("Read WANDB_API_KEY from ~/.netrc")
+            except Exception:
+                pass
+        if not wandb_api_key:
             raise ValueError(
-                "WANDB_API_KEY environment variable must be set when wandb is enabled"
+                "WANDB_API_KEY must be set via environment variable or ~/.netrc"
             )
-        logger.info("Found WANDB_API_KEY in environment, forcing wandb relogin")
         wandb.login(key=wandb_api_key, relogin=True)
 
         wandb_config = (
