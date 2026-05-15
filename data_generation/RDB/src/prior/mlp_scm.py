@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import math
 import random
-from typing import Dict, Any, List
+import warnings
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -80,6 +81,14 @@ class MLPSCM(nn.Module):
     device : str, default="cpu"
         The computing device ('cpu' or 'cuda') where tensors will be allocated.
 
+    time_dim : int, default=0
+        If > 0, normalized timestamps are embedded and concatenated to the MLP
+        input (time-as-input). ``0`` means no time column for this table.
+
+    time_embed_mode : str, default="raw"
+        ``"raw"`` uses a single scalar (requires ``time_dim in {0, 1}``). ``"fourier"``
+        uses sinusoidal features (``time_dim`` must be a positive even integer).
+
     **kwargs : dict
         Unused hyperparameters passed from parent configurations.
     """
@@ -115,6 +124,8 @@ class MLPSCM(nn.Module):
         batch_size: int = 32,
         parent_sampling_dist: str = "uniform",  # "uniform" or "zipf"
         parent_sampling_alpha: float = 1.0,
+        time_dim: int = 0,
+        time_embed_mode: str = "raw",
         **kwargs: Dict[str, Any],
     ):
         super(MLPSCM, self).__init__()
@@ -151,10 +162,37 @@ class MLPSCM(nn.Module):
         self.parent_sampling_dist = parent_sampling_dist
         self.parent_sampling_alpha = parent_sampling_alpha
 
+        self.time_dim = time_dim
+        self.time_embed_mode = time_embed_mode.lower()
+        if self.time_embed_mode not in ("raw", "fourier"):
+            raise ValueError(
+                f"time_embed_mode must be 'raw' or 'fourier', got {time_embed_mode!r}"
+            )
+        if self.time_embed_mode == "raw" and self.time_dim not in (0, 1):
+            raise ValueError(
+                "time_embed_mode 'raw' requires time_dim in {0, 1} "
+                f"(scalar normalized time), got time_dim={self.time_dim}"
+            )
+        if self.time_embed_mode == "fourier":
+            if self.time_dim <= 0 or self.time_dim % 2 != 0:
+                raise ValueError(
+                    "time_embed_mode 'fourier' requires positive even time_dim, "
+                    f"got {self.time_dim}"
+                )
+
         if self.use_timestamp_sampling:
+            warnings.warn(
+                "use_timestamp_sampling is deprecated and ignored: timestamp tables "
+                "now use time-as-input (time_dim > 0) instead of "
+                "forward_with_enhanced_temporal_sampling.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
+        # TemporalVocab for real-valued timestamps fed into the MLP (not mask slices).
+        self.temporal_vocab: TemporalVocab | None = None
+        if self.time_dim > 0:
             self.temporal_vocab = TemporalVocab(device=self.device)
-        else:
-            self.temporal_vocab = None
 
         self.eta = kwargs.get("eta", 1.0)  # Controls influence of embedding affinity
 
@@ -184,8 +222,9 @@ class MLPSCM(nn.Module):
             device=self.device,
         )
 
-        # Build layers
-        first_in_dim = self.num_causes + self.other_causes
+        # Build layers: optional time embedding is concatenated after root causes,
+        # before parent causal outputs (same total width as num_causes + time_dim + other_causes).
+        first_in_dim = self.num_causes + self.other_causes + self.time_dim
         layers = [nn.Linear(first_in_dim, self.hidden_dim)]
         for _ in range(self.num_layers - 1):
             layers.append(self.generate_layer_modules())
@@ -354,12 +393,68 @@ class MLPSCM(nn.Module):
 
         return remapped_indices.tolist()
 
+    def _fourier_features(self, t_norm: torch.Tensor) -> torch.Tensor:
+        """Sinusoidal encoding for normalized times ``t_norm`` in ``[0, 1]``.
+
+        Args:
+            t_norm: Shape ``(n,)`` float tensor on ``self.device``.
+
+        Returns:
+            Tensor of shape ``(n, self.time_dim)`` with ``sin`` / ``cos`` blocks.
+        """
+        half = self.time_dim // 2
+        device = t_norm.device
+        dtype = t_norm.dtype
+        freqs = torch.exp(
+            torch.arange(half, device=device, dtype=dtype)
+            * (-math.log(10000.0) / max(half, 1))
+        )
+        args = t_norm.unsqueeze(-1) * freqs
+        return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+
+    def _sample_time_embedding(self, n: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Sample timestamps from ``TemporalVocab`` and build MLP time input.
+
+        Real event times are drawn via ``sample_time`` (sorted); values stored in
+        ``X[MASK_TYPE.TIMESTAMP]`` are normalized to ``[0, 1]`` for a clean CSV
+        semantic. The same normalized scalars (or their Fourier lift) drive the
+        first linear layer — time is a true input to the SCM, not a mask slice.
+
+        Args:
+            n: Number of rows to sample (typically ``seq_len * sampling_ratio``).
+
+        Returns:
+            ``timestamps_norm`` of shape ``(n,)`` in ``[0, 1]``, and ``time_embed``
+            of shape ``(n, time_dim)`` (``time_dim==1`` and mode ``raw`` for scalar).
+        """
+        if n <= 0:
+            raise ValueError(f"_sample_time_embedding expects n > 0, got {n}")
+        if self.temporal_vocab is None:
+            raise RuntimeError("temporal_vocab is unset; time_dim must be > 0")
+
+        timestamps = self.temporal_vocab.sample_time(
+            num_samples=n,
+            time_range=(0.0, 10.0),
+        )
+        timestamps_norm = (timestamps.to(self.device) / 10.0).clamp(0.0, 1.0)
+
+        if self.time_embed_mode == "raw":
+            time_embed = timestamps_norm.unsqueeze(-1)
+        else:
+            time_embed = self._fourier_features(timestamps_norm)
+
+        return timestamps_norm, time_embed
+
     def forward_without_input(self):
         """
         This case is for generate tables without parent tables.
         Therefore, we do not need to sample the parent tables.
         """
         causes = self.xsampler.sample()  # (seq_len, num_causes)
+        n_sampled = int(self.seq_len * self.sampling_ratio)
+        if self.time_dim > 0:
+            timestamps_norm, time_embed = self._sample_time_embedding(n_sampled)
+            causes = torch.cat([causes, time_embed], dim=-1)
 
         # Generate outputs through MLP layers
         outputs = [causes]
@@ -371,6 +466,9 @@ class MLPSCM(nn.Module):
 
         # Handle outputs based on causality
         X, outputs_flat = self.handle_outputs(outputs, self.masks)
+
+        if self.time_dim > 0:
+            X[MASK_TYPE.TIMESTAMP] = timestamps_norm.unsqueeze(-1)
 
         # Check for NaNs and handle them by setting to default values
         for _, value in X.items():
@@ -400,6 +498,9 @@ class MLPSCM(nn.Module):
             row indices (0-based) to use for parent ``i``.
         """
         causes = self.xsampler.sample()  # (seq_len, num_causes)
+        if self.time_dim > 0:
+            timestamps_norm, time_embed = self._sample_time_embedding(self.seq_len)
+            causes = torch.cat([causes, time_embed], dim=-1)
 
         for i, parent_table_data in enumerate(parent_data_list):
             parent_idx = fk_ids[:, i]
@@ -409,8 +510,8 @@ class MLPSCM(nn.Module):
         assert causes.shape[0] == self.seq_len, (
             f"Expected {self.seq_len} rows, got {causes.shape[0]}"
         )
-        assert causes.shape[1] == self.num_causes + self.other_causes, (
-            f"Expected {self.num_causes + self.other_causes} input dims, "
+        assert causes.shape[1] == self.num_causes + self.time_dim + self.other_causes, (
+            f"Expected {self.num_causes + self.time_dim + self.other_causes} input dims, "
             f"got {causes.shape[1]}"
         )
 
@@ -422,6 +523,9 @@ class MLPSCM(nn.Module):
 
         X, outputs_flat = self.handle_outputs(outputs, self.masks)
 
+        if self.time_dim > 0:
+            X[MASK_TYPE.TIMESTAMP] = timestamps_norm.unsqueeze(-1)
+
         for _, value in X.items():
             if torch.any(torch.isnan(value)):
                 value[:] = 0.0
@@ -431,7 +535,12 @@ class MLPSCM(nn.Module):
     def forward_with_enhanced_temporal_sampling(
         self, parent_data_list: List[Dict[str, torch.Tensor]]
     ):
-        """Enhanced temporal sampling method implementing the 5-step process:
+        """Deprecated baseline (Pólya urn + mass reinforcer); kept for comparison only.
+
+        The production path uses time-as-input via ``time_dim`` and
+        ``forward_with_input`` / ``forward_without_input`` instead.
+
+        Enhanced temporal sampling method implementing the 5-step process:
         1. Draw Timestamps from temporal function Λ(t)
         2. Initialize Objects (mass vectors and edge kernel)
         3. Nested Sampling Loop (for each timestamp)

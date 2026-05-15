@@ -5,8 +5,8 @@ DAG to RDB Generator
 This script converts DAG data into real RDBs. Given DAG structure with source/destination
 nodes and table dimensions, it creates relational databases with proper table relationships.
 
-Child tables may have any number of parents. Tables with exactly 2 parents
-may optionally include a timestamp column (50% random chance).
+Child tables may have any number of parents; optional timestamp columns are configured via
+``dimension_config["timestamp"]``.
 """
 
 import torch
@@ -56,6 +56,11 @@ class DAGToRDBGenerator:
             "fluctuation_ratio": 1.0,
             "min": 8,
             "max": 12,
+        },
+        "timestamp": {
+            "prob": 1.0,
+            "time_dim": 8,
+            "time_embed_mode": "fourier",
         },
     }
 
@@ -292,13 +297,12 @@ class DAGToRDBGenerator:
                 original_num_cols + 1 + num_parents
             )  # num_col from DAG + 1 + parent's tables num
 
-            # Determine if this should be a timestamp table
-            # Only possible if table has exactly 2 parents, randomly determined
-            is_timestamp_table = False
-            if num_parents == 2:
-                is_timestamp_table = random.choice([True, False])
-                if is_timestamp_table:
-                    num_cols += 1  # Add one more column for timestamp
+            # Optional timestamp column: any parent count; probability from config.
+            ts_cfg = self.dimension_config.get("timestamp", {})
+            timestamp_prob = float(ts_cfg.get("prob", 1.0))
+            is_timestamp_table = random.random() < timestamp_prob
+            if is_timestamp_table:
+                num_cols += 1  # Add one more column for timestamp
 
             # Create table config
             table_config = {
@@ -386,6 +390,7 @@ class DAGToRDBGenerator:
             Created RDB instance
         """
         rdb = RDB(rdb_name)
+        rdb.timestamp_config = dict(self.dimension_config.get("timestamp", {}))
         if self.use_row_gnn:
             rdb.enable_row_gnn(device=self.gnn_device)
 
@@ -798,7 +803,6 @@ class DAGToRDBGenerator:
 
             # Show distribution of parent counts
             parent_count_distribution = {}
-            tables_with_2_parents = 0
 
             for i in range(num_dags):
                 try:
@@ -808,8 +812,6 @@ class DAGToRDBGenerator:
                         parent_count_distribution[num_parents] = (
                             parent_count_distribution.get(num_parents, 0) + 1
                         )
-                        if num_parents == 2:
-                            tables_with_2_parents += 1
                 except Exception:
                     continue
 
@@ -818,11 +820,10 @@ class DAGToRDBGenerator:
                 count = parent_count_distribution[parent_count]
                 print(f"  {parent_count} parents: {count} tables")
 
+            ts_prob = self.dimension_config.get("timestamp", {}).get("prob", 1.0)
             print(
-                f"\nTables eligible for timestamp (2 parents): {tables_with_2_parents}"
-            )
-            print(
-                f"Expected timestamp tables (50% random): ~{tables_with_2_parents // 2}"
+                f"\nTables in corpus (all may get timestamp with prob={ts_prob}): "
+                f"{sum(total_table_counts)}"
             )
 
 
