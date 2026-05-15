@@ -99,11 +99,14 @@ def _subsample_dir_for(csv_dir: Path) -> Path:
 
 
 def _load_local_csv_datasets(data_dirs: list[Path]):
-    dataset_splits = []
-    dataset_names = []
+    grouped_splits: dict[str, list] = {}
+    grouped_names: dict[str, list] = {}
     for directory in data_dirs:
         if not directory.exists():
             continue
+        dir_key = directory.name
+        dir_splits = []
+        dir_names = []
         subsample_dir = _subsample_dir_for(directory)
         subsample_dir.mkdir(parents=True, exist_ok=True)
         for csv_path in sorted(directory.glob("*.csv")):
@@ -116,8 +119,8 @@ def _load_local_csv_datasets(data_dirs: list[Path]):
                     data["y_train"],
                     data["y_test"],
                 )
-                dataset_splits.append((X_train, X_test, y_train, y_test))
-                dataset_names.append(csv_path.stem)
+                dir_splits.append((X_train, X_test, y_train, y_test))
+                dir_names.append(csv_path.stem)
                 continue
             try:
                 X, y = _load_csv_dataset(csv_path)
@@ -148,33 +151,56 @@ def _load_local_csv_datasets(data_dirs: list[Path]):
                 y_train=y_train,
                 y_test=y_test,
             )
-            dataset_splits.append((X_train, X_test, y_train, y_test))
-            dataset_names.append(csv_path.stem)
-    return dataset_splits, dataset_names
+            dir_splits.append((X_train, X_test, y_train, y_test))
+            dir_names.append(csv_path.stem)
+        grouped_splits[dir_key] = dir_splits
+        grouped_names[dir_key] = dir_names
+    return grouped_splits, grouped_names
 
 
 def prepare_eval_splits(
     data_dirs: list[Path] | None = None,
 ):
     dirs = data_dirs if data_dirs else DEFAULT_EVAL_DIRS
-    splits, names = _load_local_csv_datasets(dirs)
-    return splits, names
+    return _load_local_csv_datasets(dirs)
 
 
-def evaluate_classifier(classifier, splits):
-    scores = {"roc_auc": 0, "acc": 0, "balanced_acc": 0}
-    for X_train, X_test, y_train, y_test in splits:
-        classifier.fit(X_train, y_train)
-        prob = classifier.predict_proba(X_test)
-        pred = prob.argmax(axis=1)
-        if prob.shape[1] == 2:
-            roc = roc_auc_score(y_test, prob[:, 1])
-        else:
-            roc = roc_auc_score(y_test, prob, multi_class="ovr")
-        scores["roc_auc"] += float(roc)
-        scores["acc"] += float(accuracy_score(y_test, pred))
-        scores["balanced_acc"] += float(balanced_accuracy_score(y_test, pred))
-    scores = {k: v / len(splits) for k, v in scores.items()}
+def evaluate_classifier(classifier, splits_by_dir: dict[str, list]):
+    metric_names = ["roc_auc", "acc", "balanced_acc"]
+    per_dir_scores: dict[str, float] = {}
+    total_splits = 0
+    overall_sums = {k: 0.0 for k in metric_names}
+
+    for dir_key, dir_splits in splits_by_dir.items():
+        dir_sums = {k: 0.0 for k in metric_names}
+        for X_train, X_test, y_train, y_test in dir_splits:
+            classifier.fit(X_train, y_train)
+            prob = classifier.predict_proba(X_test)
+            pred = prob.argmax(axis=1)
+            if prob.shape[1] == 2:
+                roc = roc_auc_score(y_test, prob[:, 1])
+            else:
+                roc = roc_auc_score(y_test, prob, multi_class="ovr")
+            roc_val = float(roc)
+            acc_val = float(accuracy_score(y_test, pred))
+            bal_val = float(balanced_accuracy_score(y_test, pred))
+            dir_sums["roc_auc"] += roc_val
+            dir_sums["acc"] += acc_val
+            dir_sums["balanced_acc"] += bal_val
+            overall_sums["roc_auc"] += roc_val
+            overall_sums["acc"] += acc_val
+            overall_sums["balanced_acc"] += bal_val
+
+        n = len(dir_splits)
+        total_splits += n
+        if n > 0:
+            for k in metric_names:
+                per_dir_scores[f"{dir_key}/{k}"] = dir_sums[k] / n
+
+    scores: dict[str, float] = {}
+    for k in metric_names:
+        scores[k] = overall_sums[k] / total_splits if total_splits > 0 else 0.0
+    scores.update(per_dir_scores)
     return scores
 
 
