@@ -435,34 +435,65 @@ class TaskDataGenerator:
                     if t in joined_tables and table_name in neighbors:
                         linked_name = t
                         break
-            if linked_name is None:
+
+            other_table = self.rdb.tables[table_name]
+            feat_cols = other_table.get_feature_columns()
+
+            if linked_name is not None:
+                edge = schema_graph.get_edge(linked_name, table_name)
+                if edge is None:
+                    edge = schema_graph.get_edge(table_name, linked_name)
+
+                if edge is not None:
+                    if edge.direction == SchemaEdgeDirection.FK_TO_PK:
+                        col_name_to_idx = {
+                            name: i for i, name in enumerate(other_table.column_names)
+                        }
+                        for c in feat_cols:
+                            idx = col_name_to_idx.get(c)
+                            col_dtype = (
+                                other_table.data_type_configs[idx].data_type
+                                if idx is not None
+                                else DataType.FLOAT
+                            )
+                            joined_cols.append((f"{table_name}_{c}", col_dtype))
+
+                    elif edge.direction == SchemaEdgeDirection.PK_TO_FK:
+                        for c in feat_cols:
+                            joined_cols.append(
+                                (f"{table_name}_{c}_mean", DataType.FLOAT)
+                            )
+                            joined_cols.append(
+                                (f"{table_name}_{c}_std", DataType.FLOAT)
+                            )
+
+                    joined_tables.add(table_name)
+                    continue
+
+            # ── multi-hop bridge (mirrors _join_related_features) ──────────
+            if not feat_cols:
                 continue
 
-            edge = schema_graph.get_edge(linked_name, table_name)
-            if edge is None:
-                edge = schema_graph.get_edge(table_name, linked_name)
-            if edge is None:
-                continue
+            for mid_name, mid_table in self.rdb.tables.items():
+                if mid_name == table_name or mid_name == focal_table_name:
+                    continue
 
-            # Column naming mirrors _join_related_features.
-            if edge.direction == SchemaEdgeDirection.FK_TO_PK:
-                other_table = self.rdb.tables[table_name]
-                feat_cols = other_table.get_feature_columns()
-                col_name_to_idx = {
-                    name: i for i, name in enumerate(other_table.column_names)
-                }
-                for c in feat_cols:
-                    idx = col_name_to_idx.get(c)
-                    col_dtype = (
-                        other_table.data_type_configs[idx].data_type
-                        if idx is not None
-                        else DataType.FLOAT
-                    )
-                    joined_cols.append((f"{table_name}_{c}", col_dtype))
+                # T FK → M PK?
+                t_fk_col, _, _ = self._find_fk_to(other_table, mid_name)
+                if t_fk_col is None:
+                    continue
 
-            elif edge.direction == SchemaEdgeDirection.PK_TO_FK:
-                other_table = self.rdb.tables[table_name]
-                feat_cols = other_table.get_feature_columns()
+                # M FK → J (any already-joined table)?
+                bridge_found = False
+                for j_name in joined_tables:
+                    m_fk, _, _ = self._find_fk_to(mid_table, j_name)
+                    if m_fk is not None:
+                        bridge_found = True
+                        break
+                if not bridge_found:
+                    continue
+
+                # Bridge join always aggregates (mean/std).
                 for c in feat_cols:
                     joined_cols.append(
                         (f"{table_name}_{c}_mean", DataType.FLOAT)
@@ -470,7 +501,7 @@ class TaskDataGenerator:
                     joined_cols.append(
                         (f"{table_name}_{c}_std", DataType.FLOAT)
                     )
-
+                break
             joined_tables.add(table_name)
 
         return joined_cols
@@ -511,15 +542,6 @@ class TaskDataGenerator:
                     if t in joined_tables and table_name in neighbors:
                         linked_name = t
                         break
-            if linked_name is None:
-                continue
-
-            edge = schema_graph.get_edge(linked_name, table_name)
-            if edge is None:
-                edge = schema_graph.get_edge(table_name, linked_name)
-            if edge is None:
-                continue
-
             other_table = self.rdb.tables[table_name]
             if other_table.dataframe is None:
                 other_table.generate_dataframe()
@@ -532,70 +554,146 @@ class TaskDataGenerator:
                 if dtc.data_type == DataType.FOREIGN_KEY
             ]
             extra_cols = [c for c in fk_cols if c not in feat_cols]
-            if not feat_cols and not extra_cols:
-                joined_tables.add(table_name)
+
+            # ── direct edge join ──────────────────────────────────────────
+            if linked_name is not None:
+                edge = schema_graph.get_edge(linked_name, table_name)
+                if edge is None:
+                    edge = schema_graph.get_edge(table_name, linked_name)
+                if edge is not None and (feat_cols or extra_cols):
+                    t_linked = self.rdb.tables[linked_name]
+                    t_other = other_table
+
+                    # Case 1: linked_name FK → table_name PK (direct merge)
+                    fk_col, pk_table, _ = self._find_fk_to(t_linked, table_name)
+                    if fk_col is not None and pk_table is not None:
+                        fk_col_name = t_linked.column_names[fk_col]
+                        pk_col_name = t_other.column_names[0]
+                        if fk_col_name in combined_df.columns:
+                            keep_cols = [pk_col_name] + feat_cols + extra_cols
+                            other_feat_df = t_other.dataframe[keep_cols].copy()
+                            rename_map = {c: f"{table_name}_{c}" for c in feat_cols}
+                            other_feat_df = other_feat_df.rename(columns=rename_map)
+                            if other_feat_df[pk_col_name].duplicated().any():
+                                other_feat_df = other_feat_df.drop_duplicates(
+                                    subset=[pk_col_name], keep="first"
+                                )
+                            combined_df = combined_df.merge(
+                                other_feat_df,
+                                left_on=fk_col_name,
+                                right_on=pk_col_name,
+                                how="left",
+                            )
+                            combined_df.index = orig_index
+                            joined_tables.add(table_name)
+                            continue
+
+                    # Case 2: table_name FK → linked_name PK (aggregate)
+                    fk_col2, pk_table2, _ = self._find_fk_to(t_other, linked_name)
+                    if fk_col2 is not None and pk_table2 is not None:
+                        fk_col_name2 = t_other.column_names[fk_col2]
+                        pk_col_name2 = t_linked.column_names[0]
+                        if pk_col_name2 in combined_df.columns:
+                            child_df = t_other.dataframe[[fk_col_name2] + feat_cols].copy()
+                            agg_funcs = {c: ["mean", "std"] for c in feat_cols}
+                            agg_df = child_df.groupby(fk_col_name2, as_index=False).agg(agg_funcs)
+                            agg_df.columns = [
+                                fk_col_name2
+                                if col[0] == fk_col_name2
+                                else f"{table_name}_{col[0]}_{col[1]}"
+                                for col in agg_df.columns
+                            ]
+                            combined_df = combined_df.merge(
+                                agg_df,
+                                left_on=pk_col_name2,
+                                right_on=fk_col_name2,
+                                how="left",
+                            )
+                            combined_df.index = orig_index
+                            joined_tables.add(table_name)
+                            continue
+
+            # ── multi-hop bridge join ─────────────────────────────────────
+            # When linked_name is None (no direct edge to a joined table),
+            # try a 2-hop path: table T has FK→M, and M has FK→J (J already
+            # joined).  Needed because Case 2 aggregation drops M's PK from
+            # combined_df, blocking direct FK joins from grandchild tables.
+            if not feat_cols:
                 continue
 
-            # Determine which table has the FK and which has the PK by using
-            # the table's own data_type_configs, not the edge annotation.
-            # PK is always column 0.  FK columns have DataType.FOREIGN_KEY
-            # and a parent_table config entry.
-            t_linked = self.rdb.tables[linked_name]
             t_other = other_table
+            for mid_name, mid_table in self.rdb.tables.items():
+                if mid_name == table_name or mid_name == focal_table_name:
+                    continue
+                if mid_table.dataframe is None:
+                    mid_table.generate_dataframe()
 
-            # Try: linked_name FK → table_name PK (many-to-one, direct join)
-            fk_col, pk_table, _ = self._find_fk_to(t_linked, table_name)
-            if fk_col is not None and pk_table is not None:
-                fk_col_name = t_linked.column_names[fk_col]
-                pk_col_name = t_other.column_names[0]  # PK is always col 0
-                if fk_col_name in combined_df.columns:
-                    keep_cols = [pk_col_name] + feat_cols + extra_cols
-                    other_feat_df = t_other.dataframe[keep_cols].copy()
-                    rename_map = {c: f"{table_name}_{c}" for c in feat_cols}
-                    other_feat_df = other_feat_df.rename(columns=rename_map)
-                    if other_feat_df[pk_col_name].duplicated().any():
-                        other_feat_df = other_feat_df.drop_duplicates(
-                            subset=[pk_col_name], keep="first"
-                        )
-                    combined_df = combined_df.merge(
-                        other_feat_df,
-                        left_on=fk_col_name,
-                        right_on=pk_col_name,
-                        how="left",
-                    )
-                    combined_df.index = orig_index
-                    joined_tables.add(table_name)
+                # T FK → M PK?
+                t_fk_col, _, _ = self._find_fk_to(t_other, mid_name)
+                if t_fk_col is None:
                     continue
 
-            # Try: table_name FK → linked_name PK (many-to-one from the
-            # other direction).  The FK is in table_name, PK in linked_name.
-            # To add table_name features without duplicating rows, aggregate
-            # by FK and join via linked_name.PK.
-            fk_col2, pk_table2, _ = self._find_fk_to(t_other, linked_name)
-            if fk_col2 is not None and pk_table2 is not None:
-                fk_col_name2 = t_other.column_names[fk_col2]
-                pk_col_name2 = t_linked.column_names[0]
-                if pk_col_name2 in combined_df.columns:
-                    child_df = t_other.dataframe[[fk_col_name2] + feat_cols].copy()
-                    agg_funcs = {c: ["mean", "std"] for c in feat_cols}
-                    agg_df = child_df.groupby(fk_col_name2, as_index=False).agg(agg_funcs)
-                    agg_df.columns = [
-                        fk_col_name2
-                        if col[0] == fk_col_name2
-                        else f"{table_name}_{col[0]}_{col[1]}"
-                        for col in agg_df.columns
-                    ]
-                    combined_df = combined_df.merge(
-                        agg_df,
-                        left_on=pk_col_name2,
-                        right_on=fk_col_name2,
-                        how="left",
-                    )
-                    combined_df.index = orig_index
-                    joined_tables.add(table_name)
+                # M FK → J (any already-joined table)?
+                bridge_linked = None
+                bridge_fk_col = None
+                for j_name in joined_tables:
+                    m_fk, _, _ = self._find_fk_to(mid_table, j_name)
+                    if m_fk is not None:
+                        bridge_linked = j_name
+                        bridge_fk_col = m_fk
+                        break
+                if bridge_linked is None:
                     continue
 
-            joined_tables.add(table_name)
+                t_fk_col_name = t_other.column_names[t_fk_col]
+                bridge_fk_col_name = mid_table.column_names[bridge_fk_col]
+                bridge_pk_col_name = mid_table.column_names[0]
+                t_linked2 = self.rdb.tables[bridge_linked]
+                pk_col_name2 = t_linked2.column_names[0]
+                if pk_col_name2 not in combined_df.columns:
+                    continue
+
+                # 1. Merge T with bridge M to propagate bridge FK.
+                t_df = t_other.dataframe[[t_fk_col_name] + feat_cols].copy()
+                bridge_df = mid_table.dataframe[
+                    [bridge_pk_col_name, bridge_fk_col_name]
+                ].copy()
+                bridge_df = bridge_df.rename(
+                    columns={bridge_pk_col_name: "_bridge_pk"}
+                )
+                merged = t_df.merge(
+                    bridge_df,
+                    left_on=t_fk_col_name,
+                    right_on="_bridge_pk",
+                    how="left",
+                )
+
+                # 2. Aggregate T features by bridge FK.
+                agg_funcs = {c: ["mean", "std"] for c in feat_cols}
+                agg_df = merged.groupby(
+                    bridge_fk_col_name, as_index=False
+                ).agg(agg_funcs)
+                agg_df.columns = [
+                    bridge_fk_col_name
+                    if col[0] == bridge_fk_col_name
+                    else f"{table_name}_{col[0]}_{col[1]}"
+                    for col in agg_df.columns
+                ]
+
+                # 3. Join via J.PK = bridge FK.
+                combined_df = combined_df.merge(
+                    agg_df,
+                    left_on=pk_col_name2,
+                    right_on=bridge_fk_col_name,
+                    how="left",
+                )
+                combined_df.index = orig_index
+                joined_tables.add(table_name)
+                break
+            else:
+                # No bridge found either — add to joined set anyway so
+                # subsequent tables can still try to link through it.
+                joined_tables.add(table_name)
 
         return combined_df
 
