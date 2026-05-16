@@ -40,6 +40,7 @@ from .task_generation_utils import (
     DirectAttributeTarget,
     RelationalAggregationTarget,
     SchemaEdge,
+    SchemaEdgeDirection,
     SchemaGraph,
     InstanceGraph,
     FocalEntity,
@@ -375,7 +376,10 @@ class TaskDataGenerator:
             task.task_type == TaskType.DIRECT_ATTRIBUTE_PREDICTION
             or task.task_type == TaskType.RELATIONAL_AGGREGATION_PREDICTION
         ):
-            # TODO: Handle multiple key tables
+            # For complex tasks, joined columns are not known until
+            # _join_related_features runs.  Compute metadata from the focal
+            # table's own columns here; joined columns are patched in by
+            # generate_task_data after combine_features_and_labels.
             key_table_name = task.key_tables[0]
             if key_table_name not in key_tables:
                 raise ValueError(f"Key table '{key_table_name}' not found")
@@ -395,9 +399,218 @@ class TaskDataGenerator:
                 "feature_columns": feature_columns,
                 "label_column": label_column,
                 "column_metadata": column_metadata,
+                # Filled by generate_task_data after joins.
+                "_joined_cols_pending": True,
             }
 
             return task_column_metadata
+
+    def _get_joined_feature_columns(
+        self,
+        focal_table_name: str,
+        schema_graph: "SchemaGraph",
+    ) -> List[Tuple[str, "DataType"]]:
+        """Return ``(column_name, DataType)`` for columns ``_join_related_features`` adds."""
+        if schema_graph is None or len(schema_graph.nodes) <= 1:
+            return []
+
+        topo_order = schema_graph.get_topological_order()
+        remaining = [t for t in topo_order if t != focal_table_name]
+        if not remaining:
+            return []
+
+        joined_cols: List[Tuple[str, DataType]] = []
+        joined_tables = {focal_table_name}
+
+        for table_name in remaining:
+            # Find any already-joined table that has an edge with table_name
+            # (same BFS logic as _join_related_features).
+            linked_name = None
+            for neighbor in schema_graph.adjacency.get(table_name, []):
+                if neighbor in joined_tables:
+                    linked_name = neighbor
+                    break
+            if linked_name is None:
+                for t, neighbors in schema_graph.adjacency.items():
+                    if t in joined_tables and table_name in neighbors:
+                        linked_name = t
+                        break
+            if linked_name is None:
+                continue
+
+            edge = schema_graph.get_edge(linked_name, table_name)
+            if edge is None:
+                edge = schema_graph.get_edge(table_name, linked_name)
+            if edge is None:
+                continue
+
+            # Column naming mirrors _join_related_features.
+            if edge.direction == SchemaEdgeDirection.FK_TO_PK:
+                other_table = self.rdb.tables[table_name]
+                feat_cols = other_table.get_feature_columns()
+                col_name_to_idx = {
+                    name: i for i, name in enumerate(other_table.column_names)
+                }
+                for c in feat_cols:
+                    idx = col_name_to_idx.get(c)
+                    col_dtype = (
+                        other_table.data_type_configs[idx].data_type
+                        if idx is not None
+                        else DataType.FLOAT
+                    )
+                    joined_cols.append((f"{table_name}_{c}", col_dtype))
+
+            elif edge.direction == SchemaEdgeDirection.PK_TO_FK:
+                other_table = self.rdb.tables[table_name]
+                feat_cols = other_table.get_feature_columns()
+                for c in feat_cols:
+                    joined_cols.append(
+                        (f"{table_name}_{c}_mean", DataType.FLOAT)
+                    )
+                    joined_cols.append(
+                        (f"{table_name}_{c}_std", DataType.FLOAT)
+                    )
+
+            joined_tables.add(table_name)
+
+        return joined_cols
+
+    def _join_related_features(
+        self,
+        combined_df: pd.DataFrame,
+        focal_table_name: str,
+        schema_graph: "SchemaGraph",
+    ) -> pd.DataFrame:
+        """Join feature columns from related tables via FK relationships.
+
+        Traverses the schema graph from the focal table outward, joining
+        feature columns (float + categorical) from each non-focal table.
+        Column names are prefixed with ``{table_name}_`` to avoid collisions.
+        """
+        if schema_graph is None or len(schema_graph.nodes) <= 1:
+            return combined_df
+
+        topo_order = schema_graph.get_topological_order()
+        remaining = [t for t in topo_order if t != focal_table_name]
+        if not remaining:
+            return combined_df
+
+        orig_index = combined_df.index
+        joined_tables = {focal_table_name}
+
+        for table_name in remaining:
+            # Find any already-joined table that has an edge with table_name.
+            linked_name = None
+            for neighbor in schema_graph.adjacency.get(table_name, []):
+                if neighbor in joined_tables:
+                    linked_name = neighbor
+                    break
+            if linked_name is None:
+                # Also check reverse adjacency
+                for t, neighbors in schema_graph.adjacency.items():
+                    if t in joined_tables and table_name in neighbors:
+                        linked_name = t
+                        break
+            if linked_name is None:
+                continue
+
+            edge = schema_graph.get_edge(linked_name, table_name)
+            if edge is None:
+                edge = schema_graph.get_edge(table_name, linked_name)
+            if edge is None:
+                continue
+
+            other_table = self.rdb.tables[table_name]
+            if other_table.dataframe is None:
+                other_table.generate_dataframe()
+
+            feat_cols = other_table.get_feature_columns()
+            # Also pull FK columns so they are available for subsequent joins.
+            fk_cols = [
+                other_table.column_names[i]
+                for i, dtc in enumerate(other_table.data_type_configs)
+                if dtc.data_type == DataType.FOREIGN_KEY
+            ]
+            extra_cols = [c for c in fk_cols if c not in feat_cols]
+            if not feat_cols and not extra_cols:
+                joined_tables.add(table_name)
+                continue
+
+            # Determine which table has the FK and which has the PK by using
+            # the table's own data_type_configs, not the edge annotation.
+            # PK is always column 0.  FK columns have DataType.FOREIGN_KEY
+            # and a parent_table config entry.
+            t_linked = self.rdb.tables[linked_name]
+            t_other = other_table
+
+            # Try: linked_name FK → table_name PK (many-to-one, direct join)
+            fk_col, pk_table, _ = self._find_fk_to(t_linked, table_name)
+            if fk_col is not None and pk_table is not None:
+                fk_col_name = t_linked.column_names[fk_col]
+                pk_col_name = t_other.column_names[0]  # PK is always col 0
+                if fk_col_name in combined_df.columns:
+                    keep_cols = [pk_col_name] + feat_cols + extra_cols
+                    other_feat_df = t_other.dataframe[keep_cols].copy()
+                    rename_map = {c: f"{table_name}_{c}" for c in feat_cols}
+                    other_feat_df = other_feat_df.rename(columns=rename_map)
+                    if other_feat_df[pk_col_name].duplicated().any():
+                        other_feat_df = other_feat_df.drop_duplicates(
+                            subset=[pk_col_name], keep="first"
+                        )
+                    combined_df = combined_df.merge(
+                        other_feat_df,
+                        left_on=fk_col_name,
+                        right_on=pk_col_name,
+                        how="left",
+                    )
+                    combined_df.index = orig_index
+                    joined_tables.add(table_name)
+                    continue
+
+            # Try: table_name FK → linked_name PK (many-to-one from the
+            # other direction).  The FK is in table_name, PK in linked_name.
+            # To add table_name features without duplicating rows, aggregate
+            # by FK and join via linked_name.PK.
+            fk_col2, pk_table2, _ = self._find_fk_to(t_other, linked_name)
+            if fk_col2 is not None and pk_table2 is not None:
+                fk_col_name2 = t_other.column_names[fk_col2]
+                pk_col_name2 = t_linked.column_names[0]
+                if pk_col_name2 in combined_df.columns:
+                    child_df = t_other.dataframe[[fk_col_name2] + feat_cols].copy()
+                    agg_funcs = {c: ["mean", "std"] for c in feat_cols}
+                    agg_df = child_df.groupby(fk_col_name2, as_index=False).agg(agg_funcs)
+                    agg_df.columns = [
+                        fk_col_name2
+                        if col[0] == fk_col_name2
+                        else f"{table_name}_{col[0]}_{col[1]}"
+                        for col in agg_df.columns
+                    ]
+                    combined_df = combined_df.merge(
+                        agg_df,
+                        left_on=pk_col_name2,
+                        right_on=fk_col_name2,
+                        how="left",
+                    )
+                    combined_df.index = orig_index
+                    joined_tables.add(table_name)
+                    continue
+
+            joined_tables.add(table_name)
+
+        return combined_df
+
+    @staticmethod
+    def _find_fk_to(
+        table: "Table", target_table_name: str
+    ) -> Tuple[int | None, str | None, int | None]:
+        """Return ``(fk_col_idx, pk_table_name, pk_col_idx)`` if *table* has
+        an FK pointing to *target_table_name*, else ``(None, None, None)``."""
+        for i, dtc in enumerate(table.data_type_configs):
+            if dtc.data_type == DataType.FOREIGN_KEY:
+                parent = dtc.config.get("parent_table")
+                if parent == target_table_name:
+                    return (i, target_table_name, 0)
+        return (None, None, None)
 
     def generate_instance_graphs_and_compute_labels(
         self,
@@ -425,6 +638,12 @@ class TaskDataGenerator:
         assert num_samples <= key_table.dataframe.shape[0]
         idx = random.sample(range(key_table.dataframe.shape[0]), num_samples)
         combined_df = key_table.dataframe.iloc[idx]
+
+        # Join feature columns from related tables so the model has the raw
+        # materials for relational reasoning.
+        combined_df = self._join_related_features(
+            combined_df, key_table_name, task.schema_graph
+        )
 
         # Build instance graphs once; reuse them across retries.
         instance_graphs: List[Tuple[int, InstanceGraph]] = []
@@ -671,6 +890,24 @@ class TaskDataGenerator:
         if unified_df is None:
             return None
         task.set_unified_dataframe(unified_df)
+
+        # If joined columns were added, patch the metadata.
+        if task_column_metadata.get("_joined_cols_pending"):
+            del task_column_metadata["_joined_cols_pending"]
+            all_cols = list(unified_df.columns)
+            focal_cols = task_column_metadata["all_columns"]
+            joined_cols = [c for c in all_cols if c not in focal_cols and c != task.real_name_for_target_column]
+            for col_name in joined_cols:
+                task_column_metadata["all_columns"].append(col_name)
+                task_column_metadata["feature_columns"].append(col_name)
+                task_column_metadata["column_metadata"][col_name] = {
+                    "name": col_name,
+                    "data_type": DataType.FLOAT,
+                    "is_feature": True,
+                    "is_label": False,
+                    "column_index": -1,
+                }
+            task.set_task_column_metadata(task_column_metadata)
 
         # Step 3: Split the unified dataframe
         task_data = self.split_task_data(task, train_ratio, valid_ratio)
