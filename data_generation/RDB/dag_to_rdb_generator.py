@@ -485,7 +485,8 @@ class DAGToRDBGenerator:
         Parameters
         ----------
         args : tuple
-            (rdb_index, all_dag_structures, output_base_dir, eta_min, eta_max)
+            (rdb_index, all_dag_structures, output_base_dir, eta_min, eta_max,
+             use_complex_tasks, dimension_config, quality_filter, quality_max_retries)
 
         Returns
         -------
@@ -501,6 +502,8 @@ class DAGToRDBGenerator:
                 eta_max,
                 use_complex_tasks,
                 dimension_config,
+                quality_filter,
+                quality_max_retries,
             ) = args
 
             # Set random seed for reproducibility (each worker gets different seed)
@@ -557,18 +560,24 @@ class DAGToRDBGenerator:
             # Save to file
             rdb.save_to_file(csv_dir)
 
-            # Initialize tasks and save to 4DBInfer format
+            task_quality_info = {}
             if use_complex_tasks:
-                rdb.initialize_tasks_with_complex_tasks(
-                    tasks_per_rdb=5, train_ratio=0.75, valid_ratio=0.05
-                )
+                if quality_filter:
+                    task_quality_info = DAGToRDBGenerator._generate_tasks_with_quality_gate(
+                        rdb, rdb_dir, tasks_per_rdb=5, train_ratio=0.75,
+                        valid_ratio=0.05, max_retries=quality_max_retries,
+                        base_seed=rdb_index,
+                    )
+                else:
+                    rdb.initialize_tasks_with_complex_tasks(
+                        tasks_per_rdb=5, train_ratio=0.75, valid_ratio=0.05
+                    )
+                    rdb.save_to_4dbinfer_dataset_with_tasks(rdb_dir)
             else:
                 rdb.initialize_tasks(
                     tasks_per_rdb=5, train_ratio=0.75, valid_ratio=0.05
                 )
-
-            # Save to 4DBInfer format with tasks
-            rdb.save_to_4dbinfer_dataset_with_tasks(rdb_dir)
+                rdb.save_to_4dbinfer_dataset_with_tasks(rdb_dir)
 
             # Return success info
             return (
@@ -581,6 +590,7 @@ class DAGToRDBGenerator:
                     "num_timestamp_tables": len(timestamp_tables),
                     "num_relationships": len(relationships),
                     "rdb_dir": rdb_dir,
+                    **task_quality_info,
                 },
             )
 
@@ -588,6 +598,71 @@ class DAGToRDBGenerator:
             import traceback
 
             return (False, rdb_index, str(e) + "\n" + traceback.format_exc())
+
+    @staticmethod
+    def _generate_tasks_with_quality_gate(rdb, rdb_dir, tasks_per_rdb=5,
+                                           train_ratio=0.75, valid_ratio=0.05,
+                                           max_retries=3, base_seed=42):
+        """Generate complex tasks with quality gate.
+
+        Retries up to ``max_retries`` times with different seeds. Keeps the
+        attempt with the most passed tasks. Failed task schemas are pruned
+        from ``rdb.task_generation_schemas`` before saving.
+        """
+        from src.table_def.task_quality import diagnose_dataframe
+
+        best_passed = []
+        best_attempt = -1
+        total_checked = 0
+
+        for attempt in range(max_retries + 1):
+            seed = base_seed + attempt * 1000
+            random.seed(seed)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+
+            rdb.task_generation_schemas = []  # clear from previous retry
+            rdb.initialize_tasks_with_complex_tasks(
+                tasks_per_rdb=tasks_per_rdb,
+                train_ratio=train_ratio,
+                valid_ratio=valid_ratio,
+            )
+
+            passed = []
+            for task in rdb.tasks:
+                if task.task_data is None:
+                    continue
+                train_df = task.task_data["train_df"]
+                result = diagnose_dataframe(train_df)
+                total_checked += 1
+                if result["passed"]:
+                    passed.append(task)
+
+            if len(passed) > len(best_passed):
+                best_passed = passed
+                best_attempt = attempt
+                # Snapshot the matching generation schemas
+                best_task_names = {t.task_name for t in best_passed}
+                best_schemas = [
+                    s for s in rdb.task_generation_schemas
+                    if s.task_name in best_task_names
+                ]
+
+            if len(passed) == tasks_per_rdb:
+                break  # all tasks passed
+
+        # Restore best attempt
+        rdb.tasks = best_passed
+        rdb.task_generation_schemas = best_schemas if best_passed else []
+
+        rdb.save_to_4dbinfer_dataset_with_tasks(rdb_dir)
+
+        return {
+            "quality_tasks_passed": len(best_passed),
+            "quality_tasks_requested": tasks_per_rdb,
+            "quality_attempts": best_attempt + 1,
+            "quality_checked": total_checked,
+        }
 
     def generate_rdbs_from_dags(
         self,
@@ -597,6 +672,8 @@ class DAGToRDBGenerator:
         start_index: int = 0,
         num_processes: int = None,
         use_complex_tasks: bool = False,
+        quality_filter: bool = True,
+        quality_max_retries: int = 3,
     ) -> List[RDB]:
         """
         Generate RDBs from the loaded DAG data.
@@ -616,6 +693,10 @@ class DAGToRDBGenerator:
             If 1, runs sequentially (original behavior).
         use_complex_tasks : bool
             Whether to use complex tasks
+        quality_filter : bool
+            Whether to run the quality gate on complex tasks (default: True)
+        quality_max_retries : int
+            Maximum retry attempts for the quality gate (default: 3)
         Returns
         -------
         List[RDB]
@@ -662,6 +743,8 @@ class DAGToRDBGenerator:
                 eta_max,
                 use_complex_tasks,
                 self.dimension_config,
+                quality_filter,
+                quality_max_retries,
             )
             for i in range(start_index, start_index + num_rdbs)
         ]
@@ -682,6 +765,10 @@ class DAGToRDBGenerator:
                         f"{info['num_timestamp_tables']} timestamp tables, "
                         f"{info['num_relationships']} relationships)"
                     )
+                    qinfo = info.get("quality_tasks_passed")
+                    if qinfo is not None:
+                        print(f"  [quality] {qinfo}/{info['quality_tasks_requested']} tasks passed"
+                              f" (attempts={info['quality_attempts']})")
                     print(f"  ✓ Saved to {info['rdb_dir']}")
                     successful_generations += 1
                     # Note: We don't append the actual RDB object in parallel mode to save memory
@@ -707,6 +794,10 @@ class DAGToRDBGenerator:
                                 f"{info['num_timestamp_tables']} timestamp tables, "
                                 f"{info['num_relationships']} relationships) -> {info['rdb_dir']}"
                             )
+                            qinfo = info.get("quality_tasks_passed")
+                            if qinfo is not None:
+                                print(f"  [quality] {qinfo}/{info['quality_tasks_requested']} tasks passed"
+                                      f" (attempts={info['quality_attempts']})")
                             successful_generations += 1
                         else:
                             print(f"✗ Error generating RDB {rdb_index + 1}: {result}")
@@ -724,6 +815,10 @@ class DAGToRDBGenerator:
                             f"{info['num_timestamp_tables']} timestamp tables, "
                             f"{info['num_relationships']} relationships)"
                         )
+                        qinfo2 = info.get("quality_tasks_passed")
+                        if qinfo2 is not None:
+                            print(f"  [quality] {qinfo2}/{info['quality_tasks_requested']} tasks passed"
+                                  f" (attempts={info['quality_attempts']})")
                         print(f"  ✓ Saved to {info['rdb_dir']}")
                         successful_generations += 1
                     else:
@@ -868,6 +963,8 @@ def main():
             num_processes=num_processes,
             start_index=start_index,
             use_complex_tasks=use_complex_tasks,
+            quality_filter=quality_filter,
+            quality_max_retries=quality_max_retries,
         )
         end_time = time.time()
         elapsed_time = end_time - start_time
@@ -956,6 +1053,17 @@ if __name__ == "__main__":
         default="cpu",
         help="Device for row-level GNN (e.g., 'cpu', 'cuda:0')",
     )
+    parser.add_argument(
+        "--no-quality-filter",
+        action="store_true",
+        help="Disable the task quality gate (enabled by default for complex tasks)",
+    )
+    parser.add_argument(
+        "--quality-max-retries",
+        type=int,
+        default=3,
+        help="Maximum retry attempts for the quality gate (default: 3)",
+    )
     args = parser.parse_args()
 
     num_rdbs_to_generate = args.num_rdbs
@@ -970,6 +1078,8 @@ if __name__ == "__main__":
     use_row_gnn = args.use_row_gnn
     random_seed = args.random_seed
     gnn_device = args.gnn_device
+    quality_filter = not args.no_quality_filter
+    quality_max_retries = args.quality_max_retries
 
     # Validate num_processes
     if num_processes is not None and num_processes <= 0:

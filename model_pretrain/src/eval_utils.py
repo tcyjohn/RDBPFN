@@ -112,16 +112,20 @@ def _load_local_csv_datasets(data_dirs: list[Path]):
         for csv_path in sorted(directory.glob("*.csv")):
             npz_path = subsample_dir / f"{csv_path.stem}_split.npz"
             if npz_path.exists():
-                data = np.load(npz_path, allow_pickle=True)
-                X_train, X_test, y_train, y_test = (
-                    data["X_train"],
-                    data["X_test"],
-                    data["y_train"],
-                    data["y_test"],
-                )
-                dir_splits.append((X_train, X_test, y_train, y_test))
-                dir_names.append(csv_path.stem)
-                continue
+                try:
+                    data = np.load(npz_path, allow_pickle=True)
+                    X_train, X_test, y_train, y_test = (
+                        data["X_train"],
+                        data["X_test"],
+                        data["y_train"],
+                        data["y_test"],
+                    )
+                    dir_splits.append((X_train, X_test, y_train, y_test))
+                    dir_names.append(csv_path.stem)
+                    continue
+                except Exception as exc:
+                    print(f"Cached {npz_path} corrupted ({exc}), regenerating...")
+                    npz_path.unlink(missing_ok=True)
             try:
                 X, y = _load_csv_dataset(csv_path)
             except Exception as exc:
