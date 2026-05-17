@@ -1179,13 +1179,34 @@ class TableGenerator:
         child_rows: int,
     ) -> tuple[int, list[int]]:
         """Row-count-aware clipping: max leaf blocks must fit in both sides."""
+        import logging
+
+        logger = logging.getLogger(__name__)
+        min_rows = min(parent_rows, child_rows)
+        original_cpl = clusters_per_level
+        original_nlv = num_levels
+
         max_leaf = clusters_per_level ** num_levels
-        if max_leaf > min(parent_rows, child_rows):
-            while num_levels > 0 and clusters_per_level ** num_levels > min(
-                parent_rows, child_rows
-            ):
+        if max_leaf > min_rows:
+            while num_levels > 0 and clusters_per_level ** num_levels > min_rows:
                 num_levels -= 1
-            num_levels = max(num_levels, 1)
+            if num_levels == 0:
+                num_levels = 1
+                clusters_per_level = min(clusters_per_level, min_rows)
+
+        if clusters_per_level != original_cpl or num_levels != original_nlv:
+            logger.warning(
+                "HSBM hierarchy clipped for parent_rows=%d, child_rows=%d: "
+                "num_levels %d→%d, clusters_per_level %d→%d (min_rows=%d)",
+                parent_rows,
+                child_rows,
+                original_nlv,
+                num_levels,
+                original_cpl,
+                clusters_per_level,
+                min_rows,
+            )
+
         hierarchy = [clusters_per_level] * num_levels
         return num_levels, hierarchy
 
