@@ -380,7 +380,7 @@ class TemporalVocab:
 
         sample_indices = torch.multinomial(probs, 1, replacement=True).squeeze(-1)  # (N,)
         sampled_times = t_points[sample_indices]
-        return torch.sort(sampled_times)[0]
+        return sampled_times  # unsorted: row i's timestamp corresponds to row i's t_min
 
     def retrieve(self, t: torch.Tensor) -> torch.Tensor:
         """
