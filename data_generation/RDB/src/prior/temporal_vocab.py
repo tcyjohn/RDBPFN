@@ -153,6 +153,11 @@ class TemporalVocab:
         self.spikes_vocab = SpikesVocab(device=device)
         self.noise_vocab = NoiseVocab(device=device)
 
+        # Component activation flags (set during generate())
+        self.trend_active: bool = False
+        self.seasonal_active: bool = False
+        self.spike_active: bool = False
+
         # Default probabilities and amplitudes
         self._init_default_params()
 
@@ -215,20 +220,23 @@ class TemporalVocab:
         intensity = torch.ones_like(t, device=self.device, dtype=torch.float32)
 
         # Add components based on probabilities
-        if random.random() < self.component_probs[ComponentType.TREND]:
+        self.trend_active = random.random() < self.component_probs[ComponentType.TREND]
+        if self.trend_active:
             trend_component = self.trend_vocab.generate(t)
             intensity += (
                 self.component_amplitudes[ComponentType.TREND] * trend_component
             )
 
-        if random.random() < self.component_probs[ComponentType.SEASONALITY]:
+        self.seasonal_active = random.random() < self.component_probs[ComponentType.SEASONALITY]
+        if self.seasonal_active:
             seasonal_component = self.seasonality_vocab.generate(t)
             intensity += (
                 self.component_amplitudes[ComponentType.SEASONALITY]
                 * seasonal_component
             )
 
-        if random.random() < self.component_probs[ComponentType.SPIKES]:
+        self.spike_active = random.random() < self.component_probs[ComponentType.SPIKES]
+        if self.spike_active:
             spikes_component = self.spikes_vocab.generate(t)
             intensity += (
                 self.component_amplitudes[ComponentType.SPIKES] * spikes_component
