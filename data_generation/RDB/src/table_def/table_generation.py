@@ -1266,6 +1266,62 @@ class TableGenerator:
         )
         return torch.tensor(fk_ids_np, device=self.device).long()
 
+    def _compute_t_min_for_child(
+        self,
+        child_rows: int,
+        fk_ids: torch.Tensor,
+        parent_data_list: list,
+        parent_is_time_table: list[bool],
+        dag_position: str,
+    ) -> torch.Tensor:
+        """Compute per-row t_min for child table timestamp sampling.
+
+        Args:
+            child_rows: Number of child rows.
+            fk_ids: (child_rows, num_parents) FK index tensor.
+            parent_data_list: List of parent ``all_scm_outputs`` dicts.
+            parent_is_time_table: bool per parent.
+            dag_position: "source" | "intermediate" | "leaf".
+
+        Returns:
+            (child_rows,) tensor of t_min values in [0, 1] (normalized).
+        """
+        T = 1.0  # normalized time range
+        num_parents = len(parent_data_list)
+
+        # Collect parent timestamps for rows with FK references
+        parent_ts_list: list[torch.Tensor] = []
+        for p_idx in range(num_parents):
+            if parent_is_time_table[p_idx] and MASK_TYPE.TIMESTAMP in parent_data_list[p_idx]:
+                p_ts = parent_data_list[p_idx][MASK_TYPE.TIMESTAMP].squeeze(-1)  # (N_p,)
+                row_ts = p_ts[fk_ids[:, p_idx].long()]  # (child_rows,)
+                parent_ts_list.append(row_ts)
+
+        if parent_ts_list:
+            t_min = torch.stack(parent_ts_list, dim=1).max(dim=1).values  # (child_rows,)
+        else:
+            # Fallback based on DAG topology
+            rng = np.random.RandomState(
+                hash((self._seed, "t_min_fallback")) & 0x7FFFFFFF
+            )
+            if dag_position == "source":
+                t_min = torch.tensor(
+                    rng.uniform(0.0, 0.15 * T, size=child_rows),
+                    device=self.device, dtype=torch.float32,
+                )
+            elif dag_position == "intermediate":
+                t_min = torch.tensor(
+                    rng.uniform(0.15 * T, 0.45 * T, size=child_rows),
+                    device=self.device, dtype=torch.float32,
+                )
+            else:  # leaf
+                t_min = torch.tensor(
+                    rng.uniform(0.45 * T, 0.85 * T, size=child_rows),
+                    device=self.device, dtype=torch.float32,
+                )
+
+        return t_min.clamp(0.0, T)
+
     def generate_data(self, **kwargs) -> torch.Tensor:
         with torch.no_grad():
             if "parent_data_list" in kwargs:
@@ -1276,6 +1332,19 @@ class TableGenerator:
                     parent_data_list=parent_data_list,
                     parent_names=parent_names,
                 )
+                # Compute per-row t_min from parent timestamps
+                parent_is_time = kwargs.get(
+                    "parent_is_time_table", [False] * len(parent_data_list)
+                )
+                dag_pos = getattr(self, "dag_position", "intermediate")
+                t_min = self._compute_t_min_for_child(
+                    child_rows=self.num_rows,
+                    fk_ids=fk_ids,
+                    parent_data_list=parent_data_list,
+                    parent_is_time_table=parent_is_time,
+                    dag_position=dag_pos,
+                )
+                self.table_SCM.t_min = t_min.to(self.device)
                 X, FK_ids, outputs_flat = self.table_SCM.forward_with_input(
                     parent_data_list, fk_ids
                 )
@@ -1558,6 +1627,17 @@ class RDB:
             parent_tables = [
                 rel.to_table for rel in self.get_foreign_keys_for_table(table_name)
             ]
+            # Determine DAG topology position for t_min fallback
+            children_of_this = [
+                rel.to_table for rel in self.get_foreign_keys_for_table(table_name)
+            ]
+            num_children = len(children_of_this)
+            if len(parent_tables) == 0:
+                dag_position = "source"
+            elif num_children == 0:
+                dag_position = "leaf"
+            else:
+                dag_position = "intermediate"
             seq_len = table.num_rows
             # num_outputs = num_causes  # Set to 10 for now
             # num_causes = 10  # Set to 10 for now
@@ -1575,13 +1655,11 @@ class RDB:
                 other_causes = 0
                 sampling_ratio = 1.0
 
-            ts_cfg = getattr(self, "timestamp_config", {}) or {}
+            from src.prior.prior_config import TIME_DIM  # noqa: PLC0415
             if table.is_time_table:
-                base_time_dim = int(ts_cfg.get("time_dim", 8))
-                base_time_embed_mode = str(ts_cfg.get("time_embed_mode", "fourier"))
+                base_time_dim = TIME_DIM
             else:
                 base_time_dim = 0
-                base_time_embed_mode = "raw"
 
             # Determine generation type (timestamp tables remain parent_based or self_generated)
             if len(parent_tables) == 0:
@@ -1605,6 +1683,14 @@ class RDB:
                     "hsbm_clusters_per_level": hsbm_sample["hsbm_clusters_per_level"],
                 }
 
+            # Sample gamma tier for lifecycle decay (only for timestamp child tables)
+            if table.is_time_table and len(parent_tables) > 0:
+                gamma_sample = hpsampler.sample()
+                sampled_gamma_raw = gamma_sample.get("gamma_tier", 0.0)
+                sampled_gamma = sampled_gamma_raw() if callable(sampled_gamma_raw) else sampled_gamma_raw
+            else:
+                sampled_gamma = 0.0
+
             # 2nd dict: base parameters (without masks)
             base_params = {
                 "seq_len": seq_len,
@@ -1612,7 +1698,7 @@ class RDB:
                 "sampling_ratio": sampling_ratio,
                 "use_timestamp_sampling": False,
                 "time_dim": base_time_dim,
-                "time_embed_mode": base_time_embed_mode,
+                "gamma": sampled_gamma,
             }
 
             # 3rd dict: combine sampled and base parameters
@@ -1649,6 +1735,7 @@ class RDB:
                 masks=scm_masks,
                 device=self.device,
             )
+            self.table_generators[table_name].dag_position = dag_position
 
     def generate_one_table_data_from_SCM(
         self, table_name: str, parent_tables: List[str]
