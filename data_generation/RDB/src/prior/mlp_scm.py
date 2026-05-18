@@ -401,9 +401,15 @@ class MLPSCM(nn.Module):
         # 1. Generate intensity distribution once
         self.temporal_vocab.generate(time_range=(0.0, 10.0))
 
-        # 2. Sample timestamps
+        # 2. Sample timestamps with optional per-row t_min and decay
+        t_min_raw = None
+        if t_min is not None:
+            t_min_raw = (t_min.to(self.device) * 10.0).clamp(0.0, 10.0)
         timestamps = self.temporal_vocab.sample_time(
-            num_samples=n, time_range=(0.0, 10.0),
+            num_samples=n,
+            time_range=(0.0, 10.0),
+            t_min=t_min_raw,
+            gamma=getattr(self, "gamma", 0.0),
         )
         timestamps_norm = (timestamps.to(self.device) / 10.0).clamp(0.0, 1.0)
 
@@ -476,7 +482,10 @@ class MLPSCM(nn.Module):
         """
         causes = self.xsampler.sample()  # (seq_len, num_causes)
         if self.time_dim > 0:
-            timestamps_norm, time_features = self._prepare_time_features(self.seq_len)
+            timestamps_norm, time_features = self._prepare_time_features(
+                n=self.seq_len,
+                t_min=getattr(self, "t_min", None),
+            )
             causes = torch.cat([causes, time_features], dim=-1)
 
         for i, parent_table_data in enumerate(parent_data_list):
