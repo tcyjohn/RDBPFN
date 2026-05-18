@@ -328,43 +328,59 @@ class TemporalVocab:
         time_range: Tuple[float, float] = (0.0, 10.0),
         num_points: int = DEFAULT_NUM_POINTS,
         distribution: Optional[torch.Tensor] = None,
+        t_min: Optional[torch.Tensor] = None,
+        gamma: float = 0.0,
     ) -> torch.Tensor:
-        """
-        Sample event times from the generated temporal distribution.
+        """Sample event times, optionally with per-row lower bounds.
 
-        Parameters
-        ----------
-        num_samples : int
-            Number of samples to generate
-        time_range : Tuple[float, float]
-            Time range for sampling
-        distribution : torch.Tensor, optional
-            Pre-generated distribution. If None, generates new one.
+        Args:
+            num_samples: Number of samples (rows).
+            time_range: Global (min_t, max_t).
+            num_points: Discretization grid size.
+            distribution: Pre-generated (t, intensity) tensor.
+            t_min: Optional (num_samples,) tensor of per-row lower bounds in
+                   raw time units (same scale as time_range).
+            gamma: Lifecycle decay strength. 0 = no decay.
 
-        Returns
-        -------
-        torch.Tensor
-            Sampled event indices
+        Returns:
+            Sampled times (num_samples,) sorted ascending, in raw time units.
         """
         if distribution is None:
             distribution = self.generate(time_range, num_points=num_points)
 
-        t_points = distribution[:, 0]
-        intensity = distribution[:, 1]
+        t_points = distribution[:, 0]  # (K,)
+        intensity = distribution[:, 1]  # (K,)
+        K = t_points.shape[0]
+        device = t_points.device
 
-        # Normalize intensity to create probability distribution
-        probs = intensity / intensity.sum()
+        # Per-row intensity: shape (num_samples, K)
+        if t_min is not None:
+            t_min_clamped = t_min.to(device).clamp(
+                min=time_range[0], max=time_range[1]
+            )  # (N,)
+            mask = t_points.unsqueeze(0) >= t_min_clamped.unsqueeze(1)  # (N, K)
+            intensity_bc = intensity.unsqueeze(0) * mask.float()  # (N, K)
+        else:
+            intensity_bc = intensity.unsqueeze(0).expand(num_samples, -1)  # (N, K)
 
-        # Sample indices based on probabilities
-        sample_indices = torch.multinomial(probs, num_samples, replacement=True)
+        # --- Task 2.2: Lifecycle decay ---
+        if gamma > 0.0 and t_min is not None:
+            # tau = (t - t_min) / (T_max - t_min), normalized relative time
+            tau = (t_points.unsqueeze(0) - t_min_clamped.unsqueeze(1)) / (
+                time_range[1] - t_min_clamped.unsqueeze(1)
+            ).clamp(min=1e-8)  # (N, K)
+            tau = tau.clamp(min=0.0)
+            decay = torch.exp(-gamma * tau)
+            intensity_bc = intensity_bc * decay
 
-        # Get corresponding time points
+        # Renormalize per row; guard against all-zero rows
+        row_sums = intensity_bc.sum(dim=1, keepdim=True)  # (N, 1)
+        row_sums = row_sums.clamp(min=1e-12)
+        probs = intensity_bc / row_sums  # (N, K)
+
+        sample_indices = torch.multinomial(probs, 1, replacement=True).squeeze(-1)  # (N,)
         sampled_times = t_points[sample_indices]
-
-        # Sort samples
-        sampled_times = torch.sort(sampled_times)[0]
-
-        return sampled_times
+        return torch.sort(sampled_times)[0]
 
     def retrieve(self, t: torch.Tensor) -> torch.Tensor:
         """
