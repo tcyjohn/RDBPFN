@@ -1273,7 +1273,6 @@ class TableGenerator:
         parent_data_list: list,
         parent_is_time_table: list[bool],
         dag_position: str,
-        seed: int = 42,
     ) -> torch.Tensor:
         """Compute per-row t_min for child table timestamp sampling.
 
@@ -1283,6 +1282,7 @@ class TableGenerator:
             parent_data_list: List of parent ``all_scm_outputs`` dicts.
             parent_is_time_table: bool per parent.
             dag_position: "source" | "intermediate" | "leaf".
+        fallback_seed: int = 42,
 
         Returns:
             (child_rows,) tensor of t_min values in [0, 1] (normalized).
@@ -1303,7 +1303,7 @@ class TableGenerator:
         else:
             # Fallback based on DAG topology
             rng = np.random.RandomState(
-                hash((seed, "t_min_fallback")) & 0x7FFFFFFF
+                hash((fallback_seed, "t_min_fallback")) & 0x7FFFFFFF
             )
             if dag_position == "source":
                 t_min = torch.tensor(
@@ -1377,7 +1377,7 @@ class TableGenerator:
                     parent_data_list=parent_data_list,
                     parent_is_time_table=parent_is_time,
                     dag_position=dag_pos,
-                    seed=kwargs.get("fk_seed", 42),
+                    fallback_seed=kwargs.get("fk_seed", 0),
                 )
                 self.table_SCM.t_min = t_min.to(self.device)
                 X, FK_ids, outputs_flat = self.table_SCM.forward_with_input(
