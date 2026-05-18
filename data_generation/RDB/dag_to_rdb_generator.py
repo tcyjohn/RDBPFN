@@ -58,9 +58,7 @@ class DAGToRDBGenerator:
             "max": 12,
         },
         "timestamp": {
-            "prob": 1.0,
-            "time_dim": 8,
-            "time_embed_mode": "fourier",
+            "prob": 0.7,
         },
     }
 
