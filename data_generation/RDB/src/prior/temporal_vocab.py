@@ -413,6 +413,18 @@ class TemporalVocab:
 
         return torch.cat(pieces, dim=-1)  # (N, 8)
 
+    def build_gate_vector(self) -> torch.Tensor:
+        """Return (3,) float tensor: [trend_active, seasonal_active, spike_active]."""
+        return torch.tensor(
+            [
+                float(getattr(self, "trend_active", False)),
+                float(getattr(self, "seasonal_active", False)),
+                float(getattr(self, "spike_active", False)),
+            ],
+            device=self.device,
+            dtype=torch.float32,
+        )
+
 
 class TrendVocab:
     """Vocabulary for trend components."""
