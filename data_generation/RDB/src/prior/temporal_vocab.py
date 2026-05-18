@@ -381,6 +381,38 @@ class TemporalVocab:
             + len(self.noise_vocab)
         )
 
+    def evaluate_basis(self, t: torch.Tensor) -> torch.Tensor:
+        """Evaluate all active basis components at time points t.
+
+        Args:
+            t: (N,) tensor, normalized time values in [0, 1] on self.device.
+        Returns:
+            (N, 8) tensor:
+              [trend_level, trend_slope,
+               season_low_sin, season_low_cos, season_high_sin, season_high_cos,
+               spike_amplitude, spike_decay]
+            Inactive components output zeros in their slots.
+        """
+        N = t.shape[0]
+        pieces: list[torch.Tensor] = []
+
+        if getattr(self, "trend_active", False):
+            pieces.append(self.trend_vocab.evaluate(t))  # (N, 2)
+        else:
+            pieces.append(torch.zeros(N, 2, device=self.device, dtype=t.dtype))
+
+        if getattr(self, "seasonal_active", False):
+            pieces.append(self.seasonality_vocab.evaluate(t))  # (N, 4)
+        else:
+            pieces.append(torch.zeros(N, 4, device=self.device, dtype=t.dtype))
+
+        if getattr(self, "spike_active", False):
+            pieces.append(self.spikes_vocab.evaluate(t))  # (N, 2)
+        else:
+            pieces.append(torch.zeros(N, 2, device=self.device, dtype=t.dtype))
+
+        return torch.cat(pieces, dim=-1)  # (N, 8)
+
 
 class TrendVocab:
     """Vocabulary for trend components."""
@@ -488,6 +520,59 @@ class TrendVocab:
 
     def __len__(self):
         return len(self.patterns)
+
+    def evaluate(self, t: torch.Tensor) -> torch.Tensor:
+        """Evaluate trend basis at arbitrary t.
+
+        Args:
+            t: (N,) tensor of normalized time values in [0, 1].
+        Returns:
+            (N, 2) tensor: [level (normalized value), slope (finite-difference derivative)].
+        """
+        if not hasattr(self, "pattern_probs"):
+            self.init()
+
+        pattern_names = list(self.pattern_probs.keys())
+        pattern_weights = list(self.pattern_probs.values())
+        selected_pattern = np.random.choice(
+            pattern_names, p=np.array(pattern_weights) / sum(pattern_weights)
+        )
+        level = self._eval_trend_level(selected_pattern, t)
+        slope = self._eval_trend_slope(selected_pattern, t)
+        # Soft-clip to avoid extreme values
+        level = torch.tanh(level * 0.1)
+        slope = torch.tanh(slope * 0.5)
+        return torch.stack([level, slope], dim=-1)
+
+    def _eval_trend_level(self, pattern: str, t: torch.Tensor) -> torch.Tensor:
+        pattern = getattr(self, "_eval_pattern", pattern) if hasattr(self, "_eval_pattern") else pattern
+        if pattern == "linear_increasing":
+            return 0.5 * t
+        elif pattern == "linear_decreasing":
+            return -0.5 * t
+        elif pattern == "exponential_growth":
+            return (torch.exp(0.3 * t) - 1) / (torch.exp(torch.tensor(0.3)) - 1 + 1e-8)
+        elif pattern == "exponential_decay":
+            return torch.exp(-0.3 * t)
+        elif pattern == "polynomial_quadratic":
+            return 0.05 * t**2 + 0.25 * t
+        elif pattern == "polynomial_cubic":
+            return 0.005 * t**3 + 0.02 * t**2 + 0.15 * t
+        elif pattern == "logistic_growth":
+            return 1.0 / (1 + torch.exp(-2.0 * (t - 0.5)))
+        elif pattern == "power_law":
+            return torch.pow(t + 0.1, 0.8) - 0.1**0.8
+        elif pattern == "logarithmic":
+            return 0.3 * torch.log(t + 0.1) + 0.7
+        else:  # constant
+            return torch.zeros_like(t)
+
+    def _eval_trend_slope(self, pattern: str, t: torch.Tensor) -> torch.Tensor:
+        dt = 0.001
+        t_plus = t + dt
+        level = self._eval_trend_level(pattern, t)
+        level_plus = self._eval_trend_level(pattern, t_plus)
+        return (level_plus - level) / dt
 
 
 class SeasonalityVocab:
@@ -601,6 +686,23 @@ class SeasonalityVocab:
     def __len__(self):
         return len(self.patterns)
 
+    def evaluate(self, t: torch.Tensor) -> torch.Tensor:
+        """Evaluate seasonal basis at arbitrary t.
+
+        Args:
+            t: (N,) tensor of normalized time values in [0, 1].
+        Returns:
+            (N, 4) tensor: [low_sin, low_cos, high_sin, high_cos].
+            Low frequency: ~1 cycle over [0,1]. High frequency: ~4 cycles.
+        """
+        low_freq = 2.0 * torch.pi * 1.0
+        high_freq = 2.0 * torch.pi * 4.0
+        low_sin = torch.sin(low_freq * t)
+        low_cos = torch.cos(low_freq * t)
+        high_sin = torch.sin(high_freq * t)
+        high_cos = torch.cos(high_freq * t)
+        return torch.stack([low_sin, low_cos, high_sin, high_cos], dim=-1)
+
 
 class SpikesVocab:
     """Vocabulary for spike components."""
@@ -683,6 +785,34 @@ class SpikesVocab:
 
     def __len__(self):
         return len(self.patterns)
+
+    def evaluate(self, t: torch.Tensor) -> torch.Tensor:
+        """Evaluate spike basis at arbitrary t.
+
+        Args:
+            t: (N,) tensor of normalized time values in [0, 1].
+        Returns:
+            (N, 2) tensor: [amplitude (combined spike contributions), decay (exp distance to nearest spike)].
+        """
+        if not hasattr(self, "_spike_params_for_eval"):
+            self._spike_params_for_eval = []
+            n_spikes = 2
+            for _ in range(n_spikes):
+                center = float(np.random.uniform(0.1, 0.9))
+                width = float(np.random.uniform(0.02, 0.08))
+                amp = float(np.random.uniform(0.5, 2.0))
+                self._spike_params_for_eval.append((center, width, amp))
+
+        amplitude = torch.zeros_like(t)
+        min_dist = torch.full_like(t, float("inf"))
+        for center, width, amp in self._spike_params_for_eval:
+            dist = torch.abs(t - center)
+            amplitude += amp * torch.exp(-0.5 * (dist / width)**2)
+            min_dist = torch.minimum(min_dist, dist)
+
+        decay = torch.exp(-3.0 * min_dist)
+        amplitude = torch.tanh(amplitude * 0.3)
+        return torch.stack([amplitude, decay], dim=-1)
 
 
 class NoiseVocab:
