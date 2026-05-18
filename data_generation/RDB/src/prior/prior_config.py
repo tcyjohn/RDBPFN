@@ -1,7 +1,7 @@
 import torch.nn as nn
 from src.prior.activations import get_activations
 
-# Timestamp feature dimension: 11 features per row (t_min, gamma, and 9 cyclic time encodings).
+# Fixed time-as-input dimension: trend(2) + seasonal(4) + spike(2) + gates(3) = 11.
 # Must match the temporal pipeline in mlp_scm.py and table_generation.py.
 TIME_DIM = 11
 
@@ -189,6 +189,29 @@ DEFAULT_SAMPLED_HP = {
         "min_mean": 0.01,
         "round": False,
         "lower_bound": 0.0,
+    },
+    # --- Temporal basis component activation (per-table sampling) ---
+    "trend_active": {
+        "distribution": "meta_choice",
+        "choice_values": [True, False],
+    },
+    "seasonal_active": {
+        "distribution": "meta_choice",
+        "choice_values": [True, False],
+    },
+    "spike_active": {
+        "distribution": "meta_choice",
+        "choice_values": [True, False],
+    },
+    # --- Phase 2-3 temporal params ---
+    "gamma_tier": {
+        "distribution": "meta_choice",
+        "choice_values": [0.0, 0.5, 1.5, 3.0],
+    },
+    "p_sort": {
+        "distribution": "uniform",
+        "min": 0.3,
+        "max": 0.8,
     },
     # --- Deprecated: kept for backward compat, ignored by HSBM path ---
     "parent_sampling_dist": {

@@ -1,52 +1,67 @@
-# Task Plan: Apply Quality Gate + Training Fixes to Target Branch
+# Task Plan: Temporal Generation Refactor
 
 ## Goal
 
-Apply the changes from commit `3732d95` (currently on `feature/hsbm-fk-generation`) to a target branch. Changes include:
-1. Task quality gate (`task_quality.py`) integrated into data generation pipeline
-2. Complex task fixes (`_join_related_features` for cross-table feature joining)
-3. Training eval bug fix (corrupted npz cache recovery)
-4. Eval CSV generation script (`convert_rdb_to_csv.py`)
-5. Parallel preprocessing in `run_pipeline.sh`
+Refactor time generation logic to fix three problems:
 
-## Source
+1. **虚假相关性**: MLP reads raw time value → learned shortcut between sampling density and feature values
+2. **跨表时序不一致**: Child table timestamps independent of parent timestamps
+3. **FK 组内无结构**: No differentiation of timestamps within same FK group
 
-- Source branch: `feature/hsbm-fk-generation`
-- Source commit: `3732d95 feat: add task quality gate, parallel pipeline, and eval CSV generation`
-- 7 files changed (+1153/-72)
+## Design Spec
 
-## Files Changed (3732d95)
+`docs/superpowers/specs/2026-05-18-temporal-generation-refactor-design.md`
 
-| File | Change Type | Lines |
-|------|------------|-------|
-| `data_generation/RDB/dag_to_rdb_generator.py` | Quality gate integration | +126 |
-| `data_generation/RDB/src/table_def/task_generation.py` | Cross-table feature join | +239 |
-| `data_generation/RDB/src/table_def/task_quality.py` | NEW: Two-stage quality checker | +420 |
-| `model_pretrain/src/eval_utils.py` | Corrupted npz recovery | +24 |
-| `scripts/convert_rdb_to_csv.py` | NEW: RDB to CSV converter | +119 |
-| `scripts/diagnose_complex_tasks.py` | NEW: CLI quality checker | +127 |
-| `scripts/run_pipeline.sh` | Parallel preprocess, QC flags | +170 |
+## Key Design Decisions
+
+- `time_dim = 11` (fixed): trend(2) + seasonal(4) + spike(2) + gates(3)
+- MLP reads basis vector B(t_i), not raw t_i
+- Noise stays in sampler, NOT passed to MLP
+- Child t_min = max(parent timestamps), with DAG-topology fallback
+- Gamma decay uses normalized relative time (discrete tiers)
+- Probabilistic per-FK-group sort (p_sort)
+- No Fourier encoding, no latent state Z(t), no Hawkes process
 
 ## Phases
 
-### Phase 1: Confirm target branch
+### Phase 1 — Basis Vector Input to MLP (Problem 1)
 
-- [ ] Clarify: which branch should receive these changes?
-  - `main`? `feature/hsbm-fk-no-ts-input`? Other?
-  - Changes are already on `feature/hsbm-fk-generation`
+- [ ] Add `TemporalVocab.evaluate_basis(t)` — evaluate trend/seasonal/spike at arbitrary t
+- [ ] Implement per-component eval methods (TrendVocab, SeasonalityVocab, SpikesVocab)
+- [ ] Rename `_sample_time_embedding` → `_prepare_time_features` in MLPSCM
+- [ ] Rewrite `_prepare_time_features` to return (N, 11) basis+gate tensor
+- [ ] Build gate indicators in TableGenerator: [trend_active, seasonal_active, spike_active]
+- [ ] Remove Fourier encoding and `time_embed_mode` config
+- [ ] Update `time_dim` to fixed constant 11
+- [ ] Remove `time_dim` from dynamic HP sampling (no longer sampled)
+- **Verify:** Generate a table, check that time features shape = (N, 11), gates match component activation
 
-### Phase 2: Identify delta between target and source
+### Phase 2 — Cross-Table Temporal Constraints (Problem 2)
 
-- [ ] Diff target branch vs `feature/hsbm-fk-generation` for the 7 files
-- [ ] Determine if cherry-pick, merge, or manual apply is needed
+- [ ] Modify `TemporalVocab.sample_time()` to accept `t_min: (N,)` tensor
+- [ ] Implement per-row masking + batched multinomial (accept-reject on discretized intensity)
+- [ ] In `_prepare_time_features`, collect parent timestamps via FK mapping, compute per-row t_min
+- [ ] Implement DAG topology fallback (source/intermediate/leaf)
+- [ ] Implement lifecycle decay with discrete gamma tiers + normalized tau
+- [ ] Sample `gamma_tier` per table from {0.0, 0.5, 1.5, 3.0}
+- **Verify:** Child timestamps >= max(parent timestamps) for all rows
 
-### Phase 3: Apply changes
+### Phase 3 — Intra-Group Sort (Problem 3)
 
-- [ ] Apply each file's changes to target branch
-- [ ] Ensure imports and dependencies are consistent
-- [ ] Verify no regressions in existing functionality
+- [ ] Sample `p_sort` per table from Uniform(0.3, 0.8)
+- [ ] After sampling, for each FK group: with prob p_sort, sort ascending
+- **Verify:** Table with p_sort=1.0 has timestamps sorted within each FK group; p_sort=0.0 does not
 
-### Phase 4: Validation
+### Phase 4 — Configuration & Cleanup
 
-- [ ] Verify target branch code parses correctly
-- [ ] Run a quick generation test if applicable
+- [ ] Add new HP params to `prior_config.py`: trend_active, seasonal_active, spike_active, gamma_tier, p_sort
+- [ ] Remove `time_embed_mode` from all config paths
+- [ ] Update `dag_to_rdb_generator.py` timestamp_config defaults
+- [ ] Pass DAG topology info for fallback
+- **Verify:** Full pipeline run — no config errors, output data valid
+
+## Open Questions
+
+1. Exact probability values for trend_active, seasonal_active, spike_active Bernoulli params? ✅ Confirmed
+2. Fallback t_min distribution ranges ✅ Finalized: Source U(0, 0.15T) / Intermediate U(0.15T, 0.45T) / Leaf U(0.45T, 0.85T)
+3. Gamma tiers (0.0, 0.5, 1.5, 3.0) ✅ Confirmed
