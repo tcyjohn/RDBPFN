@@ -1322,6 +1322,39 @@ class TableGenerator:
 
         return t_min.clamp(0.0, T)
 
+    def _apply_intra_group_sort(
+        self,
+        timestamps: torch.Tensor,
+        fk_ids: torch.Tensor,
+        p_sort: float,
+    ) -> torch.Tensor:
+        """Probabilistically sort timestamps within each FK group.
+
+        Args:
+            timestamps: (N,) tensor of timestamps in [0, 1].
+            fk_ids: (N, num_parents) FK index tensor (first parent used for grouping).
+            p_sort: Probability of sorting within a group.
+
+        Returns:
+            (N,) tensor — may be reordered within groups.
+        """
+        if p_sort <= 0.0 or fk_ids is None:
+            return timestamps
+        rng = np.random.RandomState()
+        parent_fk = fk_ids[:, 0].cpu().numpy()
+        ts_np = timestamps.cpu().numpy()
+        result = ts_np.copy()
+
+        unique_parents = np.unique(parent_fk)
+        for p in unique_parents:
+            mask = parent_fk == p
+            if mask.sum() <= 1:
+                continue
+            if rng.random() < p_sort:
+                result[mask] = np.sort(result[mask])
+
+        return torch.tensor(result, device=timestamps.device, dtype=timestamps.dtype)
+
     def generate_data(self, **kwargs) -> torch.Tensor:
         with torch.no_grad():
             if "parent_data_list" in kwargs:
@@ -1368,6 +1401,21 @@ class TableGenerator:
         self.pending_outputs = self.all_scm_outputs if self.all_scm_outputs else outputs
         self.pending_fk_ids = fk_ids
         self.pending_parent_tables = list(parent_tables) if parent_tables else []
+
+        # Phase 3: probabilistic intra-FK-group timestamp sort
+        if (
+            MASK_TYPE.TIMESTAMP in self.pending_outputs
+            and self.pending_fk_ids is not None
+        ):
+            p_sort = getattr(self, "p_sort", 0.0)
+            if p_sort > 0.0:
+                ts_sorted = self._apply_intra_group_sort(
+                    timestamps=self.pending_outputs[MASK_TYPE.TIMESTAMP].squeeze(-1),
+                    fk_ids=self.pending_fk_ids,
+                    p_sort=p_sort,
+                )
+                self.pending_outputs[MASK_TYPE.TIMESTAMP] = ts_sorted.unsqueeze(-1)
+
         self.row_embeddings = self._build_row_embedding()
 
     def _build_row_embedding(self) -> torch.Tensor | None:
@@ -1691,6 +1739,14 @@ class RDB:
             else:
                 sampled_gamma = 0.0
 
+            # Sample p_sort for intra-group sort (only for timestamp child tables)
+            if table.is_time_table and len(parent_tables) > 0:
+                p_sort_sample = hpsampler.sample()
+                sampled_p_sort_raw = p_sort_sample.get("p_sort", 0.5)
+                sampled_p_sort = sampled_p_sort_raw() if callable(sampled_p_sort_raw) else sampled_p_sort_raw
+            else:
+                sampled_p_sort = 0.0
+
             # 2nd dict: base parameters (without masks)
             base_params = {
                 "seq_len": seq_len,
@@ -1736,6 +1792,7 @@ class RDB:
                 device=self.device,
             )
             self.table_generators[table_name].dag_position = dag_position
+            self.table_generators[table_name].p_sort = sampled_p_sort
 
     def generate_one_table_data_from_SCM(
         self, table_name: str, parent_tables: List[str]
