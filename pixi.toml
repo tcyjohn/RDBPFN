@@ -19,14 +19,23 @@ h5py = ">=3.16.0,<4"
 typer = ">=0.25.1,<0.26"
 wandb = ">=0.26.1,<0.27"
 featuretools = ">=1.31.0,<2"
-setuptools = ">=82.0.1,<83"
+setuptools = ">=65,<70"
 hydra-core = ">=1.3,<2"
+huggingface_hub = ">=1.15.0,<2"
+sql-formatter = ">=0.2"
+tqdm = ">=4.67.3,<5"
+duckdb = ">=1.5.2,<2"
 
 
 [pypi-dependencies]
 torch = {version = ">=2.0", index = "https://download.pytorch.org/whl/cu124"}
 relbench = { version = ">=1.1.0, <2" }
 dbinfer-bench = ">=0.1, <0.2"
+sql-formatter = ">=0.6.2, <0.7"
+sqlglot = ">=30.8.0, <31"
+schedulefree = ">=1.4.1, <2"
+accelerate = ">=1.13.0, <2"
+scikit-learn = "*"
 
 [tasks]
 # 用法: pixi run peek-parquet <file.parquet> [--head N] [--schema-only] [--json-schema]

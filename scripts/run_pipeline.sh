@@ -1,6 +1,6 @@
 #!/bin/bash
 # Full pipeline: data generation → preprocessing → merge to h5 → training
-# Usage: bash scripts/run_pipeline.sh [num_rdbs] [start_index] [run_name] [skip_gen] [skip_preprocess] [skip_merge] [no_quality_filter] [quality_max_retries] [num_processes]
+# Usage: bash scripts/run_pipeline.sh [num_rdbs] [start_index] [run_name] [skip_gen] [skip_preprocess] [skip_merge] [no_quality_filter] [quality_max_retries] [num_processes] [skip_train]
 #   num_rdbs: number of RDBs to generate (default: 4)
 #   start_index: starting index (default: 0)
 #   run_name: output subdirectory name (default: auto-generated with timestamp, e.g. "run_20260515_003000")
@@ -36,6 +36,7 @@ SKIP_MERGE="${6:-false}"
 NO_QUALITY_FILTER="${7:-false}"
 QUALITY_MAX_RETRIES="${8:-3}"
 NUM_PROCESSES="${9:-$(nproc 2>/dev/null || echo 4)}"
+SKIP_TRAIN="${10:-false}"
 END_INDEX=$((START_INDEX + NUM_RDBS))
 
 RDB_GEN_DIR="${ROOT}/data_generation/RDB"
@@ -50,12 +51,51 @@ PRE_DFS_CONFIG="${ROOT}/data_preprocessing/configs/transform/pre-dfs.yaml"
 DFS_CONFIG="${ROOT}/data_preprocessing/configs/dfs/dfs-1-ft.yaml"
 POST_DFS_CONFIG="${ROOT}/data_preprocessing/configs/transform/post-dfs.yaml"
 
-# Build LD_LIBRARY_PATH from pixi env's nvidia libs
-PIXI_ENV="${ROOT}/.pixi/envs/default/lib/python3.10/site-packages"
-NVIDIA_LIBS=$(find "$PIXI_ENV/nvidia" -name "*.so*" -path "*/lib/*" 2>/dev/null | sed 's|/[^/]*$||' | sort -u | tr '\n' ':')
-export LD_LIBRARY_PATH="${NVIDIA_LIBS}${LD_LIBRARY_PATH:-}"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export HF_ENDPOINT="https://hf-mirror.com"
+
+# Proxy: forward from env if set (both cases for tool compatibility);
+# pixi run strips some env vars, so re-export explicitly
+if [ -n "${http_proxy:-}${HTTP_PROXY:-}" ]; then
+    _proxy="${http_proxy:-$HTTP_PROXY}"
+    export http_proxy="$_proxy"
+    export https_proxy="${https_proxy:-$_proxy}"
+    export HTTP_PROXY="$_proxy"
+    export HTTPS_PROXY="${https_proxy:-$_proxy}"
+    export no_proxy="${no_proxy:-localhost,127.0.0.1,api.wandb.ai,wandb.ai}"
+    export NO_PROXY="${NO_PROXY:-localhost,127.0.0.1,api.wandb.ai,wandb.ai}"
+    echo "Proxy: $_proxy"
+fi
+
+# Auto-detect free GPUs (utilization < 30%, memory used < 3GB)
+auto_select_gpus() {
+    if ! command -v nvidia-smi &>/dev/null; then
+        echo "WARNING: nvidia-smi not found; falling back to CUDA_VISIBLE_DEVICES=0"
+        echo "0"
+        return
+    fi
+    local free_gpus=""
+    local gpu_count
+    gpu_count=$(nvidia-smi -L 2>/dev/null | wc -l)
+    for ((i=0; i<gpu_count; i++)); do
+        local util mem_used
+        util=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits -i "$i" 2>/dev/null || echo "100")
+        mem_used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$i" 2>/dev/null || echo "999999")
+        if [ "${util}" -lt 30 ] && [ "${mem_used}" -lt 3072 ]; then
+            free_gpus="${free_gpus}${free_gpus:+,}$i"
+        fi
+    done
+    if [ -z "${free_gpus}" ]; then
+        echo "WARNING: no free GPUs found; falling back to all GPUs (0-$((gpu_count-1)))" >&2
+        seq 0 $((gpu_count-1)) | paste -sd,
+    else
+        echo "${free_gpus}"
+    fi
+}
+
+SELECTED_GPUS=$(auto_select_gpus)
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-$SELECTED_GPUS}"
+GPU_COUNT=$(echo "${CUDA_VISIBLE_DEVICES}" | tr ',' '\n' | wc -l)
+echo "GPUs available: ${GPU_COUNT} (CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES})"
 
 echo "╔══════════════════════════════════════════════════╗"
 echo "║     RDBPFN Full Pipeline                         ║"
@@ -222,12 +262,21 @@ echo "Eval CSVs ready in ${CLF_DIR} ($(ls "${CLF_DIR}"/*.csv 2>/dev/null | wc -l
 echo ""
 echo "=== [5/5] Launching training ==="
 
+if [ "${SKIP_TRAIN}" = "true" ]; then
+    echo "SKIP training"
+    echo ""
+    echo "╔══════════════════════════════════════════════════╗"
+    echo "║     Pipeline Complete!                            ║"
+    echo "╚══════════════════════════════════════════════════╝"
+    exit 0
+fi
+
 cd "${ROOT}/model_pretrain"
 
 pixi run torchrun \
     --standalone \
     --nnodes=1 \
-    --nproc_per_node="${NPROC:-2}" \
+    --nproc_per_node="${NPROC:-$GPU_COUNT}" \
     run_train.py \
     --config-name=RDBPFN_hsbm \
     "train.datasets.0.path=pretrain_datasets/${RUN_NAME}.h5" \

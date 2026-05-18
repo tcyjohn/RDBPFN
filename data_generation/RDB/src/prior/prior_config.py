@@ -1,6 +1,9 @@
 import torch.nn as nn
 from src.prior.activations import get_activations
 
+# Timestamp feature dimension: 11 features per row (t_min, gamma, and 9 cyclic time encodings).
+# Must match the temporal pipeline in mlp_scm.py and table_generation.py.
+TIME_DIM = 11
 
 """
     MLP SCM Config
