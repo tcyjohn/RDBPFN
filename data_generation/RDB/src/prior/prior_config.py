@@ -225,6 +225,54 @@ DEFAULT_SAMPLED_HP = {
     },
 }
 
+# Calendar-aligned Fourier seasonality + EventCalendar hyperparameters.
+# Sampled per-table (modulation) and per-RDB (event calendar).
+TEMPORAL_FOURIER_HP = {
+    # Per-table modulation weights
+    "m_week": {
+        "distribution": "uniform",
+        "min": 0.0,
+        "max": 1.0,
+    },
+    "m_month": {
+        "distribution": "uniform",
+        "min": 0.0,
+        "max": 0.2,
+    },
+    "m_year": {
+        "distribution": "uniform",
+        "min": 0.0,
+        "max": 0.3,
+    },
+    # Trend params
+    "m_lin": {
+        "distribution": "normal",
+        "mean": 0.0,
+        "std": 0.3,
+    },
+    "c_lin": {
+        "distribution": "normal",
+        "mean": 0.0,
+        "std": 0.1,
+    },
+    # Event calendar (per-RDB)
+    "event_H_min": 3,
+    "event_H_max": 8,
+    "event_importance_log_mu": -0.2,
+    "event_importance_log_sigma": 0.5,
+    "event_importance_clip_min": 0.2,
+    "event_importance_clip_max": 2.5,
+    "event_sigma_min": 1.0,
+    "event_sigma_max": 3.0,
+    # Per-table event sensitivity
+    "table_event_p": 0.4,
+    "table_sens_beta_alpha": 1.0,
+    "table_sens_beta_beta": 4.0,
+    # Noise
+    "noise_std_log_min": -3.0,
+    "noise_std_log_max": -1.0,
+}
+
 
 # HSBM FK generation hyperparameters — sampled per parent relation independently.
 DEFAULT_HSBM_HP = {

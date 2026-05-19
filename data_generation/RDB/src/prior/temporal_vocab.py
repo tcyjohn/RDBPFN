@@ -1,917 +1,435 @@
-# This file contains the temporal vocabulary for the SCM
+# Temporal vocabulary for SCM timestamp generation.
+# Calendar-aligned Fourier seasonality + EventCalendar (ForecastPFN-inspired).
+# DOW patterns via mixture of Dirichlets — structural templates, not ad-hoc bias.
 
 import torch
 import numpy as np
 from typing import Dict, List, Tuple, Optional
-from enum import Enum
 import random
+import math
 
-DEFAULT_NUM_POINTS = 1000
+DEFAULT_NUM_POINTS = 20000
+NUM_DAYS = 18262  # 50 years: 1970-01-01 to 2020-12-31
+
+# Mixture of Dirichlet templates for day-of-week patterns.
+# Each entry: (α vector, weight).  α controls concentration per DOW.
+# Smaller α → that day suppressed.  Larger α → that day boosted.
+DOW_TEMPLATES: List[Tuple[List[float], float]] = [
+    ([3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0], 0.28),   # near-uniform
+    ([3.0, 3.0, 3.0, 3.0, 3.0, 0.3, 0.3], 0.20),   # weekday-heavy (Mon-Fri)
+    ([0.3, 0.3, 0.3, 0.3, 0.3, 3.0, 3.0], 0.13),   # weekend-heavy (Sat-Sun)
+    ([3.0, 3.0, 3.0, 3.0, 0.3, 0.3, 0.3], 0.10),   # Mon-Thu heavy
+    ([0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 5.0], 0.07),   # Sun peak
+    ([5.0, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2], 0.05),   # Mon peak
+    ([0.2, 0.2, 0.2, 0.2, 0.2, 5.0, 0.2], 0.05),   # Sat peak
+    ([0.2, 0.2, 5.0, 0.2, 0.2, 0.2, 0.2], 0.04),   # Wed peak
+    ([8.0, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1], 0.03),   # extreme Mon peak
+    ([0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 8.0], 0.03),   # extreme Sun peak
+    ([0.1, 0.1, 0.1, 0.1, 0.1, 8.0, 0.1], 0.02),   # extreme Sat peak
+]
 
 
-class ComponentType(Enum):
-    TREND = "trend"
-    SEASONALITY = "seasonality"
-    SPIKES = "spikes"
-    NOISE = "noise"
+def _sample_dow_pvec(seed: int, device: str = "cpu") -> torch.Tensor:
+    """Sample a DOW probability vector from the Dirichlet mixture.
+
+    Returns (7,) tensor, sum=1, representing p(Mon), ..., p(Sun).
+    """
+    rng = np.random.RandomState(seed)
+    templates, weights = zip(*DOW_TEMPLATES)
+    weights = np.array(weights) / sum(weights)
+    idx = rng.choice(len(templates), p=weights)
+    alpha_base = np.array(templates[idx])
+
+    # Per-table concentration noise: multiply α by LogNormal to vary sharpness.
+    # Higher std → more tables land at extreme entropy.
+    concentration = float(np.exp(rng.normal(0.0, 0.7)))
+    alpha = alpha_base * concentration
+
+    p = rng.dirichlet(alpha)
+    return torch.tensor(p, device=device, dtype=torch.float32)
 
 
-class TemporalCombinationConfigs:
-    """Pre-defined temporal combination configurations."""
+class EventCalendar:
+    """RDB-level shared event calendar.
 
-    CONFIGS = {
-        "Trend-Dominated": {
-            "probs": {
-                ComponentType.TREND: 0.9,
-                ComponentType.SEASONALITY: 0.2,
-                ComponentType.SPIKES: 0.1,
-                ComponentType.NOISE: 0.3,
-            },
-            "amplitudes": {
-                ComponentType.TREND: 2.0,
-                ComponentType.SEASONALITY: 0.3,
-                ComponentType.SPIKES: 0.2,
-                ComponentType.NOISE: 0.1,
-            },
-        },
-        "Seasonality-Dominated": {
-            "probs": {
-                ComponentType.TREND: 0.3,
-                ComponentType.SEASONALITY: 0.9,
-                ComponentType.SPIKES: 0.1,
-                ComponentType.NOISE: 0.3,
-            },
-            "amplitudes": {
-                ComponentType.TREND: 0.5,
-                ComponentType.SEASONALITY: 1.5,
-                ComponentType.SPIKES: 0.2,
-                ComponentType.NOISE: 0.1,
-            },
-        },
-        "Spike-Dominated": {
-            "probs": {
-                ComponentType.TREND: 0.2,
-                ComponentType.SEASONALITY: 0.3,
-                ComponentType.SPIKES: 0.8,
-                ComponentType.NOISE: 0.3,
-            },
-            "amplitudes": {
-                ComponentType.TREND: 0.3,
-                ComponentType.SEASONALITY: 0.3,
-                ComponentType.SPIKES: 1.0,
-                ComponentType.NOISE: 0.1,
-            },
-        },
-        "Noise-Dominated": {
-            "probs": {
-                ComponentType.TREND: 0.2,
-                ComponentType.SEASONALITY: 0.2,
-                ComponentType.SPIKES: 0.1,
-                ComponentType.NOISE: 0.9,
-            },
-            "amplitudes": {
-                ComponentType.TREND: 0.3,
-                ComponentType.SEASONALITY: 0.2,
-                ComponentType.SPIKES: 0.1,
-                ComponentType.NOISE: 0.8,
-            },
-        },
-        "Balanced": {
-            "probs": {
-                ComponentType.TREND: 0.6,
-                ComponentType.SEASONALITY: 0.6,
-                ComponentType.SPIKES: 0.3,
-                ComponentType.NOISE: 0.5,
-            },
-            "amplitudes": {
-                ComponentType.TREND: 0.8,
-                ComponentType.SEASONALITY: 0.8,
-                ComponentType.SPIKES: 0.4,
-                ComponentType.NOISE: 0.2,
-            },
-        },
-        "Default": {
-            "probs": {
-                ComponentType.TREND: 0.8,
-                ComponentType.SEASONALITY: 0.6,
-                ComponentType.SPIKES: 0.3,
-                ComponentType.NOISE: 0.9,
-            },
-            "amplitudes": {
-                ComponentType.TREND: 1.0,
-                ComponentType.SEASONALITY: 0.5,
-                ComponentType.SPIKES: 0.3,
-                ComponentType.NOISE: 0.1,
-            },
-        },
-    }
+    Each event h:
+      base_doy_h   ~ U(0, 365)
+      sigma_h      ~ U(1.0, 3.0) days
+      importance_h ~ clip(LogNormal(-0.2, 0.5), 0.2, 2.5)
+
+    Per-table sensitivity:
+      active_r     ~ Bernoulli(0.4)
+      local_sens_h ~ Beta(1, 4)
+      sens_h       = active_r * local_sens_h
+    """
+
+    def __init__(self, seed: int, H: int = None, device: str = "cpu"):
+        self.device = device
+        rng = np.random.RandomState(seed)
+        self.H = H if H is not None else rng.randint(3, 9)
+
+        self.base_doys = torch.tensor(
+            [rng.uniform(0, 365) for _ in range(self.H)],
+            device=device, dtype=torch.float32,
+        )
+        self.sigmas = torch.tensor(
+            [rng.uniform(1.0, 3.0) for _ in range(self.H)],
+            device=device, dtype=torch.float32,
+        )
+        self.importances = torch.tensor(
+            [float(np.clip(rng.lognormal(-0.2, 0.5), 0.2, 2.5)) for _ in range(self.H)],
+            device=device, dtype=torch.float32,
+        )
+
+    @staticmethod
+    def sample_table_sens(H: int, seed: int, device: str = "cpu") -> torch.Tensor:
+        """Sample per-table sensitivity vector of shape (H,)."""
+        rng = np.random.RandomState(seed)
+        active = float(rng.random() < 0.4)
+        local_sens = torch.tensor(
+            [rng.beta(1, 4) for _ in range(H)],
+            device=device, dtype=torch.float32,
+        )
+        return active * local_sens
+
+    def evaluate(self, t: torch.Tensor, table_sens: torch.Tensor) -> torch.Tensor:
+        """Evaluate event contribution at day indices t.
+
+        Args:
+            t: (N,) day indices since epoch.
+            table_sens: (H,) per-table sensitivity.
+
+        Returns:
+            (N,) event contribution.
+        """
+        N = t.shape[0]
+        H = self.H
+        years = torch.floor(t / 365.25).unsqueeze(1)  # (N, 1)
+
+        # Deterministic per-year jitter via sine
+        jitter = self.sigmas.unsqueeze(0) * 0.3 * torch.sin(
+            years * 7.123 + self.base_doys.unsqueeze(0) * 0.731
+        )  # (N, H)
+
+        t_center = years * 365.25 + self.base_doys.unsqueeze(0) + jitter  # (N, H)
+        dist = (t.unsqueeze(1) - t_center) / self.sigmas.unsqueeze(0)  # (N, H)
+        contributions = torch.exp(-0.5 * dist ** 2)  # (N, H)
+
+        amp = self.importances * table_sens  # (H,)
+        return (contributions * amp.unsqueeze(0)).sum(dim=1)  # (N,)
+
+    def to_dict(self) -> dict:
+        return {
+            "H": self.H,
+            "base_doys": self.base_doys.cpu().tolist(),
+            "sigmas": self.sigmas.cpu().tolist(),
+            "importances": self.importances.cpu().tolist(),
+        }
 
     @classmethod
-    def get_random_config(cls):
-        """Randomly select a configuration from the predefined ones."""
-        config_name = random.choice(list(cls.CONFIGS.keys()))
-        return config_name, cls.CONFIGS[config_name]
-
-    @classmethod
-    def get_config(cls, name: str):
-        """Get a specific configuration by name."""
-        if name not in cls.CONFIGS:
-            raise ValueError(
-                f"Configuration '{name}' not found. Available: {list(cls.CONFIGS.keys())}"
-            )
-        return cls.CONFIGS[name]
+    def from_dict(cls, d: dict, device: str = "cpu") -> "EventCalendar":
+        obj = cls.__new__(cls)
+        obj.device = device
+        obj.H = d["H"]
+        obj.base_doys = torch.tensor(d["base_doys"], device=device, dtype=torch.float32)
+        obj.sigmas = torch.tensor(d["sigmas"], device=device, dtype=torch.float32)
+        obj.importances = torch.tensor(d["importances"], device=device, dtype=torch.float32)
+        return obj
 
 
 class TemporalVocab:
+    """Calendar-aligned temporal intensity generator.
+
+    Composition:
+        raw(t) = trend(t_norm) + seasonality(t) + events(t) + noise(t)
+        intensity(t) = softplus(raw(t)) * dow_factor(t)
+
+    where seasonality(t) uses Fourier series aligned to week/month/year periods,
+    events come from a shared EventCalendar with per-table sensitivity,
+    and dow_factor(t) = p_dow[dow(t)] * 7 is sampled from a Dirichlet mixture.
     """
-    Main temporal vocabulary that combines different temporal components.
 
-    The vocabulary includes:
-    - Trend: Linear, exponential, polynomial trends
-    - Seasonality: Periodic patterns with various frequencies
-    - Spikes: Sudden increases or decreases in intensity
-    - Noise: Random variations
-    """
-
-    def __init__(self, device: str = "cpu"):
-        """
-        Initialize the temporal vocabulary.
-
-        Parameters
-        ----------
-        device : str
-            Device to store tensors on
-        """
+    def __init__(self, device: str = "cpu", num_days: float = NUM_DAYS):
         self.device = device
-        self.components = {}
-        self.component_probs = {}
-        self.component_amplitudes = {}
+        self.num_days = num_days
 
-        # Initialize component vocabularies
         self.trend_vocab = TrendVocab(device=device)
-        self.seasonality_vocab = SeasonalityVocab(device=device)
-        self.spikes_vocab = SpikesVocab(device=device)
+        self.seasonality_vocab = SeasonalityVocab(device=device, num_days=num_days)
         self.noise_vocab = NoiseVocab(device=device)
 
-        # Component activation flags (set during generate())
-        self.trend_active: bool = False
-        self.seasonal_active: bool = False
-        self.spike_active: bool = False
+        self.event_calendar: Optional[EventCalendar] = None
+        self.table_sens: Optional[torch.Tensor] = None
+        self.intensity: Optional[torch.Tensor] = None
 
-        # Default probabilities and amplitudes
-        self._init_default_params()
+        self._sample_params()
 
-    def _init_default_params(self):
-        """Initialize default probabilities and amplitudes for components."""
-        # Randomly select one from pre-defined configurations
-        config_name, config = TemporalCombinationConfigs.get_random_config()
+    def _sample_params(self):
+        """Sample per-table modulation weights, trend params, and DOW pattern."""
+        self.m_week = random.uniform(0.0, 3.0)
+        self.m_month = random.uniform(0.0, 0.2)
+        self.m_year = random.uniform(0.0, 0.3)
 
-        # print(f"Selected temporal configuration: {config_name}")
+        # DOW pattern: Dirichlet mixture → probability vector
+        dow_seed = random.randint(0, 2**31 - 1)
+        self.p_dow = _sample_dow_pvec(dow_seed, self.device)  # (7,), sum=1
 
-        self.component_probs = config["probs"].copy()
-        self.component_amplitudes = config["amplitudes"].copy()
-        self.config_name = config_name
+        self.m_lin = random.gauss(0.0, 0.3)
+        self.c_lin = random.gauss(0.0, 0.1)
 
-    def init(
-        self,
-        component_probs: Dict[ComponentType, float] = None,
-        component_amplitudes: Dict[ComponentType, float] = None,
-    ):
-        """
-        Initialize the probabilities and amplitudes of different components.
+        self.noise_std = 10.0 ** random.uniform(-3.0, -1.0)  # log-uniform [0.001, 0.1]
 
-        Parameters
-        ----------
-        component_probs : Dict[ComponentType, float], optional
-            Probability of including each component type
-        component_amplitudes : Dict[ComponentType, float], optional
-            Amplitude/strength of each component type
-        """
-        if component_probs is not None:
-            self.component_probs.update(component_probs)
+        self.seasonality_vocab.sample_params()
 
-        if component_amplitudes is not None:
-            self.component_amplitudes.update(component_amplitudes)
+    def set_calendar(self, event_calendar: EventCalendar, table_sens: torch.Tensor):
+        """Attach an RDB-level event calendar with this table's sensitivity."""
+        self.event_calendar = event_calendar
+        self.table_sens = table_sens.to(self.device)
 
     def generate(
         self,
-        time_range: Tuple[float, float] = (0.0, 10.0),
+        time_range: Tuple[float, float] = (0.0, float(NUM_DAYS)),
         num_points: int = DEFAULT_NUM_POINTS,
     ) -> torch.Tensor:
-        """
-        Generate a temporal distribution by combining selected components.
+        """Generate temporal intensity distribution.
 
-        Parameters
-        ----------
-        time_range : Tuple[float, float]
-            Start and end time for the distribution
-        num_points : int
-            Number of time points to generate
-
-        Returns
-        -------
-        torch.Tensor
-            Generated temporal distribution (time_points, intensity)
+        Returns:
+            (num_points, 2) tensor: [t (days), intensity].
         """
         t_start, t_end = time_range
         t = torch.linspace(t_start, t_end, num_points, device=self.device)
 
-        # Initialize with baseline intensity
-        intensity = torch.ones_like(t, device=self.device, dtype=torch.float32)
+        # Trend (normalized)
+        t_norm = t / self.num_days
+        trend = self.m_lin * t_norm + self.c_lin
 
-        # Add components based on probabilities
-        self.trend_active = random.random() < self.component_probs[ComponentType.TREND]
-        if self.trend_active:
-            trend_component = self.trend_vocab.generate(t)
-            intensity += (
-                self.component_amplitudes[ComponentType.TREND] * trend_component
-            )
+        # Fourier seasonality
+        seasonal = self.seasonality_vocab.evaluate(t)
+        seasonal = self.m_week * seasonal[0] + self.m_month * seasonal[1] + self.m_year * seasonal[2]
 
-        self.seasonal_active = random.random() < self.component_probs[ComponentType.SEASONALITY]
-        if self.seasonal_active:
-            seasonal_component = self.seasonality_vocab.generate(t)
-            intensity += (
-                self.component_amplitudes[ComponentType.SEASONALITY]
-                * seasonal_component
-            )
+        # DOW multiplicative factor: p_dow[dow] * 7, mean≈1
+        dow_idx = ((t.long() + 4) % 7).to(self.device)  # 1970-01-01 is Thursday (dow=4)
+        dow_factor = self.p_dow[dow_idx] * 7.0  # (N,), mean ≈ 1
 
-        self.spike_active = random.random() < self.component_probs[ComponentType.SPIKES]
-        if self.spike_active:
-            spikes_component = self.spikes_vocab.generate(t)
-            intensity += (
-                self.component_amplitudes[ComponentType.SPIKES] * spikes_component
-            )
+        # Events
+        if self.event_calendar is not None and self.table_sens is not None:
+            events = self.event_calendar.evaluate(t, self.table_sens)
+        else:
+            events = torch.zeros_like(t)
 
-        if random.random() < self.component_probs[ComponentType.NOISE]:
-            noise_component = self.noise_vocab.generate(t)
-            intensity += (
-                self.component_amplitudes[ComponentType.NOISE] * noise_component
-            )
+        # Noise
+        noise = self.noise_std * torch.randn_like(t)
 
-        # Ensure non-negative intensity
-        intensity = torch.clamp(intensity, min=0.01)
+        # Compose: base intensity via softplus, then multiply by DOW factor
+        raw = trend + seasonal + events + noise
+        base_intensity = torch.nn.functional.softplus(raw)
+        intensity = base_intensity * dow_factor
 
         self.intensity = intensity
-
         return torch.stack([t, intensity], dim=1)
-
-    def norm_intensity(self) -> torch.Tensor:
-        """
-        Normalize the intensity with mean 1, std 1, and clip to be non-negative and less than 10.
-        """
-        # Standardize to mean=0, std=1, then shift to mean=1
-        intensity = (
-            self.intensity - self.intensity.mean()
-        ) / self.intensity.std() + 1.0
-        # Fill nan with 1
-        intensity = torch.where(
-            torch.isnan(intensity), torch.ones_like(intensity), intensity
-        )
-        intensity = torch.clamp(intensity, min=0.01, max=10.0)
-        self.intensity = intensity
-        return
-
-    @property
-    def get_intensity(self) -> torch.Tensor:
-        """
-        Get the intensity of the temporal distribution.
-        """
-        return self.intensity
-
-    def sample(
-        self,
-        num_samples: int,
-        time_range: Tuple[float, float] = (0.0, 10.0),
-        num_points: int = DEFAULT_NUM_POINTS,
-        distribution: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Sample event times from the generated temporal distribution.
-
-        Parameters
-        ----------
-        num_samples : int
-            Number of samples to generate
-        time_range : Tuple[float, float]
-            Time range for sampling
-        distribution : torch.Tensor, optional
-            Pre-generated distribution. If None, generates new one.
-
-        Returns
-        -------
-        torch.Tensor
-            Sampled event indices
-        """
-        if distribution is None:
-            distribution = self.generate(time_range, num_points=num_points)
-
-        # t_points = distribution[:, 0]
-        intensity = distribution[:, 1]
-
-        # Normalize intensity to create probability distribution
-        probs = intensity / intensity.sum()
-
-        # Sample indices based on probabilities
-        sample_indices = torch.multinomial(probs, num_samples, replacement=True)
-
-        # # Get corresponding time points
-        # sampled_times = t_points[sample_indices]
-
-        # # Sort samples
-        # sampled_times = torch.sort(sampled_times)[0]
-
-        return sample_indices
 
     def sample_time(
         self,
         num_samples: int,
-        time_range: Tuple[float, float] = (0.0, 10.0),
+        time_range: Tuple[float, float] = (0.0, float(NUM_DAYS)),
         num_points: int = DEFAULT_NUM_POINTS,
         distribution: Optional[torch.Tensor] = None,
         t_min: Optional[torch.Tensor] = None,
         gamma: float = 0.0,
     ) -> torch.Tensor:
-        """Sample event times, optionally with per-row lower bounds.
+        """Sample event times with optional per-row lower bounds.
 
         Args:
             num_samples: Number of samples (rows).
-            time_range: Global (min_t, max_t).
+            time_range: (min_t, max_t) in days.
             num_points: Discretization grid size.
             distribution: Pre-generated (t, intensity) tensor.
-            t_min: Optional (num_samples,) tensor of per-row lower bounds in
-                   raw time units (same scale as time_range).
-            gamma: Lifecycle decay strength. 0 = no decay.
+            t_min: Optional (num_samples,) per-row lower bounds in days.
+            gamma: Lifecycle decay strength.
 
         Returns:
-            Sampled times (num_samples,) sorted ascending, in raw time units.
+            (num_samples,) sampled day indices, unsorted.
         """
         if distribution is None:
             distribution = self.generate(time_range, num_points=num_points)
 
-        t_points = distribution[:, 0]  # (K,)
-        intensity = distribution[:, 1]  # (K,)
+        t_points = distribution[:, 0]
+        intensity = distribution[:, 1]
         K = t_points.shape[0]
         device = t_points.device
 
-        # Per-row intensity: shape (num_samples, K)
         if t_min is not None:
-            t_min_clamped = t_min.to(device).clamp(
-                min=time_range[0], max=time_range[1]
-            )  # (N,)
-            mask = t_points.unsqueeze(0) >= t_min_clamped.unsqueeze(1)  # (N, K)
-            intensity_bc = intensity.unsqueeze(0) * mask.float()  # (N, K)
+            t_min_clamped = t_min.to(device).clamp(min=time_range[0], max=time_range[1])
+            mask = t_points.unsqueeze(0) >= t_min_clamped.unsqueeze(1)
+            intensity_bc = intensity.unsqueeze(0) * mask.float()
         else:
-            intensity_bc = intensity.unsqueeze(0).expand(num_samples, -1)  # (N, K)
+            intensity_bc = intensity.unsqueeze(0).expand(num_samples, -1)
 
-        # --- Task 2.2: Lifecycle decay ---
         if gamma > 0.0 and t_min is not None:
-            # tau = (t - t_min) / (T_max - t_min), normalized relative time
             tau = (t_points.unsqueeze(0) - t_min_clamped.unsqueeze(1)) / (
                 time_range[1] - t_min_clamped.unsqueeze(1)
-            ).clamp(min=1e-8)  # (N, K)
+            ).clamp(min=1e-8)
             tau = tau.clamp(min=0.0)
             decay = torch.exp(-gamma * tau)
             intensity_bc = intensity_bc * decay
 
-        # Renormalize per row; guard against all-zero rows
-        row_sums = intensity_bc.sum(dim=1, keepdim=True)  # (N, 1)
-        row_sums = row_sums.clamp(min=1e-12)
-        probs = intensity_bc / row_sums  # (N, K)
+        row_sums = intensity_bc.sum(dim=1, keepdim=True).clamp(min=1e-12)
+        probs = intensity_bc / row_sums
 
-        sample_indices = torch.multinomial(probs, 1, replacement=True).squeeze(-1)  # (N,)
+        sample_indices = torch.multinomial(probs, 1, replacement=True).squeeze(-1)
         sampled_times = t_points[sample_indices]
-        return sampled_times  # unsorted: row i's timestamp corresponds to row i's t_min
-
-    def retrieve(self, t: torch.Tensor) -> torch.Tensor:
-        """
-        Retrieve the intensity of the temporal distribution at a given time point.
-        """
-        return self.generate(t)
-
-    def __len__(self):
-        """Return total number of component patterns available."""
-        return (
-            len(self.trend_vocab)
-            + len(self.seasonality_vocab)
-            + len(self.spikes_vocab)
-            + len(self.noise_vocab)
-        )
+        return sampled_times
 
     def evaluate_basis(self, t: torch.Tensor) -> torch.Tensor:
-        """Evaluate all active basis components at time points t.
+        """Evaluate basis features at day indices t.
 
         Args:
-            t: (N,) tensor, normalized time values in [0, 1] on self.device.
+            t: (N,) day indices.
+
         Returns:
-            (N, 8) tensor:
-              [trend_level, trend_slope,
-               season_low_sin, season_low_cos, season_high_sin, season_high_cos,
-               spike_amplitude, spike_decay]
-            Inactive components output zeros in their slots.
+            (N, 8): [trend_level, trend_slope, week_sin1, week_cos1,
+                      month_sin1, dow_factor, year_sin1, year_cos1].
         """
         N = t.shape[0]
-        pieces: list[torch.Tensor] = []
 
-        if getattr(self, "trend_active", False):
-            pieces.append(self.trend_vocab.evaluate(t))  # (N, 2)
-        else:
-            pieces.append(torch.zeros(N, 2, device=self.device, dtype=t.dtype))
+        # Trend basis
+        t_norm = t / self.num_days
+        trend_level = self.m_lin * t_norm + self.c_lin
+        trend_slope = torch.full_like(t, self.m_lin / self.num_days)
 
-        if getattr(self, "seasonal_active", False):
-            pieces.append(self.seasonality_vocab.evaluate(t))  # (N, 4)
-        else:
-            pieces.append(torch.zeros(N, 4, device=self.device, dtype=t.dtype))
+        # Fourier basis: first harmonic of each period
+        w_sin1 = torch.sin(2 * np.pi * t / 7.0)
+        w_cos1 = torch.cos(2 * np.pi * t / 7.0)
+        m_sin1 = torch.sin(2 * np.pi * t / 30.4375)
+        y_sin1 = torch.sin(2 * np.pi * t / 365.25)
+        y_cos1 = torch.cos(2 * np.pi * t / 365.25)
 
-        if getattr(self, "spike_active", False):
-            pieces.append(self.spikes_vocab.evaluate(t))  # (N, 2)
-        else:
-            pieces.append(torch.zeros(N, 2, device=self.device, dtype=t.dtype))
+        # DOW multiplicative factor at each time point
+        dow_idx = ((t.long() + 4) % 7).to(self.device)
+        dow_factor = self.p_dow[dow_idx] * 7.0
 
-        return torch.cat(pieces, dim=-1)  # (N, 8)
+        return torch.stack([
+            trend_level, trend_slope,
+            w_sin1, w_cos1,
+            m_sin1, dow_factor,
+            y_sin1, y_cos1,
+        ], dim=-1)
 
     def build_gate_vector(self) -> torch.Tensor:
-        """Return (3,) float tensor: [trend_active, seasonal_active, spike_active]."""
+        """Return (3,) float: [trend_active, seasonal_active, events_active]."""
+        events_active = 1.0 if (self.event_calendar is not None and
+                                self.table_sens is not None and
+                                self.table_sens.sum() > 0) else 0.0
         return torch.tensor(
-            [
-                float(getattr(self, "trend_active", False)),
-                float(getattr(self, "seasonal_active", False)),
-                float(getattr(self, "spike_active", False)),
-            ],
-            device=self.device,
-            dtype=torch.float32,
+            [1.0, 1.0, events_active],
+            device=self.device, dtype=torch.float32,
         )
+
+    @property
+    def get_intensity(self) -> torch.Tensor:
+        return self.intensity
+
+    def __len__(self):
+        return 3  # trend, seasonality, events
 
 
 class TrendVocab:
-    """Vocabulary for trend components."""
+    """Simple linear trend component."""
 
     def __init__(self, device: str = "cpu"):
         self.device = device
-        self.patterns = [
-            "linear_increasing",
-            "linear_decreasing",
-            "exponential_growth",
-            "exponential_decay",
-            "polynomial_quadratic",
-            "polynomial_cubic",
-            "logistic_growth",
-            "power_law",
-            "logarithmic",
-            "constant",
-        ]
 
-    def init(self, pattern_probs: Dict[str, float] = None):
-        """
-        Initialize probabilities for different trend patterns.
-
-        Parameters
-        ----------
-        pattern_probs : Dict[str, float], optional
-            Probability of selecting each pattern
-        """
-        if pattern_probs is None:
-            # Default uniform probabilities
-            self.pattern_probs = {
-                pattern: 1.0 / len(self.patterns) for pattern in self.patterns
-            }
-        else:
-            self.pattern_probs = pattern_probs
-
-    def generate(self, t: torch.Tensor) -> torch.Tensor:
-        """
-        Generate a trend component.
-
-        Parameters
-        ----------
-        t : torch.Tensor
-            Time points
-
-        Returns
-        -------
-        torch.Tensor
-            Trend values
-        """
-        if not hasattr(self, "pattern_probs"):
-            self.init()
-
-        # Select pattern based on probabilities
-        pattern_names = list(self.pattern_probs.keys())
-        pattern_weights = list(self.pattern_probs.values())
-        selected_pattern = np.random.choice(
-            pattern_names, p=np.array(pattern_weights) / sum(pattern_weights)
-        )
-
-        # Generate trend based on selected pattern
-        if selected_pattern == "linear_increasing":
-            slope = random.uniform(0.1, 1.0)
-            return slope * t
-
-        elif selected_pattern == "linear_decreasing":
-            slope = random.uniform(-1.0, -0.1)
-            return slope * t
-
-        elif selected_pattern == "exponential_growth":
-            rate = random.uniform(0.1, 0.5)
-            return torch.exp(rate * t) - 1
-
-        elif selected_pattern == "exponential_decay":
-            rate = random.uniform(0.1, 0.5)
-            return torch.exp(-rate * t)
-
-        elif selected_pattern == "polynomial_quadratic":
-            a = random.uniform(-0.1, 0.1)
-            b = random.uniform(-0.5, 0.5)
-            return a * t**2 + b * t
-
-        elif selected_pattern == "polynomial_cubic":
-            a = random.uniform(-0.01, 0.01)
-            b = random.uniform(-0.1, 0.1)
-            c = random.uniform(-0.5, 0.5)
-            return a * t**3 + b * t**2 + c * t
-
-        elif selected_pattern == "logistic_growth":
-            k = random.uniform(1.0, 5.0)  # carrying capacity
-            r = random.uniform(0.1, 1.0)  # growth rate
-            t0 = random.uniform(0.2, 0.8) * t.max()  # inflection point
-            return k / (1 + torch.exp(-r * (t - t0)))
-
-        elif selected_pattern == "power_law":
-            alpha = random.uniform(0.5, 2.0)
-            return torch.pow(t + 1, alpha) - 1
-
-        elif selected_pattern == "logarithmic":
-            scale = random.uniform(0.5, 2.0)
-            return scale * torch.log(t + 1)
-
-        else:  # constant
-            return torch.zeros_like(t)
-
-    def __len__(self):
-        return len(self.patterns)
-
-    def evaluate(self, t: torch.Tensor) -> torch.Tensor:
-        """Evaluate trend basis at arbitrary t.
-
-        Args:
-            t: (N,) tensor of normalized time values in [0, 1].
-        Returns:
-            (N, 2) tensor: [level (normalized value), slope (finite-difference derivative)].
-        """
-        if not hasattr(self, "pattern_probs"):
-            self.init()
-
-        pattern_names = list(self.pattern_probs.keys())
-        pattern_weights = list(self.pattern_probs.values())
-        selected_pattern = np.random.choice(
-            pattern_names, p=np.array(pattern_weights) / sum(pattern_weights)
-        )
-        level = self._eval_trend_level(selected_pattern, t)
-        slope = self._eval_trend_slope(selected_pattern, t)
-        # Soft-clip to avoid extreme values
-        level = torch.tanh(level * 0.1)
-        slope = torch.tanh(slope * 0.5)
-        return torch.stack([level, slope], dim=-1)
-
-    def _eval_trend_level(self, pattern: str, t: torch.Tensor) -> torch.Tensor:
-        pattern = getattr(self, "_eval_pattern", pattern) if hasattr(self, "_eval_pattern") else pattern
-        if pattern == "linear_increasing":
-            return 0.5 * t
-        elif pattern == "linear_decreasing":
-            return -0.5 * t
-        elif pattern == "exponential_growth":
-            return (torch.exp(0.3 * t) - 1) / (torch.exp(torch.tensor(0.3)) - 1 + 1e-8)
-        elif pattern == "exponential_decay":
-            return torch.exp(-0.3 * t)
-        elif pattern == "polynomial_quadratic":
-            return 0.05 * t**2 + 0.25 * t
-        elif pattern == "polynomial_cubic":
-            return 0.005 * t**3 + 0.02 * t**2 + 0.15 * t
-        elif pattern == "logistic_growth":
-            return 1.0 / (1 + torch.exp(-2.0 * (t - 0.5)))
-        elif pattern == "power_law":
-            return torch.pow(t + 0.1, 0.8) - 0.1**0.8
-        elif pattern == "logarithmic":
-            return 0.3 * torch.log(t + 0.1) + 0.7
-        else:  # constant
-            return torch.zeros_like(t)
-
-    def _eval_trend_slope(self, pattern: str, t: torch.Tensor) -> torch.Tensor:
-        dt = 0.001
-        t_plus = t + dt
-        level = self._eval_trend_level(pattern, t)
-        level_plus = self._eval_trend_level(pattern, t_plus)
-        return (level_plus - level) / dt
+    def evaluate(self, t_norm: torch.Tensor, m_lin: float, c_lin: float) -> torch.Tensor:
+        """Evaluate trend at normalized time points."""
+        return m_lin * t_norm + c_lin
 
 
 class SeasonalityVocab:
-    """Vocabulary for seasonality components."""
+    """Calendar-aligned Fourier seasonality.
 
-    def __init__(self, device: str = "cpu"):
+    Three periods, each with multiple harmonics:
+      week:  3 harmonics, period = 7 days
+      month: 6 harmonics, period = 30.4375 days
+      year:  6 harmonics, period = 365.25 days
+
+    Coefficients c_f, d_f ~ N(0, 1/f), rescaled to unit norm.
+    """
+
+    def __init__(self, device: str = "cpu", num_days: float = NUM_DAYS):
         self.device = device
-        self.patterns = [
-            "sinusoidal",
-            "cosine",
-            "sawtooth",
-            "square_wave",
-            "triangle_wave",
-            "multi_frequency",
-            "damped_oscillation",
-            "frequency_modulation",
-            "amplitude_modulation",
-            "harmonic_series",
-        ]
+        self.num_days = num_days
+        self.week_nharm = 3
+        self.month_nharm = 6
+        self.year_nharm = 6
 
-    def init(self, pattern_probs: Dict[str, float] = None):
-        """Initialize probabilities for different seasonality patterns."""
-        if pattern_probs is None:
-            self.pattern_probs = {
-                pattern: 1.0 / len(self.patterns) for pattern in self.patterns
-            }
-        else:
-            self.pattern_probs = pattern_probs
+    def sample_params(self):
+        """Sample per-table Fourier coefficients."""
+        self.week_coeffs = self._sample_fourier_coeffs(self.week_nharm)
+        self.month_coeffs = self._sample_fourier_coeffs(self.month_nharm)
+        self.year_coeffs = self._sample_fourier_coeffs(self.year_nharm)
 
-    def generate(self, t: torch.Tensor) -> torch.Tensor:
-        """Generate a seasonality component."""
-        if not hasattr(self, "pattern_probs"):
-            self.init()
+    def _sample_fourier_coeffs(self, n_harmonics: int) -> torch.Tensor:
+        """Sample c_f, d_f ~ N(0, 1/f), rescale to unit norm.
 
-        pattern_names = list(self.pattern_probs.keys())
-        pattern_weights = list(self.pattern_probs.values())
-        selected_pattern = np.random.choice(
-            pattern_names, p=np.array(pattern_weights) / sum(pattern_weights)
-        )
+        Returns:
+            (n_harmonics * 2,) tensor: [c_1, ..., c_F, d_1, ..., d_F].
+        """
+        coeffs = []
+        for f in range(1, n_harmonics + 1):
+            std = 1.0 / f
+            coeffs.append(random.gauss(0, std))  # c_f
+            coeffs.append(random.gauss(0, std))  # d_f
+        t = torch.tensor(coeffs, device=self.device, dtype=torch.float32)
+        norm = t.norm()
+        if norm > 1e-8:
+            t = t / norm
+        return t
 
-        # Base frequency and parameters
-        frequency = random.uniform(0.5, 3.0)
-        phase = random.uniform(0, 2 * np.pi)
-
-        if selected_pattern == "sinusoidal":
-            return torch.sin(2 * np.pi * frequency * t + phase)
-
-        elif selected_pattern == "cosine":
-            return torch.cos(2 * np.pi * frequency * t + phase)
-
-        elif selected_pattern == "sawtooth":
-            return (
-                2
-                * (
-                    frequency * t
-                    + phase / (2 * np.pi)
-                    - torch.floor(frequency * t + phase / (2 * np.pi))
-                )
-                - 1
-            )
-
-        elif selected_pattern == "square_wave":
-            return torch.sign(torch.sin(2 * np.pi * frequency * t + phase))
-
-        elif selected_pattern == "triangle_wave":
-            return (
-                2 / np.pi * torch.arcsin(torch.sin(2 * np.pi * frequency * t + phase))
-            )
-
-        elif selected_pattern == "multi_frequency":
-            # Combine multiple frequencies
-            result = torch.zeros_like(t)
-            for i in range(random.randint(2, 4)):
-                freq_i = frequency * (i + 1)
-                weight_i = 1.0 / (i + 1)
-                result += weight_i * torch.sin(2 * np.pi * freq_i * t + phase)
-            return result
-
-        elif selected_pattern == "damped_oscillation":
-            decay_rate = random.uniform(0.1, 1.0)
-            return torch.exp(-decay_rate * t) * torch.sin(
-                2 * np.pi * frequency * t + phase
-            )
-
-        elif selected_pattern == "frequency_modulation":
-            mod_freq = frequency / random.uniform(2, 5)
-            mod_depth = random.uniform(0.5, 2.0)
-            instantaneous_freq = frequency + mod_depth * torch.sin(
-                2 * np.pi * mod_freq * t
-            )
-            return torch.sin(
-                2 * np.pi * torch.cumsum(instantaneous_freq, dim=0) * (t[1] - t[0])
-                + phase
-            )
-
-        elif selected_pattern == "amplitude_modulation":
-            mod_freq = frequency / random.uniform(3, 8)
-            mod_depth = random.uniform(0.3, 0.8)
-            envelope = 1 + mod_depth * torch.sin(2 * np.pi * mod_freq * t)
-            return envelope * torch.sin(2 * np.pi * frequency * t + phase)
-
-        else:  # harmonic_series
-            result = torch.zeros_like(t)
-            for n in range(1, random.randint(4, 7)):
-                harmonic_weight = 1.0 / n
-                result += harmonic_weight * torch.sin(
-                    2 * np.pi * n * frequency * t + phase
-                )
-            return result
-
-    def __len__(self):
-        return len(self.patterns)
-
-    def evaluate(self, t: torch.Tensor) -> torch.Tensor:
-        """Evaluate seasonal basis at arbitrary t.
+    def _eval_fourier_series(
+        self, t: torch.Tensor, period: float, coeffs: torch.Tensor
+    ) -> torch.Tensor:
+        """Evaluate Fourier series at day indices t.
 
         Args:
-            t: (N,) tensor of normalized time values in [0, 1].
+            t: (N,) day indices.
+            period: Period in days.
+            coeffs: (2F,) tensor [c_1..c_F, d_1..d_F].
+
         Returns:
-            (N, 4) tensor: [low_sin, low_cos, high_sin, high_cos].
-            Low frequency: ~1 cycle over [0,1]. High frequency: ~4 cycles.
+            (N,) series values.
         """
-        low_freq = 2.0 * torch.pi * 1.0
-        high_freq = 2.0 * torch.pi * 4.0
-        low_sin = torch.sin(low_freq * t)
-        low_cos = torch.cos(low_freq * t)
-        high_sin = torch.sin(high_freq * t)
-        high_cos = torch.cos(high_freq * t)
-        return torch.stack([low_sin, low_cos, high_sin, high_cos], dim=-1)
-
-
-class SpikesVocab:
-    """Vocabulary for spike components."""
-
-    def __init__(self, device: str = "cpu"):
-        self.device = device
-        self.patterns = [
-            "gaussian_spikes",
-            "exponential_spikes",
-            "rectangular_spikes",
-            "triangular_spikes",
-            "clustered_spikes",
-            "periodic_spikes",
-            "random_spikes",
-            "burst_spikes",
-        ]
-
-    def init(self, pattern_probs: Dict[str, float] = None):
-        """Initialize probabilities for different spike patterns."""
-        if pattern_probs is None:
-            self.pattern_probs = {
-                pattern: 1.0 / len(self.patterns) for pattern in self.patterns
-            }
-        else:
-            self.pattern_probs = pattern_probs
-
-    def generate(self, t: torch.Tensor) -> torch.Tensor:
-        """Generate a spikes component."""
-        if not hasattr(self, "pattern_probs"):
-            self.init()
-
-        pattern_names = list(self.pattern_probs.keys())
-        pattern_weights = list(self.pattern_probs.values())
-        selected_pattern = np.random.choice(
-            pattern_names, p=np.array(pattern_weights) / sum(pattern_weights)
-        )
-
+        F = len(coeffs) // 2
+        omega = 2 * np.pi / period
         result = torch.zeros_like(t)
-        num_spikes = random.randint(1, 5)
-
-        for _ in range(num_spikes):
-            # Random spike location and parameters
-            spike_center = random.uniform(t.min().item(), t.max().item())
-            spike_width = random.uniform(0.1, 0.5) * (t.max() - t.min()) / 10
-            spike_amplitude = random.uniform(0.5, 2.0)
-
-            if selected_pattern == "gaussian_spikes":
-                spike = spike_amplitude * torch.exp(
-                    -0.5 * ((t - spike_center) / spike_width) ** 2
-                )
-
-            elif selected_pattern == "exponential_spikes":
-                spike = spike_amplitude * torch.exp(
-                    -torch.abs(t - spike_center) / spike_width
-                )
-
-            elif selected_pattern == "rectangular_spikes":
-                spike = torch.where(
-                    torch.abs(t - spike_center) <= spike_width,
-                    spike_amplitude,
-                    torch.tensor(0.0),
-                )
-
-            elif selected_pattern == "triangular_spikes":
-                distance = torch.abs(t - spike_center)
-                spike = torch.where(
-                    distance <= spike_width,
-                    spike_amplitude * (1 - distance / spike_width),
-                    torch.tensor(0.0),
-                )
-
-            else:  # Default to Gaussian
-                spike = spike_amplitude * torch.exp(
-                    -0.5 * ((t - spike_center) / spike_width) ** 2
-                )
-
-            result += spike
-
+        for f in range(F):
+            c = coeffs[f]
+            d = coeffs[F + f]
+            freq = (f + 1) * omega
+            result += c * torch.sin(freq * t) + d * torch.cos(freq * t)
         return result
 
-    def __len__(self):
-        return len(self.patterns)
+    def evaluate(self, t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Evaluate all three Fourier series at day indices t.
 
-    def evaluate(self, t: torch.Tensor) -> torch.Tensor:
-        """Evaluate spike basis at arbitrary t.
-
-        Args:
-            t: (N,) tensor of normalized time values in [0, 1].
         Returns:
-            (N, 2) tensor: [amplitude (combined spike contributions), decay (exp distance to nearest spike)].
+            (week_vals, month_vals, year_vals): each (N,).
         """
-        if not hasattr(self, "_spike_params_for_eval"):
-            self._spike_params_for_eval = []
-            n_spikes = 2
-            for _ in range(n_spikes):
-                center = float(np.random.uniform(0.1, 0.9))
-                width = float(np.random.uniform(0.02, 0.08))
-                amp = float(np.random.uniform(0.5, 2.0))
-                self._spike_params_for_eval.append((center, width, amp))
+        week = self._eval_fourier_series(t, 7.0, self.week_coeffs)
+        month = self._eval_fourier_series(t, 30.4375, self.month_coeffs)
+        year = self._eval_fourier_series(t, 365.25, self.year_coeffs)
+        return week, month, year
 
-        amplitude = torch.zeros_like(t)
-        min_dist = torch.full_like(t, float("inf"))
-        for center, width, amp in self._spike_params_for_eval:
-            dist = torch.abs(t - center)
-            amplitude += amp * torch.exp(-0.5 * (dist / width)**2)
-            min_dist = torch.minimum(min_dist, dist)
-
-        decay = torch.exp(-3.0 * min_dist)
-        amplitude = torch.tanh(amplitude * 0.3)
-        return torch.stack([amplitude, decay], dim=-1)
+    def __len__(self):
+        return (self.week_nharm + self.month_nharm + self.year_nharm) * 2
 
 
 class NoiseVocab:
-    """Vocabulary for noise components."""
+    """Small Gaussian noise for temporal intensity."""
 
     def __init__(self, device: str = "cpu"):
         self.device = device
-        self.patterns = [
-            "white_noise",
-            "colored_noise",
-            "brownian_motion",
-            "ou_process",  # Ornstein-Uhlenbeck
-            "fractional_brownian",
-            "poisson_noise",
-            "uniform_noise",
-        ]
 
-    def init(self, pattern_probs: Dict[str, float] = None):
-        """Initialize probabilities for different noise patterns."""
-        if pattern_probs is None:
-            self.pattern_probs = {
-                pattern: 1.0 / len(self.patterns) for pattern in self.patterns
-            }
-        else:
-            self.pattern_probs = pattern_probs
-
-    def generate(self, t: torch.Tensor) -> torch.Tensor:
-        """Generate a noise component."""
-        if not hasattr(self, "pattern_probs"):
-            self.init()
-
-        pattern_names = list(self.pattern_probs.keys())
-        pattern_weights = list(self.pattern_probs.values())
-        selected_pattern = np.random.choice(
-            pattern_names, p=np.array(pattern_weights) / sum(pattern_weights)
-        )
-
-        if selected_pattern == "white_noise":
-            return torch.randn_like(t, device=self.device)
-
-        elif selected_pattern == "colored_noise":
-            # Simple colored noise (low-pass filtered white noise)
-            white = torch.randn_like(t, device=self.device)
-            alpha = random.uniform(0.1, 0.9)
-            colored = torch.zeros_like(white)
-            colored[0] = white[0]
-            for i in range(1, len(white)):
-                colored[i] = alpha * colored[i - 1] + (1 - alpha) * white[i]
-            return colored
-
-        elif selected_pattern == "brownian_motion":
-            increments = torch.randn_like(t, device=self.device)
-            return torch.cumsum(increments, dim=0)
-
-        elif selected_pattern == "ou_process":
-            # Ornstein-Uhlenbeck process
-            theta = random.uniform(0.1, 1.0)  # mean reversion rate
-            sigma = random.uniform(0.5, 1.5)  # volatility
-            dt = (t[1] - t[0]).item() if len(t) > 1 else 0.01
-
-            ou = torch.zeros_like(t)
-            for i in range(1, len(t)):
-                dW = torch.randn(1, device=self.device) * torch.sqrt(torch.tensor(dt))
-                ou[i] = ou[i - 1] + theta * (0 - ou[i - 1]) * dt + sigma * dW
-            return ou
-
-        elif selected_pattern == "uniform_noise":
-            return torch.rand_like(t, device=self.device) * 2 - 1  # Range [-1, 1]
-
-        else:  # Default to white noise
-            return torch.randn_like(t, device=self.device)
+    def generate(self, t: torch.Tensor, std: float = 0.01) -> torch.Tensor:
+        return std * torch.randn_like(t, device=self.device)
 
     def __len__(self):
-        return len(self.patterns)
+        return 1

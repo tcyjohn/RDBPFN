@@ -386,11 +386,11 @@ class MLPSCM(nn.Module):
 
         Args:
             n: Number of rows to sample.
-            t_min: Optional (n,) tensor of per-row lower bounds in [0, 1]
-                   (normalized). If None, defaults to 0 for all rows.
+            t_min: Optional (n,) tensor of per-row lower bounds **in days**
+                   (same scale as NUM_DAYS). If None, defaults to 0.
 
         Returns:
-            timestamps_norm: (n,) in [0, 1] — for storage in X[MASK_TYPE.TIMESTAMP].
+            timestamps_days: (n,) day indices — stored in X[MASK_TYPE.TIMESTAMP].
             time_features: (n, self.time_dim) — basis(8) + gates(3), MLP input.
         """
         if n <= 0:
@@ -398,23 +398,27 @@ class MLPSCM(nn.Module):
         if self.temporal_vocab is None:
             raise RuntimeError("temporal_vocab is unset; time_dim must be > 0")
 
-        # 1. Generate intensity distribution once
-        self.temporal_vocab.generate(time_range=(0.0, 10.0))
+        from .temporal_vocab import NUM_DAYS  # noqa: PLC0415
 
-        # 2. Sample timestamps with optional per-row t_min and decay
+        num_days = float(NUM_DAYS)
+
+        # 1. Generate intensity distribution once (day-index domain)
+        self.temporal_vocab.generate(time_range=(0.0, num_days))
+
+        # 2. Sample timestamps with optional per-row t_min (already in days) and decay
         t_min_raw = None
         if t_min is not None:
-            t_min_raw = (t_min.to(self.device) * 10.0).clamp(0.0, 10.0)
+            t_min_raw = t_min.to(self.device).clamp(0.0, num_days)
         timestamps = self.temporal_vocab.sample_time(
             num_samples=n,
-            time_range=(0.0, 10.0),
+            time_range=(0.0, num_days),
             t_min=t_min_raw,
             gamma=getattr(self, "gamma", 0.0),
         )
-        timestamps_norm = (timestamps.to(self.device) / 10.0).clamp(0.0, 1.0)
+        timestamps_days = timestamps.to(self.device).clamp(0.0, num_days)
 
-        # 3. Evaluate basis at sampled times
-        basis = self.temporal_vocab.evaluate_basis(timestamps_norm)  # (n, 8)
+        # 3. Evaluate basis at sampled day indices
+        basis = self.temporal_vocab.evaluate_basis(timestamps_days)  # (n, 8)
 
         # 4. Build gate vector and broadcast to all rows
         gate = self.temporal_vocab.build_gate_vector().to(self.device)  # (3,)
@@ -426,7 +430,7 @@ class MLPSCM(nn.Module):
             f"Expected ({n}, {self.time_dim}), got {time_features.shape}"
         )
 
-        return timestamps_norm, time_features
+        return timestamps_days, time_features
 
     def forward_without_input(self):
         """
