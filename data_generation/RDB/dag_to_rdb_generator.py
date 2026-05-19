@@ -779,11 +779,10 @@ class DAGToRDBGenerator:
 
             try:
                 with Pool(processes=num_processes) as pool:
-                    # Use map to process all arguments
-                    results = pool.map(self._generate_single_rdb_worker, worker_args)
-
-                    # Process results
-                    for success, rdb_index, result in results:
+                    # Use imap_unordered for real-time progress (non-blocking)
+                    for success, rdb_index, result in pool.imap_unordered(
+                        self._generate_single_rdb_worker, worker_args
+                    ):
                         if success:
                             info = result
                             print(

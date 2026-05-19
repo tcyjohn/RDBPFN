@@ -185,7 +185,7 @@ if [ "${SKIP_PREPROCESS}" != "true" ]; then
         ) &
         running=$((running + 1))
         if [ "${running}" -ge "${NUM_PROCESSES}" ]; then
-            wait -n
+            wait -n || true
             running=$((running - 1))
         fi
     done
@@ -246,13 +246,19 @@ if [ "${N_EVAL}" -gt 10 ]; then N_EVAL=10; fi
 
 EVAL_DATASETS=""
 for i in $(seq "${START_INDEX}" $((START_INDEX + N_EVAL - 1))); do
-    EVAL_DATASETS="${EVAL_DATASETS} dag_rdb_${i}"
+    if [ -f "${RAW_OUTPUT_DIR}/dag_rdb_${i}/metadata.yaml" ]; then
+        EVAL_DATASETS="${EVAL_DATASETS} dag_rdb_${i}"
+    fi
 done
 
-pixi run python "${ROOT}/scripts/convert_rdb_to_csv.py" \
-    --src-dir "${RAW_OUTPUT_DIR}" \
-    --output-dir "${CLF_DIR}" \
-    --datasets ${EVAL_DATASETS}
+if [ -z "${EVAL_DATASETS}" ]; then
+    echo "No valid RDBs found for eval CSV conversion"
+else
+    pixi run python "${ROOT}/scripts/convert_rdb_to_csv.py" \
+        --src-dir "${RAW_OUTPUT_DIR}" \
+        --output-dir "${CLF_DIR}" \
+        --datasets ${EVAL_DATASETS}
+fi
 
 echo "Eval CSVs ready in ${CLF_DIR} ($(ls "${CLF_DIR}"/*.csv 2>/dev/null | wc -l) files)"
 

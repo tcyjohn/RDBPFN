@@ -1273,6 +1273,7 @@ class TableGenerator:
         parent_data_list: list,
         parent_is_time_table: list[bool],
         dag_position: str,
+        fallback_seed: int = 42,
     ) -> torch.Tensor:
         """Compute per-row t_min for child table timestamp sampling.
 
@@ -1282,7 +1283,7 @@ class TableGenerator:
             parent_data_list: List of parent ``all_scm_outputs`` dicts.
             parent_is_time_table: bool per parent.
             dag_position: "source" | "intermediate" | "leaf".
-        fallback_seed: int = 42,
+            fallback_seed: Seed for the fallback random t_min generator.
 
         Returns:
             (child_rows,) tensor of t_min values in [0, 1] (normalized).
