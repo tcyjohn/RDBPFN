@@ -134,19 +134,40 @@ def _sample_fk_per_parent(
     probs_at_levels: list,
     rng: np.random.RandomState,
 ) -> np.ndarray:
-    """Core sampling loop: for each child row, sample one parent row via HSBM."""
+    """Sample one parent row per child row via HSBM.
+
+    Child rows sharing the same cluster path across all hierarchy levels have
+    identical probability vectors over parent rows.  We group by cluster path,
+    compute probs once per group, then sample all rows in the group in a single
+    call to ``rng.choice(..., size=N)``.
+    """
+    num_levels = len(probs_at_levels)
     fk_ids = np.empty(size_b, dtype=np.int64)
-    for b_idx in range(size_b):
+
+    # Encode each child row's cluster path as a unique integer key
+    max_clusters = cluster_b.max(axis=0) + 1  # hierarchy sizes per level
+    multipliers = np.cumprod([1] + list(max_clusters[:-1]))
+    cluster_keys = (cluster_b * multipliers).sum(axis=1)  # (size_b,)
+
+    unique_keys = np.unique(cluster_keys)
+
+    for key in unique_keys:
+        mask = cluster_keys == key
+        indices = np.nonzero(mask)[0]
+        n_in_cluster = len(indices)
+        cluster_path = cluster_b[indices[0]]
+
         probs = np.ones(size_a, dtype=np.float64)
-        for l_idx in range(len(probs_at_levels)):
-            cb = cluster_b[b_idx, l_idx]
-            probs *= probs_at_levels[l_idx][cluster_a[:, l_idx], cb]
+        for l in range(num_levels):
+            probs *= probs_at_levels[l][cluster_a[:, l], cluster_path[l]]
         p_sum = probs.sum()
         if p_sum > 0:
             probs /= p_sum
         else:
             probs = None
-        fk_ids[b_idx] = rng.choice(size_a, p=probs)
+
+        fk_ids[indices] = rng.choice(size_a, size=n_in_cluster, p=probs)
+
     return fk_ids
 
 

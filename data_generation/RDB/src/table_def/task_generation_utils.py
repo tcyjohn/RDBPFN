@@ -184,6 +184,50 @@ class SchemaGraph:
 
         return num_rows_dict
 
+    def find_path(self, from_table: str, to_table: str) -> Optional[List[str]]:
+        """BFS shortest path between two tables (undirected traversal).
+
+        Returns a list of intermediate table names from *from_table* to
+        *to_table* (exclusive of *from_table*, inclusive of *to_table*), or
+        ``None`` if the tables are the same or unreachable.
+        """
+        if from_table == to_table:
+            return None
+
+        from collections import deque
+        visited = {from_table}
+        parent: dict[str, str | None] = {from_table: None}
+        queue: deque[str] = deque([from_table])
+
+        # Build undirected adjacency
+        adj: dict[str, list[str]] = {}
+        for node in self.nodes:
+            adj.setdefault(node, [])
+        for edge in self.edges:
+            adj.setdefault(edge.from_table, []).append(edge.to_table)
+            adj.setdefault(edge.to_table, []).append(edge.from_table)
+
+        while queue:
+            current = queue.popleft()
+            if current == to_table:
+                break
+            for neighbor in adj.get(current, []):
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    parent[neighbor] = current
+                    queue.append(neighbor)
+
+        if to_table not in parent:
+            return None
+
+        path: list[str] = []
+        node = to_table
+        while parent[node] is not None:
+            path.append(node)
+            node = parent[node]
+        path.reverse()
+        return path
+
     def compute_possible_task_types(self, target_table_name: str) -> TaskType:
         """Compute possible task types based on schema graph structure."""
 

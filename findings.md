@@ -1,120 +1,91 @@
-# Findings: Temporal Generation Refactor
+# Findings: RDB Generation Performance Optimization
 
-## Current Time Generation Architecture
+## Profiling Results (64 RDBs, single process, 2026-05-20)
 
-### Three Problems Identified
-
-1. **虚假相关性 (Spurious correlation)**: `TemporalVocab.sample_time()` samples timestamps from intensity distribution, then passes the SAME raw time values to MLP as input. MLP learns "high-intensity periods → special feature values" as a shortcut, which does not exist in real data.
-
-2. **跨表时序不一致 (Cross-table temporal inconsistency)**: Parent and child tables sample timestamps independently. Child row can get a timestamp earlier than its parent row (e.g., order before user registration).
-
-3. **FK 组内时间戳无结构 (No intra-group structure)**: All child rows sample timestamps independently from the same global intensity. No differentiation between different FK groups (e.g., different users' order sequences).
-
-### Root Cause
-
-All three problems stem from a single architectural flaw: **time generation conflates "time as event occurrence distribution" with "time as feature influence factor," and lacks cross-row/cross-table temporal structure constraints.**
-
----
-
-## Code Trace
-
-### Timestamp Generation Flow (current)
+Full breakdown with task-level instrumentation:
 
 ```
-TemporalVocab.generate()
-  → trend + seasonal + spikes + noise → intensity(t) on [0, 10] grid
-  → TemporalVocab.sample_time() → samples timestamps from intensity via multinomial
-  → MLPSCM._sample_time_embedding():
-      - normalizes to [0, 1]
-      - optional Fourier encoding (time_embed_mode="fourier")
-      - concat to MLP causes
-      - store in X[MASK_TYPE.TIMESTAMP]
+Total: 8m 29s (per RDB: 7.95s)
+
+initialize_tasks_with_complex_tasks           6m 4s  (71.5%)
+  └─ generate_task_data                       6m 4s
+       └─ combine_features_and_labels          6m 4s
+            └─ generate_instance_graphs_and_compute_labels  6m 4s
+                 └─ InstanceGraph.generate()   4m51s  (57.1%)  ← #1 BOTTLENECK
+                 └─ _join_related_features     1.52s  ( 0.3%)
+            └─ split_task_data                 0.33s
+  └─ save_all_task_data                        2.12s
+
+generate_all_data_from_SCM                    2m 1s  (23.8%)
+  └─ _sample_fk_per_parent (HSBM inner)       1m13s  (14.3%)  ← #2 BOTTLENECK
+  └─ compute_hsbm_fk_ids_multi                 57.8s  (11.3%)
+  └─ forward_with_input (MLPSCM)               27.9s  ( 5.5%)
+  └─ compute_hsbm_fk_ids                       15.9s  ( 3.1%)
+  └─ forward_without_input                     14.8s  ( 2.9%)
+  └─ init_table_SCMs                            5.6s
+  └─ _materialize_tables_from_pending           3.3s
 ```
 
-### Key Files
+## Root Cause A: InstanceGraph.generate() Called Per Row
 
-| File | Key Content |
-|------|------------|
-| `data_generation/RDB/src/prior/temporal_vocab.py` | `TemporalVocab`, `TrendVocab`, `SeasonalityVocab`, `SpikesVocab`, `NoiseVocab` |
-| `data_generation/RDB/src/prior/mlp_scm.py` | `MLPSCM._sample_time_embedding()` (L415-446), `forward_without_input()` (L448-479), `forward_with_input()` (L481-533) |
-| `data_generation/RDB/src/table_def/table_generation.py` | `TableGenerator._compute_hsbm_fk_ids()` (L1213-1267), `_convert_to_datetime64()` (L714-804), `init_table_SCMs()` (L1539-1651) |
-| `data_generation/RDB/src/prior/prior_config.py` | HP config (no time-specific params currently) |
-| `data_generation/RDB/dag_to_rdb_generator.py` | Default timestamp config (L60-64): prob=1.0, time_dim=8, time_embed_mode="fourier" |
+**File:** `data_generation/RDB/src/table_def/task_generation.py`
 
-### HSBM FK Allocation Confirmed
+**Call chain:**
+```
+combine_features_and_labels (line 866)
+  → generate_instance_graphs_and_compute_labels (line 736)
+    num_samples = key_table.num_rows   ← ALL rows, not a sample
+    for each row i:
+      ig = InstanceGraph(FocalEntity(table, i), schema_graph)
+      ig.generate(rdb)   ← copies DataFrames, does FK filtering
+```
 
-- `child_rows = self.num_rows` (table_generation.py:1229)
-- HSBM determines FK mapping `fk_ids[j] = parent_idx` for each child row
-- After HSBM, each parent row p has N_p child rows (implicit from FK assignment)
-- Problem 3 is: arrange N_p known timestamps within `[t_parent_p, T]`
+**What InstanceGraph.generate() does** (`task_generation_utils.py:221`):
+1. Gets focal record from table dataframe
+2. For each non-focal table in topological order:
+   - Copies the full table DataFrame
+   - Filters by FK constraints from parent records
 
-### Timestamp Config
+For 3-table schema with 2000 focal rows: 2000 × 2 = 4000 DataFrame copies + filters per task. Across 133 tasks: 233,333 total `ig.generate()` calls.
 
-- Default `prob: 1.0` — all tables get timestamp column
-- `time_dim: 8` (default), `time_embed_mode: "fourier"` (default)
-- Timestamps stored as `np.datetime64[D]` in range [1970-01-01, 2020-12-31]
-- Each timestamp column gets random sub-range within bounds
+**What InstanceGraph is used for:**
+- `DirectAttributeTarget.compute_label(ig)`: returns `records.iloc[0][column_name]` — just one column of the focal row. Equivalent to `df[column_name]`.
+- `RelationalAggregationTarget.compute_aggregated_value(ig)`: gets FK-matched records from target table, applies aggregation. Equivalent to a pandas merge + groupby.
 
----
+**Key insight:** The entire per-row InstanceGraph traversal is equivalent to a SQL LEFT JOIN along FK edges, followed by GROUP BY + aggregation. Pandas can do this in one pass for all rows simultaneously.
 
-## Design Decisions (from brainstorming)
+## Root Cause B: HSBM Python Loop Over Every Child Row
 
-### Problem 1: Basis Vector Input
+**File:** `data_generation/RDB/src/prior/hsbm.py`
 
-- `time_dim = 11`: trend(2) + seasonal(4) + spike(2) + gates(3)
-- Trend: level + slope (2D)
-- Seasonal: low-freq sin/cos + high-freq sin/cos (4D)
-- Spike: amplitude + decay (2D)
-- Gate: [trend_active, seasonal_active, spike_active] (3D) — 0-masking for inactive components
-- Noise stays in sampler only (NOT passed to MLP)
-- No fallback to raw time if all gates=0 (design inconsistency)
-- Remove Fourier encoding and `time_embed_mode` config
+`_sample_fk_per_parent()` (line 138):
+```python
+for b_idx in range(size_b):       # Python loop, ~3000x
+    probs = np.ones(size_a)       # allocate, ~3000 elements
+    for l in range(num_levels):
+        probs *= probs_at_levels[l][cluster_a[:, l], cluster_b[b_idx, l]]
+    fk_ids[b_idx] = rng.choice(size_a, p=probs)
+```
 
-### Problem 2: Cross-Table Constraints
+**Key insight:** Probability vector depends only on `cluster_b[b_idx, :]` — the cluster assignment of child row `b_idx`. All rows in the same cluster path share the identical `probs` vector. Number of unique cluster paths = `prod(hierarchy)` is a small constant (typical: 2³=8).
 
-- Child t_min = max(timestamps of all parent rows referenced by FK)
-- Fallback based on DAG topology: source→Uniform(0, 0.1T), intermediate→Uniform(0.2T, 0.4T), leaf→Uniform(0.4T, 0.6T)
-- Gamma decay: discrete tiers {0.0, 0.5, 1.5, 3.0}
-- Decay uses normalized relative time: tau = (t - t_min) / (T - t_min)
-- Only collect timestamps from parents that have timestamp column (no force-requirement)
+Instead of computing probs and sampling once per row (3000×), compute probs once per cluster path (~8×) and sample all rows in that cluster in a single `rng.choice(size_a, p=probs, size=N)` call.
 
-### Problem 3: Intra-Group Sort
+## Correctness Analysis
 
-- Independent sampling within `[t_min_j, T]` per row (window constraint already provides inter-group differentiation)
-- Probabilistic per-FK-group sort: p_sort ~ Uniform(0.3, 0.8) per table
-- Not all tables should have sorted groups (analytical tables shouldn't)
-- No Hawkes process (too e-commerce specific for general database generation)
+### Phase A (InstanceGraph → Bulk Joins)
 
-### NaN / Zero Defense Mechanisms
+| Aspect | Why unchanged |
+|--------|--------------|
+| Label values | Both approaches match FK values → same rows → same aggregation → same label |
+| Random sampling | Same seed, same aggregation functions, same predicate thresholds |
+| Feature joining | `_join_related_features` called identically, separate from label computation |
+| Edge cases | Empty groups → NaN → fillna(0), same as current `return 0` behavior |
 
-**No unified defense mechanism exists.** Each calculation site handles edge cases independently:
+### Phase B (HSBM Cluster Grouping)
 
-| File | Line | Calculation | Defense |
-|------|------|-------------|---------|
-| `analyze_rdb_stats.py` | 592 | Gini coefficient | `if total_refs > 0 and n > 1` else `gini=0.0` |
-| `analyze_rdb_stats.py` | 692 | Shannon entropy | `np.errstate(divide="ignore")` + `isfinite` check → fallback 0/1 |
-| `analyze_rdb_stats.py` | 582 | In-degree distribution | `len(child_fk_vals)==0` → all-zero in-degree |
-| `analyze_rdb_stats.py` | 682 | Coverage ratio | `n_parent_pks==0` → skip edge |
-| `task_quality.py` | 206 | Label uniqueness | `n_unique < 2` → reject task (a1) |
-| `task_quality.py` | 222 | Sample count | `n < 64` or `min(n_pos,n_neg) < 8` → reject (a3) |
-| `task_quality.py` | 244 | Child/parent ratio | `ratio > 100` → reject (a6) |
-| `temporal_vocab.py` | 258 | Intensity NaN | `torch.where(isnan, 1.0, intensity)` → fill 1 |
-
-**Risk:** When FK data is extremely sparse (child table has 0-1 rows), Gini is hard-coded to 0 ("perfectly uniform"), which is misleading but won't crash. For our new `t_min = max(parent_ts)` logic, the fallback path (DAG topology) already handles the empty `T_parents` case.
-
-### Rejected Approaches
-
-- Full Z(t) latent state with NHPP (too complex, deferred)
-- Hawkes self-excitation (too e-commerce specific)
-- Forcing all parent tables to have timestamps (too restrictive)
-- Noise component in MLP input (would become pseudo-signal)
-- Raw time fallback when all gates=0 (design contradiction)
-
----
-
-## Implementation Notes
-
-1. `TemporalVocab.evaluate_basis(t)` must evaluate at arbitrary continuous t, not just grid points. Current `generate()` discretizes on 1000-point grid. Need analytical evaluation of each basis component.
-2. Per-row `t_min` sampling via batched multinomial: construct `(N, K)` mask, zero out intensities below t_min, renormalize per row, categorical draw.
-3. Sort is applied AFTER sampling — does not affect marginal distribution.
-4. Gamma decay with normalized tau: `exp(-gamma * tau_j)` where `tau_j = (t - t_min_j) / (T - t_min_j)`. If `t_min_j = T`, tau is undefined → fallback to tau = 0 (single-point window).
+| Aspect | Why unchanged |
+|--------|--------------|
+| Statistical distribution | `rng.choice(N, p=probs)` draws from same categorical(probs) whether N=1 ×3000 or N=3000 ×1 |
+| Block structure | Same hierarchy, same probs_at_levels, same cluster assignments → same probability matrices |
+| RNG state | Multi-parent: state advances differently but FK values are random draws — distribution preserved |

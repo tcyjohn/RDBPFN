@@ -6,7 +6,6 @@ This module defines Task classes and utilities for generating prediction tasks
 on RDB tables. Currently supports single-table column prediction tasks.
 """
 
-import math
 import os
 import random
 import numpy as np
@@ -42,8 +41,6 @@ from .task_generation_utils import (
     SchemaEdge,
     SchemaEdgeDirection,
     SchemaGraph,
-    InstanceGraph,
-    FocalEntity,
     AggregationFunctionList,
     PredicateFunctionList,
 )
@@ -710,134 +707,259 @@ class TaskDataGenerator:
                     return (i, target_table_name, 0)
         return (None, None, None)
 
-    def generate_instance_graphs_and_compute_labels(
+    def _walk_and_merge(
+        self,
+        df: pd.DataFrame,
+        start_table: str,
+        path: List[str],
+        schema_graph: "SchemaGraph",
+    ) -> pd.DataFrame:
+        """Walk FK edges along *path*, merging only PK and FK columns.
+
+        Returns a DataFrame that maps the start table's PK to the terminal
+        table's PK (plus intermediate FK columns).  No feature columns are
+        carried — the caller merges those separately.
+        """
+        current_df = df
+        current_table = start_table
+        active_pk = self.rdb.tables[start_table].column_names[0]
+
+        for i, next_table in enumerate(path):
+            is_terminal = (i == len(path) - 1)
+            edge = schema_graph.get_edge(current_table, next_table)
+            if edge is None:
+                edge = schema_graph.get_edge(next_table, current_table)
+            if edge is None:
+                raise ValueError(
+                    f"No edge between {current_table} and {next_table}"
+                )
+
+            next_tbl = self.rdb.tables[next_table]
+            if next_tbl.dataframe is None:
+                next_tbl.generate_dataframe()
+
+            pk_tag = f"_pk_{next_table}"
+
+            # FK columns of *next_table* needed when it becomes the current
+            # table in a subsequent PK_TO_FK step.
+            next_fk_indices: list[int] = []
+            if not is_terminal:
+                for j, dtc in enumerate(next_tbl.data_type_configs):
+                    if dtc.data_type == DataType.FOREIGN_KEY and j != 0:
+                        next_fk_indices.append(j)
+
+            if edge.direction == SchemaEdgeDirection.PK_TO_FK:
+                # current.FK  =  next.PK
+                cur_fk_idx = edge.from_column
+                cur_fk_name = self.rdb.tables[current_table].column_names[
+                    cur_fk_idx
+                ]
+                col_idxs = [0] + next_fk_indices
+                next_df = next_tbl.dataframe.iloc[:, col_idxs].copy()
+                next_names = [pk_tag] + [
+                    next_tbl.column_names[j] for j in next_fk_indices
+                ]
+                next_df.columns = next_names
+                current_df = current_df.merge(
+                    next_df, left_on=cur_fk_name, right_on=pk_tag,
+                    how="left",
+                )
+            else:  # FK_TO_PK
+                # current.PK  =  next.FK
+                next_fk_idx = edge.to_column
+                next_fk_tag = f"_fk_{next_table}"
+                col_idxs = [0, next_fk_idx] + [
+                    j for j in next_fk_indices if j != next_fk_idx
+                ]
+                next_df = next_tbl.dataframe.iloc[:, col_idxs].copy()
+                next_names = [pk_tag, next_fk_tag] + [
+                    next_tbl.column_names[j]
+                    for j in next_fk_indices if j != next_fk_idx
+                ]
+                next_df.columns = next_names
+                current_df = current_df.merge(
+                    next_df, left_on=active_pk, right_on=next_fk_tag,
+                    how="left",
+                )
+
+            current_table = next_table
+            active_pk = pk_tag
+
+        return current_df
+
+    def _lookup_terminal_column(
+        self,
+        merged: pd.DataFrame,
+        focal_pk: str,
+        target_table_name: str,
+        column_name: str,
+    ) -> pd.Series:
+        """Merge terminal-table column into *merged* via the terminal PK."""
+        target_tbl = self.rdb.tables[target_table_name]
+        if target_tbl.dataframe is None:
+            target_tbl.generate_dataframe()
+        target_pk_tag = f"_pk_{target_table_name}"
+        target_pk = target_tbl.column_names[0]
+
+        target_df = target_tbl.dataframe[[target_pk, column_name]].copy()
+        target_df = target_df.rename(columns={target_pk: target_pk_tag})
+        return merged.merge(target_df, on=target_pk_tag, how="left")
+
+    def _compute_direct_attribute_labels_bulk(
         self,
         task: Task,
         key_table_name: str,
         key_table: Table,
-        num_samples: int = 10,
-        max_retries: int = 5,
-    ) -> Optional[pd.DataFrame]:
-        """Generate instance graphs and compute labels for a task.
+    ) -> pd.DataFrame:
+        """Bulk DirectAttribute label computation — no per-row InstanceGraph."""
+        target_comp = task.target_computation
+        target_table_name = target_comp.table_name
 
-        For :class:`RelationalAggregationTarget` tasks, labels are prone to
-        collapsing to a single value when the predicate's hard-coded threshold
-        does not match the empirical distribution of the aggregated values.
-        To avoid discarding otherwise-valid tasks, this method:
+        focal_df = key_table.dataframe.copy()
+        focal_pk = key_table.column_names[0]
 
-        1. First collects the raw aggregated value per instance graph.
-        2. Uses the **median** of those values as the predicate threshold, so
-           that ~50/50 positive/negative labels are produced whenever the
-           aggregated distribution has at least two distinct values.
-        3. Retries with a freshly sampled ``(aggregation_column,
-           aggregation_func, predicate_func)`` recipe when labels still
-           collapse, up to ``max_retries`` times.
-        """
-        assert num_samples <= key_table.dataframe.shape[0]
-        idx = random.sample(range(key_table.dataframe.shape[0]), num_samples)
-        combined_df = key_table.dataframe.iloc[idx]
-
-        # Join feature columns from related tables so the model has the raw
-        # materials for relational reasoning.
-        combined_df = self._join_related_features(
-            combined_df, key_table_name, task.schema_graph
+        result = self._join_related_features(
+            focal_df, key_table_name, task.schema_graph,
         )
 
-        # Build instance graphs once; reuse them across retries.
-        instance_graphs: List[Tuple[int, InstanceGraph]] = []
-        for i in idx:
-            ig = InstanceGraph(FocalEntity(key_table_name, i), task.schema_graph)
-            ig.generate(self.rdb)
-            instance_graphs.append((i, ig))
-
-        target_computation = task.target_computation
-        is_agg = isinstance(target_computation, RelationalAggregationTarget)
-
-        for attempt in range(max_retries + 1):
-            removed_idx: List[int] = []
-            labels: List[Any] = []
-
-            if is_agg:
-                # Pass 1: collect raw aggregated values without applying predicate.
-                raw_values: List[float] = []
-                for i, ig in instance_graphs:
-                    try:
-                        v = target_computation.compute_aggregated_value(ig)
-                    except Exception:
-                        v = None
-                    if v is None:
-                        removed_idx.append(i)
-                        continue
-                    v = float(v)
-                    if not math.isfinite(v):
-                        removed_idx.append(i)
-                        continue
-                    raw_values.append(v)
-
-                if len(raw_values) >= 2 and len(set(raw_values)) > 1:
-                    threshold = float(np.median(raw_values))
-                    # Replace with a fresh PredicateFunction instance to avoid
-                    # mutating the shared entries inside ``PredicateFunctionList``.
-                    target_computation.predicate_func = PredicateFunction(
-                        target_computation.predicate_func.operator, threshold
-                    )
-                    labels = [
-                        int(target_computation.predicate_func.apply(v))
-                        for v in raw_values
-                    ]
-            else:
-                for i, ig in instance_graphs:
-                    label = target_computation.compute_label(ig)
-                    if label is None:
-                        removed_idx.append(i)
-                        continue
-                    labels.append(label)
-
-            if len(labels) > 0 and len(set(labels)) > 1:
-                result = combined_df.drop(removed_idx)
-                result[task.real_name_for_target_column] = labels
-                return result
-
-            # Degenerate labels. Only aggregation tasks can be retried with
-            # a different recipe; direct-attribute tasks have no knobs to tweak.
-            if not is_agg or attempt == max_retries:
+        if target_table_name == key_table_name:
+            labels = key_table.dataframe[target_comp.column_name].values
+        else:
+            path = task.schema_graph.find_path(key_table_name, target_table_name)
+            if path is None:
                 return None
-
-            target_table = self.rdb.tables[
-                target_computation.target_node_set.table_name
-            ]
-            float_cols = target_table.get_feature_columns(only_float=True)
-            if not float_cols:
-                return None
-            target_computation.aggregation_column = random.choice(float_cols)
-            target_computation.aggregation_func = random.choice(AggregationFunctionList)
-            template = random.choice(PredicateFunctionList)
-            target_computation.predicate_func = PredicateFunction(
-                template.operator, template.threshold
+            init_cols = self._initial_walk_cols(
+                key_table_name, path[0], task.schema_graph, focal_pk,
+            )
+            merged = self._walk_and_merge(
+                focal_df[init_cols], key_table_name, path, task.schema_graph,
+            )
+            merged = self._lookup_terminal_column(
+                merged, focal_pk, target_table_name, target_comp.column_name,
+            )
+            labels = (
+                merged.groupby(focal_pk)[target_comp.column_name]
+                .first()
+                .reindex(focal_df[focal_pk])
+                .values
             )
 
-        return None
+        result[task.real_name_for_target_column] = labels
+        return result
+
+    def _compute_aggregation_labels_bulk(
+        self,
+        task: Task,
+        key_table_name: str,
+        key_table: Table,
+        max_retries: int = 5,
+    ) -> Optional[pd.DataFrame]:
+        """Bulk RelationalAggregation label computation via merge + groupby."""
+        target_comp = task.target_computation
+        target_node_set = target_comp.target_node_set
+        target_table_name = target_node_set.table_name
+
+        focal_df = key_table.dataframe.copy()
+        focal_pk = key_table.column_names[0]
+
+        result = self._join_related_features(
+            focal_df, key_table_name, task.schema_graph,
+        )
+
+        if target_table_name == key_table_name:
+            lookup_df = focal_df[[focal_pk, target_comp.aggregation_column]].copy()
+        else:
+            path = task.schema_graph.find_path(key_table_name, target_table_name)
+            if path is None:
+                return None
+            init_cols = self._initial_walk_cols(
+                key_table_name, path[0], task.schema_graph, focal_pk,
+            )
+            merged = self._walk_and_merge(
+                focal_df[init_cols], key_table_name, path, task.schema_graph,
+            )
+
+        for attempt in range(max_retries + 1):
+            agg_col = target_comp.aggregation_column
+            agg_func = target_comp.aggregation_func
+
+            if target_table_name != key_table_name:
+                lookup_df = self._lookup_terminal_column(
+                    merged, focal_pk, target_table_name, agg_col,
+                )
+
+            if agg_col not in lookup_df.columns:
+                return None
+
+            # Map AggregationFunction to a pandas groupby operation.
+            _agg_name_map = {
+                "COUNT": "count", "SUM": "sum", "AVG": "mean",
+                "MAX": "max", "MIN": "min", "STD": "std",
+            }
+            _agg_name = _agg_name_map.get(agg_func.name, "mean")
+            grouped = lookup_df.groupby(focal_pk)[agg_col].agg(_agg_name)
+            valid = grouped.dropna()
+            valid = valid[~np.isinf(valid.values)]
+
+            if len(valid) < 2 or len(set(valid.values)) <= 1:
+                if attempt == max_retries:
+                    return None
+                target_table = self.rdb.tables[target_table_name]
+                float_cols = target_table.get_feature_columns(only_float=True)
+                if not float_cols:
+                    return None
+                target_comp.aggregation_column = random.choice(float_cols)
+                target_comp.aggregation_func = random.choice(
+                    AggregationFunctionList,
+                )
+                template = random.choice(PredicateFunctionList)
+                target_comp.predicate_func = PredicateFunction(
+                    template.operator, template.threshold,
+                )
+                continue
+
+            threshold = float(np.median(valid.values))
+            target_comp.predicate_func = PredicateFunction(
+                target_comp.predicate_func.operator, threshold,
+            )
+            labels = valid.apply(
+                lambda v: int(target_comp.predicate_func.apply(v))
+            )
+
+            if len(labels) > 0 and len(set(labels.values)) > 1:
+                break
+        else:
+            return None
+
+        result[task.real_name_for_target_column] = (
+            labels.reindex(focal_df[focal_pk]).fillna(0).astype(int).values
+        )
+        return result
+
+    def _initial_walk_cols(
+        self,
+        start_table: str,
+        first_next: str,
+        schema_graph: "SchemaGraph",
+        pk_col: str,
+    ) -> list[str]:
+        """Columns needed in the initial DataFrame for ``_walk_and_merge``."""
+        edge = schema_graph.get_edge(start_table, first_next)
+        if edge is None:
+            edge = schema_graph.get_edge(first_next, start_table)
+        if edge is not None and edge.direction == SchemaEdgeDirection.PK_TO_FK:
+            fk_col = self.rdb.tables[start_table].column_names[
+                edge.from_column
+            ]
+            return [pk_col, fk_col]
+        return [pk_col]
 
     def combine_features_and_labels(
         self,
         task: Task,
         key_tables: Dict[str, Table],
     ) -> pd.DataFrame:
-        """
-        Combine required features and labels into a unified dataframe.
-
-        Parameters
-        ----------
-        task : Task
-            Task object with metadata
-        key_tables : Dict[str, Table]
-            Dictionary mapping table names to Table objects
-
-        Returns
-        -------
-        pd.DataFrame
-            Unified dataframe with features and labels
-        """
+        """Combine required features and labels into a unified dataframe."""
         if task.task_metadata is None:
             raise ValueError(
                 "Task metadata not generated. Call generate_task_metadata first."
@@ -846,25 +968,23 @@ class TaskDataGenerator:
         key_table_name = task.task_metadata["key_table"]
         key_table = key_tables[key_table_name]
 
-        # Ensure table has dataframe
         if key_table.dataframe is None:
             key_table.generate_dataframe()
 
-        # Get required columns
         if task.task_type == TaskType.SINGLE_TABLE_PREDICTION:
             required_columns = task.task_metadata["feature_columns"] + [
                 task.task_metadata["label_column"]
             ]
-            # Create unified dataframe with only required columns
             unified_df = key_table.dataframe[required_columns].copy()
 
-        elif (
-            task.task_type == TaskType.DIRECT_ATTRIBUTE_PREDICTION
-            or task.task_type == TaskType.RELATIONAL_AGGREGATION_PREDICTION
-        ):
-            # Randomly generate instance graphs and compute labels
-            unified_df = self.generate_instance_graphs_and_compute_labels(
-                task, key_table_name, key_table, key_table.num_rows
+        elif task.task_type == TaskType.DIRECT_ATTRIBUTE_PREDICTION:
+            unified_df = self._compute_direct_attribute_labels_bulk(
+                task, key_table_name, key_table,
+            )
+
+        elif task.task_type == TaskType.RELATIONAL_AGGREGATION_PREDICTION:
+            unified_df = self._compute_aggregation_labels_bulk(
+                task, key_table_name, key_table,
             )
 
         return unified_df
