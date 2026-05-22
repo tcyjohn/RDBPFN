@@ -1404,6 +1404,8 @@ class TaskGenerator:
                     min_table_size=min_table_size,
                 )
             )
+            if focal_table_name is None:
+                continue
             # ! Currently, we only accept one type of schema graph including 3 nodes, otherwise, we skip it.
             if len(schema_graph.nodes) != 3:
                 print(f"Skipping schema graph with {len(schema_graph.nodes)} nodes")
@@ -1618,10 +1620,12 @@ class TaskGenerator:
             candidate_tables.append(table_name)
 
         if not candidate_tables:
-            raise ValueError(
-                f"No suitable tables found for focal entity selection "
-                f"(min_size={min_table_size}, exclude_small={exclude_small_tables})"
+            print(
+                f"Warning: No suitable tables found for focal entity selection "
+                f"(min_size={min_table_size}, exclude_small={exclude_small_tables}). "
+                f"All {len(rdb.tables)} tables have < {min_table_size} rows. Skipping."
             )
+            return None, None
 
         # Randomly select a focal entity table
         focal_table_name = random.choice(candidate_tables)
