@@ -36,6 +36,385 @@ import pandas as pd
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 
+# ── feature quality metrics ────────────────────────────────────────────────
+
+def compute_feature_stats(df: pd.DataFrame) -> dict:
+    """Compute per-feature and pairwise-feature statistics.
+
+    Returns dict with keys: avg_abs_corr_p50, feature_var_p50, feature_var_mean,
+    n_features, avg_abs_corr_mean.
+    """
+    feature_cols = _get_feature_cols(df)
+    if len(feature_cols) < 2:
+        return {
+            "avg_abs_corr_p50": float("nan"),
+            "avg_abs_corr_mean": float("nan"),
+            "feature_var_p50": float("nan"),
+            "feature_var_mean": float("nan"),
+            "n_features": len(feature_cols),
+        }
+
+    X = df[feature_cols].copy()
+    X = X.replace([np.inf, -np.inf], np.nan)
+
+    # Per-feature variance
+    feats_var = X.var(ddof=1).dropna()
+    var_p50 = float(np.median(feats_var.values)) if len(feats_var) > 0 else float("nan")
+    var_mean = float(np.mean(feats_var.values)) if len(feats_var) > 0 else float("nan")
+
+    # Pairwise absolute correlation (use at most 50 columns to stay cheap)
+    cols = feature_cols[:50]
+    X_sub = X[cols].values.astype(np.float64)
+    X_sub = np.where(np.isfinite(X_sub), X_sub, 0.0)
+
+    # Remove constant columns
+    stds = np.std(X_sub, axis=0)
+    var_mask = stds > 1e-10
+    if var_mask.sum() < 2:
+        return {
+            "avg_abs_corr_p50": float("nan"),
+            "avg_abs_corr_mean": float("nan"),
+            "feature_var_p50": var_p50,
+            "feature_var_mean": var_mean,
+            "n_features": len(feature_cols),
+        }
+
+    X_sub = X_sub[:, var_mask]
+    corr = np.corrcoef(X_sub.T)
+    triu_idx = np.triu_indices_from(corr, k=1)
+    abs_corr_vals = np.abs(corr[triu_idx])
+    abs_corr_vals = abs_corr_vals[np.isfinite(abs_corr_vals)]
+
+    return {
+        "avg_abs_corr_p50": float(np.median(abs_corr_vals)) if len(abs_corr_vals) > 0 else float("nan"),
+        "avg_abs_corr_mean": float(np.mean(abs_corr_vals)) if len(abs_corr_vals) > 0 else float("nan"),
+        "feature_var_p50": var_p50,
+        "feature_var_mean": var_mean,
+        "n_features": len(feature_cols),
+    }
+
+
+def compute_feature_stats_npz(path: str) -> dict:
+    """Compute feature stats from an NPZ file (X_train only)."""
+    data = np.load(path)
+    X = data.get("X_train", data.get("X_meta", data.get("X", None)))
+    if X is None:
+        keys = [k for k in data.keys() if k.startswith("X")]
+        X = data[keys[0]] if keys else None
+    if X is None or X.shape[0] < 2 or X.shape[1] < 2:
+        return {
+            "avg_abs_corr_p50": float("nan"),
+            "avg_abs_corr_mean": float("nan"),
+            "feature_var_p50": float("nan"),
+            "feature_var_mean": float("nan"),
+            "n_features": 0,
+            "n_samples": X.shape[0] if X is not None else 0,
+        }
+
+    X = X.astype(np.float64)
+    X = np.where(np.isfinite(X), X, 0.0)
+
+    # Per-feature variance
+    feats_var = np.var(X, axis=0, ddof=1)
+    feats_var = feats_var[np.isfinite(feats_var)]
+    var_p50 = float(np.median(feats_var)) if len(feats_var) > 0 else float("nan")
+    var_mean = float(np.mean(feats_var)) if len(feats_var) > 0 else float("nan")
+
+    # Pairwise corr (limit to 50 cols)
+    cols = X.shape[1]
+    if cols > 50:
+        rng = np.random.RandomState(42)
+        idx = rng.choice(cols, 50, replace=False)
+        X = X[:, idx]
+
+    stds = np.std(X, axis=0)
+    var_mask = stds > 1e-10
+    if var_mask.sum() < 2:
+        return {
+            "avg_abs_corr_p50": float("nan"),
+            "avg_abs_corr_mean": float("nan"),
+            "feature_var_p50": var_p50,
+            "feature_var_mean": var_mean,
+            "n_features": X.shape[1],
+            "n_samples": X.shape[0],
+        }
+
+    X = X[:, var_mask]
+    corr = np.corrcoef(X.T)
+    triu_idx = np.triu_indices_from(corr, k=1)
+    abs_corr_vals = np.abs(corr[triu_idx])
+    abs_corr_vals = abs_corr_vals[np.isfinite(abs_corr_vals)]
+
+    return {
+        "avg_abs_corr_p50": float(np.median(abs_corr_vals)) if len(abs_corr_vals) > 0 else float("nan"),
+        "avg_abs_corr_mean": float(np.mean(abs_corr_vals)) if len(abs_corr_vals) > 0 else float("nan"),
+        "feature_var_p50": var_p50,
+        "feature_var_mean": var_mean,
+        "n_features": X.shape[1],
+        "n_samples": X.shape[0],
+    }
+
+
+# ── structural metrics ──────────────────────────────────────────────────────
+
+def _robust_corr(X: np.ndarray) -> np.ndarray:
+    """Correlation matrix with NaN/Inf handling."""
+    X = np.asarray(X, dtype=np.float64)
+    X = np.where(np.isfinite(X), X, 0.0)
+    stds = np.std(X, axis=0, ddof=1)
+    mask = stds > 1e-10
+    if mask.sum() < 2:
+        return np.eye(X.shape[1])
+    X = X[:, mask]
+    return np.corrcoef(X.T)
+
+
+def compute_eigen_spectrum(X: np.ndarray, max_cols: int = 50) -> dict:
+    """Eigenvalue spectrum of the feature correlation matrix.
+
+    Returns: eigenvalues (sorted descending), top5_ratio (top5/total),
+    entropy (normalized Shannon entropy of normalized eigenvalues).
+    """
+    if X.ndim != 2 or X.shape[1] < 2:
+        return {"eigvals": [], "top5_ratio": float("nan"), "entropy": float("nan")}
+
+    if X.shape[1] > max_cols:
+        rng = np.random.RandomState(42)
+        idx = rng.choice(X.shape[1], max_cols, replace=False)
+        X = X[:, idx]
+
+    corr = _robust_corr(X)
+    eigvals = np.linalg.eigvalsh(corr)
+    eigvals = np.sort(eigvals)[::-1]  # descending
+    eigvals = eigvals[eigvals > 1e-10]  # clip tiny negatives
+
+    if len(eigvals) == 0:
+        return {"eigvals": [], "top5_ratio": float("nan"), "entropy": float("nan")}
+
+    total = eigvals.sum()
+    normalized = eigvals / total
+    top5_sum = eigvals[:min(5, len(eigvals))].sum()
+    top5_ratio = top5_sum / total
+
+    # Normalized Shannon entropy: 0 = all mass in one eigenvalue, 1 = uniform
+    log_vals = np.log(normalized + 1e-12)
+    entropy = -np.sum(normalized * log_vals) / np.log(len(eigvals))
+
+    return {
+        "eigvals": eigvals.tolist(),
+        "top5_ratio": float(top5_ratio),
+        "entropy": float(entropy),
+        "n_features": int(X.shape[1]),
+    }
+
+
+def compute_wasserstein_1d(X_synth: np.ndarray, X_real: np.ndarray) -> dict:
+    """Per-feature 1D Wasserstein-1 (earth mover) distance.
+
+    Projection: for each column, sort both distributions and compute mean |diff|.
+    Also returns the KS statistic as a simpler baseline.
+    """
+    X_synth = np.asarray(X_synth, dtype=np.float64)
+    X_real = np.asarray(X_real, dtype=np.float64)
+    X_synth = np.where(np.isfinite(X_synth), X_synth, 0.0)
+    X_real = np.where(np.isfinite(X_real), X_real, 0.0)
+
+    # Align feature dimension to the smaller
+    n_feat = min(X_synth.shape[1], X_real.shape[1])
+    if n_feat < 2:
+        return {"w1_p50": float("nan"), "ks_p50": float("nan"), "n_feat": n_feat}
+
+    # Standardize each side independently for scale-invariant comparison
+    X_sr = X_synth[:, :n_feat]
+    X_rr = X_real[:, :n_feat]
+    s_mean = X_sr.mean(axis=0, keepdims=True)
+    s_std = X_sr.std(axis=0, ddof=1, keepdims=True).clip(min=1e-8)
+    r_mean = X_rr.mean(axis=0, keepdims=True)
+    r_std = X_rr.std(axis=0, ddof=1, keepdims=True).clip(min=1e-8)
+
+    X_s = (X_sr - s_mean) / s_std
+    X_r = (X_rr - r_mean) / r_std
+
+    w1_vals = []
+    ks_vals = []
+    from scipy.stats import ks_2samp  # noqa: PLC0415
+
+    # Subsample both sides to the smaller size for W1 comparison
+    n_common = min(X_s.shape[0], X_r.shape[0], 2000)
+    rng = np.random.RandomState(42)
+    idx_s = rng.choice(X_s.shape[0], n_common, replace=False)
+    idx_r = rng.choice(X_r.shape[0], n_common, replace=False)
+
+    for j in range(n_feat):
+        s_col = X_s[idx_s, j]
+        r_col = X_r[idx_r, j]
+        s_sorted = np.sort(s_col)
+        r_sorted = np.sort(r_col)
+        # W1 = mean(|s_i - r_i|) on sorted values (exact for 1D equal-length)
+        w1 = np.mean(np.abs(s_sorted - r_sorted))
+        w1_vals.append(w1)
+        # KS statistic (uses full samples)
+        ks_stat, _ = ks_2samp(X_s[:, j], X_r[:, j])
+        ks_vals.append(ks_stat)
+
+    return {
+        "w1_p50": float(np.median(w1_vals)),
+        "w1_mean": float(np.mean(w1_vals)),
+        "ks_p50": float(np.median(ks_vals)),
+        "ks_mean": float(np.mean(ks_vals)),
+        "n_feat": n_feat,
+    }
+
+
+def compute_energy_distance(X_synth: np.ndarray, X_real: np.ndarray,
+                             max_samples: int = 500) -> dict:
+    """Energy distance (squared) between two multivariate distributions.
+
+    E² = 2·E||X-Y|| − E||X-X'|| − E||Y-Y'||.
+    Subsamples to max_samples for O(n²) cost.
+    """
+    n_s = min(X_synth.shape[0], max_samples)
+    n_r = min(X_real.shape[0], max_samples)
+
+    # Align feature dimension to the smaller
+    n_feat = min(X_synth.shape[1], X_real.shape[1])
+    if n_feat < 2:
+        return {"energy_sq": float("nan"), "energy_sqrt": float("nan"),
+                "n_synth": n_s, "n_real": n_r}
+
+    rng = np.random.RandomState(42)
+    Xs = X_synth[rng.choice(X_synth.shape[0], n_s, replace=False), :n_feat]
+    Xr = X_real[rng.choice(X_real.shape[0], n_r, replace=False), :n_feat]
+    Xs = np.where(np.isfinite(Xs), Xs, 0.0)
+    Xr = np.where(np.isfinite(Xr), Xr, 0.0)
+
+    # Standardize jointly (use pooled mean/std for meaningful distance)
+    pooled = np.vstack([Xs, Xr])
+    mean = pooled.mean(axis=0, keepdims=True)
+    std = pooled.std(axis=0, ddof=1, keepdims=True).clip(min=1e-8)
+    Xs = (Xs - mean) / std
+    Xr = (Xr - mean) / std
+
+    from scipy.spatial.distance import cdist  # noqa: PLC0415
+
+    # Cross-term
+    cross = cdist(Xs, Xr, metric="euclidean").mean()
+    # Within-synthetic
+    within_s = cdist(Xs, Xs, metric="euclidean").mean()
+    # Within-real
+    within_r = cdist(Xr, Xr, metric="euclidean").mean()
+
+    e_sq = 2.0 * cross - within_s - within_r
+    return {
+        "energy_sq": float(e_sq),
+        "energy_sqrt": float(np.sqrt(max(e_sq, 0.0))),
+        "n_synth": n_s,
+        "n_real": n_r,
+    }
+
+
+def compute_raw_table_metrics(
+    synth_tables: list[str],  # list of parquet file paths
+    real_tables: list[str],   # list of parquet file paths
+) -> dict:
+    """Aggregate structural metrics comparing synthetic vs real raw tables.
+
+    For each real-synth pair, computes:
+    - eigval_entropy: Shannon entropy of normalized eigenvalue spectrum (0=concentrated, 1=uniform)
+    - top5_ratio: fraction of eigenvalue mass in top-5 components
+    - w1_p50: median per-feature Wasserstein-1 distance (standardized)
+    - energy_sqrt: sqrt of energy distance between distributions
+
+    Uses all synthetic tables and pairs with available real tables.
+    """
+    # Load all real numeric features
+    real_Xs = []
+    for path in real_tables:
+        try:
+            df = pd.read_parquet(path)
+            cols = [c for c in df.select_dtypes(include=[np.number]).columns
+                    if not c.endswith("_id")]
+            if len(cols) < 2:
+                continue
+            X = df[cols].values.astype(np.float64)
+            X = np.where(np.isfinite(X), X, 0.0)
+            X = X[:, np.std(X, axis=0) > 1e-10]
+            if X.shape[1] >= 4:
+                real_Xs.append(X)
+        except Exception:
+            continue
+
+    # Load all synthetic feature columns
+    synth_Xs = []
+    for path in synth_tables:
+        try:
+            df = pd.read_parquet(path)
+            cols = [c for c in df.columns if "feature_" in c]
+            if len(cols) < 2:
+                continue
+            X = df[cols].values.astype(np.float64)
+            X = np.where(np.isfinite(X), X, 0.0)
+            X = X[:, np.std(X, axis=0) > 1e-10]
+            if X.shape[1] >= 4:
+                synth_Xs.append(X)
+        except Exception:
+            continue
+
+    if not synth_Xs or not real_Xs:
+        return {"error": "No valid tables found", "n_synth": len(synth_Xs), "n_real": len(real_Xs)}
+
+    # Eigen-spectrum stats
+    synth_ent = []; synth_top5 = []
+    for X in synth_Xs:
+        spec = compute_eigen_spectrum(X)
+        if not np.isnan(spec["entropy"]):
+            synth_ent.append(spec["entropy"])
+            synth_top5.append(spec["top5_ratio"])
+
+    real_ent = []; real_top5 = []
+    for X in real_Xs:
+        spec = compute_eigen_spectrum(X)
+        if not np.isnan(spec["entropy"]):
+            real_ent.append(spec["entropy"])
+            real_top5.append(spec["top5_ratio"])
+
+    # Wasserstein: pair each real table with a randomly chosen synthetic table
+    w1_all = []; ks_all = []
+    for Xr in real_Xs[:20]:  # limit to 20 pairs
+        Xs = synth_Xs[np.random.RandomState(42).choice(len(synth_Xs))]
+        w1 = compute_wasserstein_1d(Xs, Xr)
+        if not np.isnan(w1.get("w1_p50", float("nan"))):
+            w1_all.append(w1["w1_p50"])
+            ks_all.append(w1["ks_p50"])
+
+    # Energy distance: sample a few pairs (expensive O(n²))
+    en_all = []
+    for _ in range(min(10, len(real_Xs), len(synth_Xs))):
+        Xs = synth_Xs[np.random.RandomState(42 + _).choice(len(synth_Xs))]
+        Xr = real_Xs[np.random.RandomState(42 + _).choice(len(real_Xs))]
+        en = compute_energy_distance(Xs, Xr, max_samples=300)
+        if not np.isnan(en.get("energy_sqrt", float("nan"))):
+            en_all.append(en["energy_sqrt"])
+
+    return {
+        "n_synth_tables": len(synth_Xs),
+        "n_real_tables": len(real_Xs),
+        "eigen": {
+            "synth_entropy_p50": float(np.median(synth_ent)) if synth_ent else float("nan"),
+            "real_entropy_p50": float(np.median(real_ent)) if real_ent else float("nan"),
+            "synth_top5_ratio_p50": float(np.median(synth_top5)) if synth_top5 else float("nan"),
+            "real_top5_ratio_p50": float(np.median(real_top5)) if real_top5 else float("nan"),
+        },
+        "wasserstein": {
+            "w1_p50": float(np.median(w1_all)) if w1_all else float("nan"),
+            "ks_p50": float(np.median(ks_all)) if ks_all else float("nan"),
+        },
+        "energy_distance": {
+            "energy_p50": float(np.median(en_all)) if en_all else float("nan"),
+        },
+    }
+
+
 # ── constants ──────────────────────────────────────────────────────────────
 AUC_HARD_REJECT = 0.52       # OOF AUC <= this -> reject directly
 AUC_HARD_ACCEPT = 0.58       # OOF AUC >= this -> accept, no bootstrap

@@ -1155,14 +1155,16 @@ class TableGenerator:
         fk_seed: int,
         parent_data_list: list,
         parent_names: list[str] | None = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Compute FK connections via HSBM.
 
         Single parent: uses ``compute_hsbm_fk_ids`` directly.
         Multiple parents: uses ``compute_hsbm_fk_ids_multi`` with a shared
         latent cluster path for joint tuple sampling.
 
-        Returns tensor of shape ``(child_rows, num_parents)``.
+        Returns ``(fk_ids, block_paths)`` where fk_ids shape is
+        ``(child_rows, num_parents)`` and block_paths is the hierarchical
+        cluster path per child row (or None for source tables).
         """
         from src.prior.hsbm import compute_hsbm_fk_ids, compute_hsbm_fk_ids_multi  # noqa: PLC0415
 
@@ -1183,28 +1185,32 @@ class TableGenerator:
 
         if num_parents == 1:
             # Single parent: use original path (backward compatible)
-            fk_ids = compute_hsbm_fk_ids(
+            fk_ids_np, block_paths_np = compute_hsbm_fk_ids(
                 size_a=parent_sizes[0],
                 size_b=child_rows,
                 hierarchy_a=hierarchies_parent[0],
                 hierarchy_b=hierarchies_parent[0],
                 seed=fk_seed,
             )
-            return torch.tensor(fk_ids, device=self.device).long().unsqueeze(-1)
+            fk_ids = torch.tensor(fk_ids_np, device=self.device).long().unsqueeze(-1)
+            block_paths = torch.tensor(block_paths_np, device=self.device).long()
+            return fk_ids, block_paths
 
         # Multi-parent joint sampling with shared latent cluster path.
         # Child-side cluster is sampled at max depth; each parent reads its prefix.
         max_levels = max(len(h) for h in hierarchies_parent)
         hierarchy_child = max(hierarchies_parent, key=len)
 
-        fk_ids_np = compute_hsbm_fk_ids_multi(
+        fk_ids_np, block_paths_np = compute_hsbm_fk_ids_multi(
             parent_sizes=parent_sizes,
             child_size=child_rows,
             hierarchies_parent=hierarchies_parent,
             hierarchy_child=hierarchy_child,
             seed=fk_seed,
         )
-        return torch.tensor(fk_ids_np, device=self.device).long()
+        fk_ids = torch.tensor(fk_ids_np, device=self.device).long()
+        block_paths = torch.tensor(block_paths_np, device=self.device).long()
+        return fk_ids, block_paths
 
     def _compute_t_min_for_child(
         self,
@@ -1304,7 +1310,7 @@ class TableGenerator:
             if "parent_data_list" in kwargs:
                 parent_data_list = kwargs["parent_data_list"]
                 parent_names = kwargs.get("parent_names", None)
-                fk_ids = self._compute_hsbm_fk_ids(
+                fk_ids, block_paths = self._compute_hsbm_fk_ids(
                     fk_seed=kwargs.get("fk_seed", 0),
                     parent_data_list=parent_data_list,
                     parent_names=parent_names,
@@ -1324,7 +1330,7 @@ class TableGenerator:
                 )
                 self.table_SCM.t_min = t_min.to(self.device)
                 X, FK_ids, outputs_flat = self.table_SCM.forward_with_input(
-                    parent_data_list, fk_ids
+                    parent_data_list, fk_ids, block_paths=block_paths,
                 )
 
                 self.all_scm_outputs = X.copy()
@@ -1715,6 +1721,47 @@ class RDB:
                     combined_params[k] = v
                 else:
                     raise ValueError(f"Parameter {k} is already sampled")
+
+            # --- Signal-group archetype params ---
+            # Compute hsbm_locality from HSBM hierarchies (structural proxy)
+            hsbm_hierarchies = []
+            for parent_name in parent_tables:
+                nlv = hsbm_per_parent[parent_name]["hsbm_num_levels"]
+                cpl = hsbm_per_parent[parent_name]["hsbm_clusters_per_level"]
+                parent_rows_val = self.table_generators[parent_name].num_rows
+                child_rows_val = table.num_rows
+                _, hierarchy_a = TableGenerator._clip_hierarchy(
+                    nlv, cpl, parent_rows_val, child_rows_val,
+                )
+                hsbm_hierarchies.append(hierarchy_a)
+
+            from src.prior.mlp_scm import compute_hsbm_locality, make_relation_key  # noqa: PLC0415
+
+            archetype_params = {
+                "is_source": len(parent_tables) == 0,
+                "is_timestamp": table.is_time_table,
+                "num_parents": len(parent_tables),
+                "hsbm_locality": compute_hsbm_locality(hsbm_hierarchies),
+            }
+
+            # Build RelationKeys and per-edge metadata
+            relation_keys = []
+            parent_causal_dims = []
+            levels_per_edge = []
+            fk_col_idx = 0
+            for _i, _parent_name in enumerate(parent_tables):
+                rk = make_relation_key(table_name, fk_col_idx, _parent_name)
+                relation_keys.append(rk)
+                parent_causal_dims.append(
+                    self.table_generators[_parent_name].table_SCM.num_outputs,
+                )
+                levels_per_edge.append(len(hsbm_hierarchies[_i]))
+                fk_col_idx += 1
+
+            combined_params["archetype_params"] = archetype_params
+            combined_params["relation_keys"] = relation_keys
+            combined_params["parent_causal_dims"] = parent_causal_dims
+            combined_params["levels_per_edge"] = levels_per_edge
 
             # Create separate mask dictionaries for different purposes
             # For SCM: use original MASK_TYPE enums

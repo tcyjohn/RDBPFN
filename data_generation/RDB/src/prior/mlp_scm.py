@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import random
 import warnings
+from collections import namedtuple
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
@@ -12,6 +13,111 @@ from torch import nn
 from .utils import GaussianNoise, XSampler, MASK_TYPE, SCM_OUTPUT
 from .prior_config import DEFAULT_MLP_SCM_CONFIG
 from .temporal_vocab import TemporalVocab
+
+# ---------------------------------------------------------------------------
+# Contract 0.1 — RelationKey
+# ---------------------------------------------------------------------------
+
+RelationKey = namedtuple("RelationKey", ["child_table", "fk_col_idx", "parent_table"])
+
+
+def make_relation_key(child_table: str, fk_col_idx: int, parent_table: str) -> RelationKey:
+    """Single factory for all RelationKey creation. One place to validate."""
+    return RelationKey(child_table=child_table, fk_col_idx=fk_col_idx, parent_table=parent_table)
+
+
+# ---------------------------------------------------------------------------
+# Contract 0.2 — Time signal split hard boundaries
+# ---------------------------------------------------------------------------
+
+TIME_BASIS_DIMS = (0, 8)   # [0:8] — Fourier basis components
+TIME_GATE_DIMS = (8, 11)   # [8:11] — Dirichlet gate vector
+
+
+# ---------------------------------------------------------------------------
+# Contract 0.4 — FeatureGenMode gating table
+# ---------------------------------------------------------------------------
+
+FEATURE_GEN_MODE_ACTIVE_HPS = {
+    True: {
+        "archetype_perturb_std", "max_groups_per_feature", "loading_sigma",
+        "loading_log_mean", "residual_sigma", "basis_group_divisor",
+        "group_scale_time", "group_scale_parent", "group_scale_path",
+    },
+    False: {"parent_injection_scale"},
+}
+
+
+# ---------------------------------------------------------------------------
+# Contract 0.2 helper — PathEncoder
+# ---------------------------------------------------------------------------
+
+def compute_hsbm_locality(hierarchies: list[list[int]]) -> float:
+    """Deterministic structural proxy for HSBM connection concentration.
+
+    Higher values → tighter block-local connections → stronger feature correlation.
+    """
+    if not hierarchies:
+        return 0.0
+    per_edge = []
+    for h in hierarchies:
+        val = sum(math.log(max(h[l], 1)) for l in range(len(h)))
+        per_edge.append(val)
+    max_possible = max(per_edge) if per_edge else 1.0
+    if max_possible <= 0:
+        return 0.0
+    return float(np.mean([v / max_possible for v in per_edge]))
+
+
+class PathEncoder(nn.Module):
+    """Per-edge path encoder: embed each hierarchy level then project to fixed dim.
+
+    Parameters
+    ----------
+    num_levels : int
+        Number of hierarchy levels (L_p) for this FK edge.
+    max_blocks_per_level : int
+        Maximum number of blocks at any single level (vocabulary size per embedding).
+    out_dim : int, default=8
+        Output dimensionality.
+    embed_dim : int, default=4
+        Embedding dimensionality per hierarchy level.
+    """
+
+    def __init__(
+        self,
+        num_levels: int,
+        max_blocks_per_level: int,
+        out_dim: int = 8,
+        embed_dim: int = 4,
+    ):
+        super().__init__()
+        self.num_levels = num_levels
+        self.out_dim = out_dim
+        self.embed_dim = embed_dim
+        self.embeddings = nn.ModuleList([
+            nn.Embedding(max_blocks_per_level, embed_dim) for _ in range(num_levels)
+        ])
+        self.projection = nn.Linear(num_levels * embed_dim, out_dim)
+
+    def forward(self, block_paths: torch.Tensor) -> torch.Tensor:
+        """Encode a block-path prefix into a fixed-dim signal vector.
+
+        Parameters
+        ----------
+        block_paths : torch.Tensor
+            LongTensor of shape ``(seq_len, num_levels)``. Each entry is a
+            block index at the corresponding hierarchy level.
+
+        Returns
+        -------
+        torch.Tensor of shape ``(seq_len, out_dim)``.
+        """
+        embeds = []
+        for l in range(self.num_levels):
+            embeds.append(self.embeddings[l](block_paths[:, l]))
+        concat = torch.cat(embeds, dim=-1)
+        return self.projection(concat)
 
 
 class MLPSCM(nn.Module):
@@ -99,7 +205,7 @@ class MLPSCM(nn.Module):
         other_causes: int = 0,
         sampling_ratio: float = 1.0,
         is_causal: bool = True,  # Always True now
-        in_clique: bool = False,  # Used now
+        in_clique: bool = True,  # Used now
         sort_features: bool = True,  # No need to sort features now
         num_layers: int = 10,
         hidden_dim: int = 20,
@@ -122,6 +228,26 @@ class MLPSCM(nn.Module):
         parent_sampling_dist: str = "uniform",  # "uniform" or "zipf"
         parent_sampling_alpha: float = 1.0,
         time_dim: int = 0,
+        parent_injection_scale: float = 0.15,
+        # Signal-group feature generation parameters
+        use_signal_group_features: bool = False,
+        archetype_params: dict | None = None,
+        relation_keys: list[RelationKey] | None = None,
+        parent_causal_dims: list[int] | None = None,
+        levels_per_edge: list[int] | None = None,
+        group_scale_time: float = 1.0,
+        group_scale_parent: float = 1.0,
+        group_scale_path: float = 1.0,
+        residual_sigma: float = 0.1,
+        loading_sigma: float = 0.5,
+        loading_log_mean: float = -0.5,
+        max_groups_per_feature: int = 1,
+        archetype_perturb_std: float = 0.2,
+        basis_group_divisor: int = 4,
+        coupling_rank: int = 2,
+        coupling_lambda: float = 0.15,
+        num_basis_families: int = 2,
+        basis_family_rho: float = 0.7,
         **kwargs: Dict[str, Any],
     ):
         super(MLPSCM, self).__init__()
@@ -178,6 +304,48 @@ class MLPSCM(nn.Module):
             self.temporal_vocab = TemporalVocab(device=self.device)
 
         self.eta = kwargs.get("eta", 1.0)  # Controls influence of embedding affinity
+        self.parent_injection_scale = parent_injection_scale
+
+        # --- Signal-group feature generation init ---
+        self.use_signal_group_features = use_signal_group_features
+        self.group_scale_time = group_scale_time
+        self.group_scale_parent = group_scale_parent
+        self.group_scale_path = group_scale_path
+        self.residual_sigma = residual_sigma
+        self.loading_sigma = loading_sigma
+        self.loading_log_mean = loading_log_mean
+        self.max_groups_per_feature = max_groups_per_feature
+        self.archetype_perturb_std = archetype_perturb_std
+        self.basis_group_divisor = basis_group_divisor
+        self.coupling_rank = coupling_rank
+        self.coupling_lambda = coupling_lambda
+        self.num_basis_families = num_basis_families
+        self.basis_family_rho = basis_family_rho
+
+        self.alpha_final: torch.Tensor | None = None
+        self.feature_assignments: list[dict] = []
+        self.group_bases: dict[str, dict[str, torch.Tensor]] = {}
+        self.parent_projectors = nn.ModuleDict()
+        self.path_encoders = nn.ModuleDict()
+
+        if self.use_signal_group_features:
+            _archetype_params = archetype_params or {}
+            _relation_keys = relation_keys or []
+            _parent_causal_dims = parent_causal_dims or []
+            _levels_per_edge = levels_per_edge or []
+
+            archetype = self._classify_archetype(_archetype_params)
+            alpha_base = self._compute_base_alpha(archetype)
+            self.alpha_final = self._perturb_alpha(alpha_base)
+
+            n_feat = masks.get(MASK_TYPE.X, 12)
+            self.feature_assignments = self._sample_feature_groups(
+                self.alpha_final, n_feat,
+            )
+            self.group_bases = self._init_group_bases()
+            self._init_parent_projectors(_relation_keys, _parent_causal_dims)
+            self._init_path_encoders(_relation_keys, _levels_per_edge)
+            self._init_cross_feature_coupling(n_feat)
 
         if self.is_causal:
             total_features = masks[MASK_TYPE.X]
@@ -462,6 +630,29 @@ class MLPSCM(nn.Module):
             if torch.any(torch.isnan(value)):
                 value[:] = 0.0
 
+        if self.use_signal_group_features:
+            # Source table: only time signal available; parent/path masked by α
+            self._cached_time_features = time_features if self.time_dim > 0 else None
+
+            time_sig_raw = self._build_time_signal()
+            parent_sig_raw = torch.zeros(self.seq_len, 12, device=self.device)
+            path_sig_raw = torch.zeros(self.seq_len, 8, device=self.device)
+
+            time_sig, parent_sig, path_sig = self._normalize_signals(
+                time_sig_raw, parent_sig_raw, path_sig_raw,
+            )
+
+            signals = {
+                "time_basis": time_sig[:, TIME_BASIS_DIMS[0]:TIME_BASIS_DIMS[1]],
+                "time_gates": time_sig[:, TIME_GATE_DIMS[0]:TIME_GATE_DIMS[1]],
+                "parent": parent_sig,
+                "path": path_sig,
+            }
+
+            X_sg = self._construct_features(signals, self.residual_sigma)
+            X_sg = self._apply_cross_feature_coupling(X_sg)
+            X[MASK_TYPE.X] = X_sg
+
         # Return both masked outputs and full outputs for TableGenerator
         return X, outputs_flat
 
@@ -469,6 +660,7 @@ class MLPSCM(nn.Module):
         self,
         parent_data_list: list,
         fk_ids: torch.Tensor,
+        block_paths: torch.Tensor | None = None,
     ):
         """Generate child-table rows conditioned on pre-determined FK connections.
 
@@ -483,6 +675,9 @@ class MLPSCM(nn.Module):
         fk_ids : torch.Tensor
             Shape ``(seq_len, num_parents)``.  ``fk_ids[:, i]`` are the parent
             row indices (0-based) to use for parent ``i``.
+        block_paths : torch.Tensor or None
+            Shape ``(seq_len, max_levels)``. Hierarchical block path per child
+            row from HSBM. Only used when ``use_signal_group_features=True``.
         """
         causes = self.xsampler.sample()  # (seq_len, num_causes)
         if self.time_dim > 0:
@@ -519,6 +714,48 @@ class MLPSCM(nn.Module):
         for _, value in X.items():
             if torch.any(torch.isnan(value)):
                 value[:] = 0.0
+
+        if self.use_signal_group_features:
+            # --- Signal-group feature construction ---
+            # Cache time features for _build_time_signal
+            self._cached_time_features = time_features if self.time_dim > 0 else None
+
+            time_sig_raw = self._build_time_signal()
+            parent_sig_raw = self._build_parent_signal(parent_data_list, fk_ids)
+            path_sig_raw = self._build_path_signal(block_paths)
+
+            time_sig, parent_sig, path_sig = self._normalize_signals(
+                time_sig_raw, parent_sig_raw, path_sig_raw,
+            )
+
+            # Split time signal for feature construction
+            signals = {
+                "time_basis": time_sig[:, TIME_BASIS_DIMS[0]:TIME_BASIS_DIMS[1]],
+                "time_gates": time_sig[:, TIME_GATE_DIMS[0]:TIME_GATE_DIMS[1]],
+                "parent": parent_sig,
+                "path": path_sig,
+            }
+
+            X_sg = self._construct_features(signals, self.residual_sigma)
+            X_sg = self._apply_cross_feature_coupling(X_sg)
+            X[MASK_TYPE.X] = X_sg
+
+        else:
+            # Old path: parent feature explicit injection
+            if self.parent_injection_scale > 0:
+                parent_parts = []
+                for i, parent_data in enumerate(parent_data_list):
+                    if MASK_TYPE.FULL in parent_data:
+                        parent_full = parent_data[MASK_TYPE.FULL]
+                        parent_parts.append(parent_full[fk_ids[:, i]])
+                if parent_parts:
+                    parent_flat = torch.cat(parent_parts, dim=-1)
+                    n_feat = X[MASK_TYPE.X].shape[1]
+                    D = parent_flat.shape[1]
+                    for j in range(n_feat):
+                        w = torch.randn(D, device=self.device)
+                        w = w * (self.parent_injection_scale / (D**0.5))
+                        X[MASK_TYPE.X][:, j] += parent_flat @ w
 
         return X, fk_ids, outputs_flat
 
@@ -807,6 +1044,438 @@ class MLPSCM(nn.Module):
         outputs_flat = torch.cat(outputs, dim=-1)
 
         return outputs_flat
+
+    # ------------------------------------------------------------------
+    # Phase 0 stubs — Signal-Group Feature Generation (Contract 0.4)
+    # Implemented in Phase 1–4.
+    # ------------------------------------------------------------------
+
+    def _classify_archetype(self, params: dict) -> dict:
+        """Extract archetype signals from table metadata."""
+        return {
+            "is_source": params.get("is_source", False),
+            "is_timestamp": params.get("is_timestamp", False),
+            "num_parents": params.get("num_parents", 0),
+            "hsbm_locality": params.get("hsbm_locality", 0.0),
+        }
+
+    def _compute_base_alpha(self, archetype: dict) -> torch.Tensor:
+        """Map archetype signals to base Dirichlet α (3-vector: time, parent, path).
+
+        Source tables only use the time group; parent and path are masked (α=0).
+        """
+        is_source = archetype["is_source"]
+        is_timestamp = archetype["is_timestamp"]
+        num_parents = archetype["num_parents"]
+
+        if is_source:
+            alpha = torch.tensor([1.0, 0.0, 0.0], device=self.device)
+            # Mask unavailable groups: source tables have no FK edges
+            # parent=0 and path=0 already applied
+        elif is_timestamp:
+            alpha = torch.tensor([0.5, 0.25, 0.25], device=self.device)
+            # Multi-parent: inflate parent share, capped at 0.6
+            if num_parents > 1:
+                parent_share = min(0.6, max(0.25, num_parents * 0.10))
+                alpha[1] = parent_share
+                remain = 1.0 - alpha[1]
+                alpha[0] = remain * 0.5
+                alpha[2] = remain * 0.5
+        else:
+            # Dependent non-timestamp table
+            alpha = torch.tensor([0.1, 0.55, 0.35], device=self.device)
+            if num_parents > 1:
+                parent_share = min(0.6, max(0.55, num_parents * 0.10))
+                alpha[1] = parent_share
+                remain = 1.0 - alpha[1]
+                alpha[0] = remain * 0.22  # 0.1 / 0.45
+                alpha[2] = remain * 0.78  # 0.35 / 0.45
+
+        # Mask unavailable groups
+        if num_parents == 0:
+            alpha[1] = 0.0  # parent group unavailable
+            alpha[2] = 0.0  # path group unavailable (no HSBM)
+        if not is_timestamp and self.time_dim == 0:
+            alpha[0] = 0.0  # time group unavailable
+
+        # Re-normalize among active groups
+        total = alpha.sum()
+        if total > 0:
+            alpha = alpha / total
+        else:
+            # All groups masked — fall back to uniform residual dominance
+            alpha = torch.tensor([0.0, 0.0, 0.0], device=self.device)
+
+        return alpha
+
+    def _perturb_alpha(self, alpha_base: torch.Tensor) -> torch.Tensor:
+        """Apply multiplicative log-normal perturbation to base α, re-normalize.
+
+        Only active groups (α > 0) get perturbed; masked groups stay at 0.
+        """
+        active_mask = alpha_base > 0
+        if active_mask.sum() == 0:
+            return alpha_base.clone()
+
+        eta = torch.randn(3, device=self.device) * self.archetype_perturb_std
+        alpha_perturbed = alpha_base.clone()
+        alpha_perturbed[active_mask] = alpha_base[active_mask] * torch.exp(
+            eta[active_mask],
+        )
+        alpha_perturbed = alpha_perturbed / alpha_perturbed.sum()
+        return alpha_perturbed
+
+    def _sample_feature_groups(
+        self, alpha_final: torch.Tensor, n_features: int,
+    ) -> list[dict]:
+        """Sample per-feature group assignments from Dirichlet(α_final).
+
+        Returns list of dicts, one per feature, with keys: groups, basis_indices,
+        signs, magnitudes.
+        """
+        GROUP_NAMES = ["time", "parent", "path"]
+        # K_g = min(3, max(1, ceil(S_g / divisor))). With divisor=8→K=2.
+        # When divisor ≥ S_g → K=1, forcing all features in a group
+        # to share the same basis vector (max within-group correlation).
+        DIV = self.basis_group_divisor
+        TIME_S = 8; PARENT_S = 12; PATH_S = 8
+        K_PER_GROUP = {
+            "time": min(3, max(1, int(np.ceil(TIME_S / DIV)))),
+            "parent": min(3, max(1, int(np.ceil(PARENT_S / DIV)))),
+            "path": min(3, max(1, int(np.ceil(PATH_S / DIV)))),
+        }
+
+        alpha_np = alpha_final.detach().cpu().numpy()
+        feature_assignments = []
+
+        # Per-group basis-index counters for round-robin allocation
+        basis_counters = {g: 0 for g in GROUP_NAMES}
+        # Per-basis-index sign, fixed per (group, basis_idx) across features
+        basis_signs: dict[str, list[float]] = {}
+        for g in GROUP_NAMES:
+            K_g = K_PER_GROUP[g]
+            basis_signs[g] = [1.0 if np.random.random() > 0.5 else -1.0 for _ in range(K_g)]
+
+        for ft_idx in range(n_features):
+            # Sample group weights from Dirichlet
+            group_weights = np.random.dirichlet(alpha_np + 1e-6)
+
+            # Select top-K groups among active ones
+            active_indices = np.where(alpha_np > 0)[0]
+            if len(active_indices) == 0:
+                feature_assignments.append({
+                    "groups": [],
+                    "basis_indices": {},
+                    "signs": {},
+                    "magnitudes": {},
+                })
+                continue
+
+            active_weights = group_weights[active_indices]
+            k = min(self.max_groups_per_feature, len(active_indices))
+            top_k_local = np.argsort(active_weights)[-k:]
+            top_k_global = active_indices[top_k_local]
+
+            fa = {
+                "groups": [],
+                "basis_indices": {},
+                "signs": {},
+                "magnitudes": {},
+            }
+
+            for g_idx in top_k_global:
+                g_name = GROUP_NAMES[g_idx]
+                K_g = K_PER_GROUP[g_name]
+
+                # Round-robin basis index — ensures uniform sharing across features
+                n_basis = min(K_g, 1)
+                basis_idx = basis_counters[g_name] % K_g
+                basis_counters[g_name] += 1
+
+                # Shared sign per (group, basis_idx) — features with same basis get SAME sign
+                sign_val = basis_signs[g_name][basis_idx]
+
+                # Magnitude ~ LogNormal with independent per-feature noise
+                mag_val = float(np.random.lognormal(
+                    mean=self.loading_log_mean, sigma=self.loading_sigma,
+                ))
+
+                # Per-feature-basis perturbation (reserved for future use)
+                pert = 0.0
+
+                fa["groups"].append(g_name)
+                fa["basis_indices"][g_name] = [basis_idx]
+                fa["signs"][g_name] = [sign_val]
+                fa["magnitudes"][g_name] = [mag_val]
+                fa.setdefault("perturbations", {})[g_name] = [pert]
+
+            feature_assignments.append(fa)
+
+        return feature_assignments
+
+    def _init_group_bases(self) -> dict[str, dict[str, torch.Tensor]]:
+        """Initialize subspace-orthogonal bases.
+
+        Each group's signal is split into K equal subspaces. Basis k only
+        projects from its own subspace, guaranteeing zero cross-basis
+        correlation from the signal. Cross-basis coupling is then
+        controlled solely by the coupling layer.
+        """
+        DIV = self.basis_group_divisor
+        TIME_S = 8; PARENT_S = 12; PATH_S = 8
+        K_time = min(3, max(1, int(np.ceil(TIME_S / DIV))))
+        K_parent = min(3, max(1, int(np.ceil(PARENT_S / DIV))))
+        K_path = min(3, max(1, int(np.ceil(PATH_S / DIV))))
+
+        group_bases: dict[str, dict[str, torch.Tensor]] = {}
+        self._basis_families: dict[str, list[int]] = {}
+        # Map: group → per-basis subspace slice (start, end)
+        self._basis_subspaces: dict[str, list[tuple[int, int]]] = {}
+
+        def _make_subspace_bases(K: int, D: int) -> tuple[torch.Tensor, list[tuple[int, int]]]:
+            """Generate K unit-norm basis vectors from disjoint subspaces."""
+            bases = torch.zeros(K, D, device=self.device)
+            subspaces: list[tuple[int, int]] = []
+            for k in range(K):
+                start = k * D // K
+                end = (k + 1) * D // K
+                subspaces.append((start, end))
+                sub_D = end - start
+                b_sub = torch.randn(sub_D, device=self.device)
+                bases[k, start:end] = b_sub / b_sub.norm()
+            return bases, subspaces
+
+        B_time_basis, subspaces_time = _make_subspace_bases(K_time, TIME_S)
+        B_time_gate, subspaces_time_gate = _make_subspace_bases(K_time, 3)
+        group_bases["time"] = {"basis": B_time_basis, "gate": B_time_gate}
+        self._basis_families["time"] = list(range(K_time))
+        self._basis_subspaces["time_basis"] = subspaces_time
+        self._basis_subspaces["time_gate"] = subspaces_time_gate
+
+        B_parent, subspaces_parent = _make_subspace_bases(K_parent, PARENT_S)
+        group_bases["parent"] = {"basis": B_parent}
+        self._basis_families["parent"] = list(range(K_parent))
+        self._basis_subspaces["parent"] = subspaces_parent
+
+        B_path, subspaces_path = _make_subspace_bases(K_path, PATH_S)
+        group_bases["path"] = {"basis": B_path}
+        self._basis_families["path"] = list(range(K_path))
+        self._basis_subspaces["path"] = subspaces_path
+
+        return group_bases
+
+    def _init_parent_projectors(
+        self,
+        relation_keys: list[RelationKey],
+        parent_causal_dims: list[int],
+    ) -> None:
+        """Create per-edge Linear projectors: parent CAUSAL_OUTPUT → 12-dim.
+
+        Stored in ``self.parent_projectors`` (nn.ModuleDict, keyed by RelationKey).
+        """
+        for rk, parent_dim in zip(relation_keys, parent_causal_dims):
+            self.parent_projectors[str(rk)] = nn.Linear(parent_dim, 12).to(
+                self.device,
+            )
+
+    def _init_path_encoders(
+        self,
+        relation_keys: list[RelationKey],
+        levels_per_edge: list[int],
+    ) -> None:
+        """Create per-edge PathEncoder instances.
+
+        Stored in ``self.path_encoders`` (nn.ModuleDict, keyed by RelationKey).
+        """
+        MAX_BLOCKS = 4  # max_blocks_per_level from DEFAULT_HSBM_HP max
+        for rk, n_lv in zip(relation_keys, levels_per_edge):
+            self.path_encoders[str(rk)] = PathEncoder(
+                num_levels=n_lv,
+                max_blocks_per_level=MAX_BLOCKS,
+                out_dim=8,
+                embed_dim=4,
+            ).to(self.device)
+
+    def _build_time_signal(self) -> torch.Tensor:
+        """Return cached time features from the most recent forward call.
+
+        Returns ``(seq_len, 11)`` tensor, or zeros if no time_dim.
+        """
+        if hasattr(self, "_cached_time_features") and self._cached_time_features is not None:
+            return self._cached_time_features
+        return torch.zeros(self.seq_len, 11, device=self.device)
+
+    def _build_parent_signal(
+        self,
+        parent_data_list: list,
+        fk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Build per-edge projected parent signal, mean-pool → (seq_len, 12).
+
+        Returns zeros if no parents or no projectors registered.
+        """
+        num_parents = fk_ids.shape[1] if fk_ids.dim() > 1 and fk_ids.shape[1] > 0 else 0
+        if num_parents == 0 or len(self.parent_projectors) == 0:
+            return torch.zeros(self.seq_len, 12, device=self.device)
+
+        edge_outputs = []
+        for i in range(num_parents):
+            parent_data = parent_data_list[i]
+            parent_rows = parent_data[MASK_TYPE.CAUSAL_OUTPUT][fk_ids[:, i]]
+            projector = list(self.parent_projectors.values())[i]
+            edge_outputs.append(projector(parent_rows))
+
+        if not edge_outputs:
+            return torch.zeros(self.seq_len, 12, device=self.device)
+
+        return torch.stack(edge_outputs, dim=0).mean(dim=0)
+
+    def _build_path_signal(
+        self,
+        block_paths: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Build per-edge path embedding signal, mean-pool → (seq_len, 8).
+
+        Returns zeros if block_paths is None or no path_encoders registered.
+        """
+        if block_paths is None or len(self.path_encoders) == 0:
+            return torch.zeros(self.seq_len, 8, device=self.device)
+
+        if not isinstance(block_paths, torch.Tensor):
+            block_paths = torch.tensor(block_paths, dtype=torch.long, device=self.device)
+        else:
+            block_paths = block_paths.to(device=self.device, dtype=torch.long)
+
+        edge_outputs = []
+        for key, encoder in self.path_encoders.items():
+            n_lv = encoder.num_levels
+            edge_path = block_paths[:, :n_lv]  # prefix up to this edge's depth
+            edge_outputs.append(encoder(edge_path))  # (seq_len, 8)
+
+        if not edge_outputs:
+            return torch.zeros(self.seq_len, 8, device=self.device)
+
+        # Mean-pool across edges (single edge → identity)
+        return torch.stack(edge_outputs, dim=0).mean(dim=0)
+
+    def _normalize_signals(
+        self,
+        time_sig: torch.Tensor,
+        parent_sig: torch.Tensor,
+        path_sig: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Apply group-specific RMS normalization + scaling.
+
+        - time_basis[:, 0:8]: RMS-norm × group_scale_time
+        - time_gates[:, 8:11]: AS-IS (no RMS, no scale)
+        - parent: RMS-norm × group_scale_parent
+        - path: RMS-norm × group_scale_path
+        """
+        # Time: split at hard boundary
+        time_basis = time_sig[:, TIME_BASIS_DIMS[0]:TIME_BASIS_DIMS[1]]
+        time_gates = time_sig[:, TIME_GATE_DIMS[0]:TIME_GATE_DIMS[1]]
+
+        rms_basis = torch.sqrt(torch.mean(time_basis ** 2))
+        if rms_basis > 1e-8:
+            time_basis_norm = time_basis / rms_basis * self.group_scale_time
+        else:
+            time_basis_norm = time_basis * 0.0
+        time_out = torch.cat([time_basis_norm, time_gates], dim=-1)
+
+        # Parent: RMS norm
+        rms_parent = torch.sqrt(torch.mean(parent_sig ** 2))
+        if rms_parent > 1e-8:
+            parent_out = parent_sig / rms_parent * self.group_scale_parent
+        else:
+            parent_out = parent_sig * 0.0
+
+        # Path: RMS norm
+        rms_path = torch.sqrt(torch.mean(path_sig ** 2))
+        if rms_path > 1e-8:
+            path_out = path_sig / rms_path * self.group_scale_path
+        else:
+            path_out = path_sig * 0.0
+
+        return time_out, parent_out, path_out
+
+    def _construct_features(
+        self,
+        signals: dict,
+        residual_sigma: float,
+    ) -> torch.Tensor:
+        """Construct feature matrix X from normalized signals + assignments.
+
+        Returns (seq_len, n_features) tensor where n_features = len(self.feature_assignments).
+        """
+        n_features = len(self.feature_assignments)
+        n_feat = n_features
+        if n_feat == 0:
+            n_feat = 12  # fallback default
+        X = torch.zeros(self.seq_len, n_feat, device=self.device)
+
+        for j, fa in enumerate(self.feature_assignments):
+            if j >= X.shape[1]:
+                break
+            for g_name in fa["groups"]:
+                basis_indices = fa["basis_indices"].get(g_name, [])
+                signs = fa["signs"].get(g_name, [])
+                magnitudes = fa["magnitudes"].get(g_name, [])
+
+                if g_name == "time":
+                    basis_sig = signals["time_basis"]  # (seq_len, 8)
+                    gate_sig = signals.get("time_gates")  # (seq_len, 3)
+                    B_basis = self.group_bases["time"]["basis"]  # (K, 8)
+                    B_gate = self.group_bases["time"]["gate"]  # (K, 3)
+                    for idx_in_list, k in enumerate(basis_indices):
+                        proj = basis_sig @ B_basis[k]
+                        if gate_sig is not None:
+                            proj += gate_sig @ B_gate[k]
+                        X[:, j] += signs[idx_in_list] * magnitudes[idx_in_list] * proj
+
+                elif g_name == "parent":
+                    parent_sig = signals["parent"]
+                    B_parent = self.group_bases["parent"]["basis"]
+                    for idx_in_list, k in enumerate(basis_indices):
+                        proj = parent_sig @ B_parent[k]
+                        X[:, j] += signs[idx_in_list] * magnitudes[idx_in_list] * proj
+
+                elif g_name == "path":
+                    path_sig = signals["path"]
+                    B_path = self.group_bases["path"]["basis"]
+                    for idx_in_list, k in enumerate(basis_indices):
+                        proj = path_sig @ B_path[k]
+                        X[:, j] += signs[idx_in_list] * magnitudes[idx_in_list] * proj
+
+            # Add per-feature residual noise (ε_j ~ N(0, σ²_res))
+            if residual_sigma > 0:
+                X[:, j] += torch.randn(self.seq_len, device=self.device) * residual_sigma
+
+        return X
+
+    def _init_cross_feature_coupling(self, n_features: int) -> None:
+        """Initialize uniform off-diagonal coupling.
+
+        W = (1 − I) / (n−1). Each column gets λ · mean(all other columns).
+        This is the simplest controllable mixing: λ directly sets the
+        fraction of other-feature signal added to each feature.
+        """
+        if self.coupling_lambda <= 0 or self.coupling_rank <= 0:
+            self._coupling_W: torch.Tensor | None = None
+            return
+
+        nf = n_features
+        W = torch.ones(nf, nf, device=self.device) / (nf - 1)
+        W = W - torch.diag(torch.diag(W))
+        self._coupling_W = W
+
+    def _apply_cross_feature_coupling(
+        self, X_struct: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply: X_out = X_struct + λ · (X_struct @ W)."""
+        if (not hasattr(self, "_coupling_W") or self._coupling_W is None
+                or self.coupling_lambda <= 0):
+            return X_struct
+        return X_struct + self.coupling_lambda * (X_struct @ self._coupling_W)
 
 
 if __name__ == "__main__":

@@ -60,9 +60,9 @@ TIME_DIM = 11
 DEFAULT_MLP_SCM_CONFIG = {
     "mlp_activations": nn.Tanh,
     "init_std": 1.0,
-    "block_wise_dropout": True,
-    "mlp_dropout_prob": 0.1,
-    "scale_init_std_by_dropout": True,
+    "block_wise_dropout": False,
+    "mlp_dropout_prob": 0.03,
+    "scale_init_std_by_dropout": False,
     "sampling": "normal",
     "pre_sample_cause_stats": False,
     "noise_std": 0.01,
@@ -100,15 +100,12 @@ DEFAULT_SAMPLED_HP = {
     },
     "block_wise_dropout": {
         "distribution": "meta_choice",
-        "choice_values": [True, False],
+        "choice_values": [False],
     },
     "mlp_dropout_prob": {
-        "distribution": "meta_beta",
-        "scale": 0.6,
-        "b_min": 0.5,
-        "b_max": 4.5,
-        "k_min": 0.1,
-        "k_max": 5.0,
+        "distribution": "uniform",
+        "min": 0.01,
+        "max": 0.05,
     },
     # MLPSCM and TreeSCM
     # "is_causal": {"distribution": "meta_choice", "choice_values": [True, False]},
@@ -212,6 +209,86 @@ DEFAULT_SAMPLED_HP = {
         "distribution": "uniform",
         "min": 0.3,
         "max": 0.8,
+    },
+    # --- Parent feature injection (方案 B, Task 2.3) ---
+    # Guarded behind use_signal_group_features=False (old path).
+    "parent_injection_scale": {
+        "distribution": "uniform",
+        "min": 0.05,
+        "max": 0.25,
+    },
+    # --- Signal-group feature generation (replaces parent_injection_scale when active) ---
+    "use_signal_group_features": {
+        "distribution": "meta_choice",
+        "choice_values": [True],
+    },
+    "archetype_perturb_std": {
+        "distribution": "uniform",
+        "min": 0.1,
+        "max": 0.4,
+    },
+    "max_groups_per_feature": {
+        "distribution": "meta_choice",
+        "choice_values": [2, 3],
+    },
+    "loading_sigma": {
+        "distribution": "uniform",
+        "min": 0.2,
+        "max": 0.6,
+    },
+    "loading_log_mean": {
+        "distribution": "uniform",
+        "min": 0.2,
+        "max": 1.5,
+    },
+    "basis_group_divisor": {
+        "distribution": "meta_choice",
+        "choice_values": [3],
+    },
+    # Cross-feature coupling (low-rank)
+    "coupling_rank": {
+        "distribution": "meta_choice",
+        "choice_values": [2, 3],
+    },
+    "coupling_lambda": {
+        "distribution": "uniform",
+        "min": 0.02,
+        "max": 0.06,
+    },
+    "residual_sigma": {
+        "distribution": "uniform",
+        "min": 0.5,
+        "max": 2.0,
+    },
+    "num_basis_families": {
+        "distribution": "meta_choice",
+        "choice_values": [2, 3],
+    },
+    "basis_family_rho": {
+        "distribution": "uniform",
+        "min": 0.5,
+        "max": 0.85,
+    },
+    "group_scale_time": {
+        "distribution": "meta_trunc_norm_log_scaled",
+        "max_mean": 12.0,
+        "min_mean": 3.0,
+        "round": False,
+        "lower_bound": 0.5,
+    },
+    "group_scale_parent": {
+        "distribution": "meta_trunc_norm_log_scaled",
+        "max_mean": 12.0,
+        "min_mean": 3.0,
+        "round": False,
+        "lower_bound": 0.5,
+    },
+    "group_scale_path": {
+        "distribution": "meta_trunc_norm_log_scaled",
+        "max_mean": 12.0,
+        "min_mean": 3.0,
+        "round": False,
+        "lower_bound": 0.5,
     },
     # --- Deprecated: kept for backward compat, ignored by HSBM path ---
     "parent_sampling_dist": {
