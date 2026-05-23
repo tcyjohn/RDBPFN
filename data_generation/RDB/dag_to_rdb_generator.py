@@ -564,7 +564,7 @@ class DAGToRDBGenerator:
                     task_quality_info = DAGToRDBGenerator._generate_tasks_with_quality_gate(
                         rdb, rdb_dir, tasks_per_rdb=5, train_ratio=0.75,
                         valid_ratio=0.05, max_retries=quality_max_retries,
-                        base_seed=rdb_index,
+                        base_seed=rdb_index, use_complex_tasks=True,
                     )
                 else:
                     rdb.initialize_tasks_with_complex_tasks(
@@ -572,10 +572,17 @@ class DAGToRDBGenerator:
                     )
                     rdb.save_to_4dbinfer_dataset_with_tasks(rdb_dir)
             else:
-                rdb.initialize_tasks(
-                    tasks_per_rdb=5, train_ratio=0.75, valid_ratio=0.05
-                )
-                rdb.save_to_4dbinfer_dataset_with_tasks(rdb_dir)
+                if quality_filter:
+                    task_quality_info = DAGToRDBGenerator._generate_tasks_with_quality_gate(
+                        rdb, rdb_dir, tasks_per_rdb=5, train_ratio=0.75,
+                        valid_ratio=0.05, max_retries=quality_max_retries,
+                        base_seed=rdb_index, use_complex_tasks=False,
+                    )
+                else:
+                    rdb.initialize_tasks(
+                        tasks_per_rdb=5, train_ratio=0.75, valid_ratio=0.05
+                    )
+                    rdb.save_to_4dbinfer_dataset_with_tasks(rdb_dir)
 
             # Return success info
             return (
@@ -600,8 +607,9 @@ class DAGToRDBGenerator:
     @staticmethod
     def _generate_tasks_with_quality_gate(rdb, rdb_dir, tasks_per_rdb=5,
                                            train_ratio=0.75, valid_ratio=0.05,
-                                           max_retries=3, base_seed=42):
-        """Generate complex tasks with quality gate.
+                                           max_retries=3, base_seed=42,
+                                           use_complex_tasks=True):
+        """Generate tasks with quality gate (supports both simple and complex tasks).
 
         Retries up to ``max_retries`` times with different seeds. Keeps the
         attempt with the most passed tasks. Failed task schemas are pruned
@@ -620,11 +628,18 @@ class DAGToRDBGenerator:
             torch.manual_seed(seed)
 
             rdb.task_generation_schemas = []  # clear from previous retry
-            rdb.initialize_tasks_with_complex_tasks(
-                tasks_per_rdb=tasks_per_rdb,
-                train_ratio=train_ratio,
-                valid_ratio=valid_ratio,
-            )
+            if use_complex_tasks:
+                rdb.initialize_tasks_with_complex_tasks(
+                    tasks_per_rdb=tasks_per_rdb,
+                    train_ratio=train_ratio,
+                    valid_ratio=valid_ratio,
+                )
+            else:
+                rdb.initialize_tasks(
+                    tasks_per_rdb=tasks_per_rdb,
+                    train_ratio=train_ratio,
+                    valid_ratio=valid_ratio,
+                )
 
             passed = []
             for task in rdb.tasks:
@@ -1029,9 +1044,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--use_complex_tasks",
-        type=bool,
+        type=lambda x: x.lower() in ("true", "1", "yes"),
         default=False,
-        help="Whether to use complex tasks",
+        help="Whether to use complex tasks (true/false, default: false)",
     )
     parser.add_argument(
         "--random_seed",

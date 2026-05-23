@@ -1,6 +1,6 @@
 #!/bin/bash
 # Full pipeline: data generation → preprocessing → merge to h5 → training
-# Usage: bash scripts/run_pipeline.sh [num_rdbs] [start_index] [run_name] [skip_gen] [skip_preprocess] [skip_merge] [no_quality_filter] [quality_max_retries] [num_processes] [skip_train]
+# Usage: bash scripts/run_pipeline.sh [num_rdbs] [start_index] [run_name] [skip_gen] [skip_preprocess] [skip_merge] [no_quality_filter] [quality_max_retries] [num_processes] [skip_train] [use_complex_tasks]
 #   num_rdbs: number of RDBs to generate (default: 4)
 #   start_index: starting index (default: 0)
 #   run_name: output subdirectory name (default: auto-generated with timestamp, e.g. "run_20260515_003000")
@@ -10,6 +10,8 @@
 #   no_quality_filter: "true" to disable quality gate (default: false; enabled by default)
 #   quality_max_retries: max retries for quality gate (default: 3)
 #   num_processes: number of parallel worker processes for generation (default: $(nproc))
+#   skip_train: "true" to skip training (default: false)
+#   use_complex_tasks: "true" for complex tasks, "false" for simple tasks (default: true)
 #
 # Output layout:
 #   data_generation/RDB_datasets/<run_name>/          raw 4DBInfer data
@@ -37,6 +39,7 @@ NO_QUALITY_FILTER="${7:-false}"
 QUALITY_MAX_RETRIES="${8:-3}"
 NUM_PROCESSES="${9:-$(nproc 2>/dev/null || echo 4)}"
 SKIP_TRAIN="${10:-false}"
+USE_COMPLEX_TASKS="${11:-true}"
 END_INDEX=$((START_INDEX + NUM_RDBS))
 
 RDB_GEN_DIR="${ROOT}/data_generation/RDB"
@@ -130,7 +133,7 @@ if [ "${SKIP_GEN}" != "true" ]; then
         --num_rdbs "${NUM_RDBS}" \
         --start_index "${START_INDEX}" \
         --output_base_dir "${RAW_OUTPUT_DIR}" \
-        --use_complex_tasks True \
+        --use_complex_tasks "${USE_COMPLEX_TASKS}" \
         --num_processes "${NUM_PROCESSES}" \
         "${QUALITY_FLAGS[@]}"
 
