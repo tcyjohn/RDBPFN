@@ -238,8 +238,8 @@ DEFAULT_SAMPLED_HP = {
     },
     "loading_log_mean": {
         "distribution": "uniform",
-        "min": 0.2,
-        "max": 1.5,
+        "min": 0.35,
+        "max": 1.7,
     },
     "basis_group_divisor": {
         "distribution": "meta_choice",
@@ -260,6 +260,10 @@ DEFAULT_SAMPLED_HP = {
         "min": 0.5,
         "max": 2.0,
     },
+    "basis_perturb_eta": {
+        "distribution": "meta_choice",
+        "choice_values": [0.10],
+    },
     "num_basis_families": {
         "distribution": "meta_choice",
         "choice_values": [2, 3],
@@ -271,21 +275,21 @@ DEFAULT_SAMPLED_HP = {
     },
     "group_scale_time": {
         "distribution": "meta_trunc_norm_log_scaled",
-        "max_mean": 12.0,
+        "max_mean": 15.0,
         "min_mean": 3.0,
         "round": False,
         "lower_bound": 0.5,
     },
     "group_scale_parent": {
         "distribution": "meta_trunc_norm_log_scaled",
-        "max_mean": 12.0,
+        "max_mean": 15.0,
         "min_mean": 3.0,
         "round": False,
         "lower_bound": 0.5,
     },
     "group_scale_path": {
         "distribution": "meta_trunc_norm_log_scaled",
-        "max_mean": 12.0,
+        "max_mean": 15.0,
         "min_mean": 3.0,
         "round": False,
         "lower_bound": 0.5,
@@ -360,5 +364,23 @@ DEFAULT_HSBM_HP = {
     "hsbm_clusters_per_level": {
         "distribution": "meta_choice",
         "choice_values": [1, 2, 3],
+    },
+    "propensity_rho": {
+        "distribution": "uniform",
+        "min": 0.05,
+        "max": 0.20,
+    },
+    "propensity_beta": {
+        "distribution": "uniform",
+        "min": 2.0,
+        "max": 8.0,
+    },
+    "matching_latent_dim": {
+        "distribution": "meta_choice",
+        "choice_values": [2, 3, 4],
+    },
+    "matching_temperature": {
+        "distribution": "meta_choice",
+        "choice_values": [0.10, 0.20, 0.35, 0.50],
     },
 }

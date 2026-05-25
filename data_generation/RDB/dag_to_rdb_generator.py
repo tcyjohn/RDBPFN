@@ -502,6 +502,7 @@ class DAGToRDBGenerator:
                 dimension_config,
                 quality_filter,
                 quality_max_retries,
+                relbench_mode,
             ) = args
 
             # Set random seed for reproducibility (each worker gets different seed)
@@ -565,10 +566,12 @@ class DAGToRDBGenerator:
                         rdb, rdb_dir, tasks_per_rdb=5, train_ratio=0.75,
                         valid_ratio=0.05, max_retries=quality_max_retries,
                         base_seed=rdb_index, use_complex_tasks=True,
+                        relbench_mode=relbench_mode,
                     )
                 else:
                     rdb.initialize_tasks_with_complex_tasks(
-                        tasks_per_rdb=5, train_ratio=0.75, valid_ratio=0.05
+                        tasks_per_rdb=5, train_ratio=0.75, valid_ratio=0.05,
+                        relbench_mode=relbench_mode,
                     )
                     rdb.save_to_4dbinfer_dataset_with_tasks(rdb_dir)
             else:
@@ -583,6 +586,9 @@ class DAGToRDBGenerator:
                         tasks_per_rdb=5, train_ratio=0.75, valid_ratio=0.05
                     )
                     rdb.save_to_4dbinfer_dataset_with_tasks(rdb_dir)
+
+            # Dump feature assignment diagnostics for post-hoc analysis
+            DAGToRDBGenerator._dump_feature_diagnostics(rdb, rdb_dir)
 
             # Return success info
             return (
@@ -608,7 +614,8 @@ class DAGToRDBGenerator:
     def _generate_tasks_with_quality_gate(rdb, rdb_dir, tasks_per_rdb=5,
                                            train_ratio=0.75, valid_ratio=0.05,
                                            max_retries=3, base_seed=42,
-                                           use_complex_tasks=True):
+                                           use_complex_tasks=True,
+                                           relbench_mode=False):
         """Generate tasks with quality gate (supports both simple and complex tasks).
 
         Retries up to ``max_retries`` times with different seeds. Keeps the
@@ -633,6 +640,7 @@ class DAGToRDBGenerator:
                     tasks_per_rdb=tasks_per_rdb,
                     train_ratio=train_ratio,
                     valid_ratio=valid_ratio,
+                    relbench_mode=relbench_mode,
                 )
             else:
                 rdb.initialize_tasks(
@@ -676,6 +684,23 @@ class DAGToRDBGenerator:
             "quality_attempts": best_attempt + 1,
             "quality_checked": total_checked,
         }
+
+    @staticmethod
+    def _dump_feature_diagnostics(rdb, rdb_dir):
+        """Save per-table feature-assignment metadata for post-hoc analysis."""
+        import json  # noqa: PLC0415
+
+        diag = {}
+        for table_name, table_gen in rdb.table_generators.items():
+            scm = getattr(table_gen, "table_SCM", None)
+            if scm is None or not getattr(scm, "use_signal_group_features", False):
+                continue
+            diag[table_name] = scm.get_feature_diagnostics()
+
+        if diag:
+            diag_path = os.path.join(rdb_dir, "_feature_diagnostics.json")
+            with open(diag_path, "w") as f:
+                json.dump(diag, f, indent=2)
 
     def generate_rdbs_from_dags(
         self,
@@ -758,6 +783,7 @@ class DAGToRDBGenerator:
                 self.dimension_config,
                 quality_filter,
                 quality_max_retries,
+                relbench_mode,
             )
             for i in range(start_index, start_index + num_rdbs)
         ]
@@ -1049,6 +1075,11 @@ if __name__ == "__main__":
         help="Whether to use complex tasks (true/false, default: false)",
     )
     parser.add_argument(
+        "--relbench_mode",
+        action="store_true",
+        help="Use RelBench-style tasks: entity as focal + target, DIRECT_ATTRIBUTE_PREDICTION",
+    )
+    parser.add_argument(
         "--random_seed",
         type=int,
         default=42,
@@ -1087,6 +1118,7 @@ if __name__ == "__main__":
     num_processes = args.num_processes
     start_index = args.start_index
     use_complex_tasks = args.use_complex_tasks
+    relbench_mode = args.relbench_mode
     use_row_gnn = args.use_row_gnn
     random_seed = args.random_seed
     gnn_device = args.gnn_device

@@ -1085,6 +1085,12 @@ class TableGenerator:
         # key = parent_table_name, value = sampled parameter value.
         self.hsbm_num_levels: Dict[str, int] = {}
         self.hsbm_clusters_per_level: Dict[str, int] = {}
+        # FK Propensity params (table-level, used for single-parent)
+        self.propensity_rho: float = 0.0
+        self.propensity_beta: float = 0.0
+        # Matching Latent params (table-level, used for multi-parent)
+        self.matching_latent_dim: int = 0
+        self.matching_temperature: float = 0.0
 
     def init_table_SCM(
         self,
@@ -1166,7 +1172,12 @@ class TableGenerator:
         ``(child_rows, num_parents)`` and block_paths is the hierarchical
         cluster path per child row (or None for source tables).
         """
-        from src.prior.hsbm import compute_hsbm_fk_ids, compute_hsbm_fk_ids_multi  # noqa: PLC0415
+        from src.prior.hsbm import (  # noqa: PLC0415
+            compute_hsbm_fk_ids,
+            compute_hsbm_fk_ids_multi,
+            compute_hsbm_fk_ids_multi_with_matching,
+            compute_hsbm_fk_ids_with_propensity,
+        )
 
         child_rows = self.num_rows
         num_parents = len(parent_data_list)
@@ -1184,30 +1195,61 @@ class TableGenerator:
             hierarchies_parent.append(hierarchy_a)
 
         if num_parents == 1:
-            # Single parent: use original path (backward compatible)
-            fk_ids_np, block_paths_np = compute_hsbm_fk_ids(
-                size_a=parent_sizes[0],
-                size_b=child_rows,
-                hierarchy_a=hierarchies_parent[0],
-                hierarchy_b=hierarchies_parent[0],
-                seed=fk_seed,
-            )
+            use_propensity = self.propensity_rho > 0
+            if use_propensity:
+                parent_causal = (
+                    parent_data_list[0][MASK_TYPE.CAUSAL_OUTPUT].cpu().numpy()
+                )
+                fk_ids_np, block_paths_np = compute_hsbm_fk_ids_with_propensity(
+                    size_a=parent_sizes[0],
+                    size_b=child_rows,
+                    hierarchy_a=hierarchies_parent[0],
+                    hierarchy_b=hierarchies_parent[0],
+                    parent_causal_output=parent_causal,
+                    propensity_rho=self.propensity_rho,
+                    propensity_beta=self.propensity_beta,
+                    seed=fk_seed,
+                )
+            else:
+                fk_ids_np, block_paths_np = compute_hsbm_fk_ids(
+                    size_a=parent_sizes[0],
+                    size_b=child_rows,
+                    hierarchy_a=hierarchies_parent[0],
+                    hierarchy_b=hierarchies_parent[0],
+                    seed=fk_seed,
+                )
             fk_ids = torch.tensor(fk_ids_np, device=self.device).long().unsqueeze(-1)
             block_paths = torch.tensor(block_paths_np, device=self.device).long()
             return fk_ids, block_paths
 
         # Multi-parent joint sampling with shared latent cluster path.
         # Child-side cluster is sampled at max depth; each parent reads its prefix.
-        max_levels = max(len(h) for h in hierarchies_parent)
         hierarchy_child = max(hierarchies_parent, key=len)
 
-        fk_ids_np, block_paths_np = compute_hsbm_fk_ids_multi(
-            parent_sizes=parent_sizes,
-            child_size=child_rows,
-            hierarchies_parent=hierarchies_parent,
-            hierarchy_child=hierarchy_child,
-            seed=fk_seed,
-        )
+        use_matching = self.matching_latent_dim > 0
+        if use_matching:
+            parent_causal_outputs = [
+                parent_data_list[i][MASK_TYPE.CAUSAL_OUTPUT].cpu().numpy()
+                for i in range(num_parents)
+            ]
+            fk_ids_np, block_paths_np = compute_hsbm_fk_ids_multi_with_matching(
+                parent_sizes=parent_sizes,
+                child_size=child_rows,
+                hierarchies_parent=hierarchies_parent,
+                hierarchy_child=hierarchy_child,
+                parent_causal_outputs=parent_causal_outputs,
+                matching_latent_dim=self.matching_latent_dim,
+                matching_temperature=self.matching_temperature,
+                seed=fk_seed,
+            )
+        else:
+            fk_ids_np, block_paths_np = compute_hsbm_fk_ids_multi(
+                parent_sizes=parent_sizes,
+                child_size=child_rows,
+                hierarchies_parent=hierarchies_parent,
+                hierarchy_child=hierarchy_child,
+                seed=fk_seed,
+            )
         fk_ids = torch.tensor(fk_ids_np, device=self.device).long()
         block_paths = torch.tensor(block_paths_np, device=self.device).long()
         return fk_ids, block_paths
@@ -1687,6 +1729,30 @@ class RDB:
                     "hsbm_num_levels": hsbm_sample["hsbm_num_levels"],
                     "hsbm_clusters_per_level": hsbm_sample["hsbm_clusters_per_level"],
                 }
+                # FK Propensity params (table-level, extract from first parent)
+                if len(parent_tables) == 1:
+                    propensity_rho_val = hsbm_sample["propensity_rho"]
+                    propensity_beta_val = hsbm_sample["propensity_beta"]
+                    self.table_generators[table_name].propensity_rho = (
+                        propensity_rho_val() if callable(propensity_rho_val)
+                        else propensity_rho_val
+                    )
+                    self.table_generators[table_name].propensity_beta = (
+                        propensity_beta_val() if callable(propensity_beta_val)
+                        else propensity_beta_val
+                    )
+
+            # Matching Latent params (table-level, for multi-parent)
+            if len(parent_tables) >= 2:
+                match_sample = hsbm_sampler.sample()
+                match_dim_val = match_sample["matching_latent_dim"]
+                match_temp_val = match_sample["matching_temperature"]
+                self.table_generators[table_name].matching_latent_dim = (
+                    match_dim_val() if callable(match_dim_val) else match_dim_val
+                )
+                self.table_generators[table_name].matching_temperature = (
+                    match_temp_val() if callable(match_temp_val) else match_temp_val
+                )
 
             # Sample gamma tier for lifecycle decay (only for timestamp child tables)
             if table.is_time_table and len(parent_tables) > 0:
@@ -2294,6 +2360,8 @@ class RDB:
         min_table_size: int = 10,
         train_ratio: float = 0.8,
         valid_ratio: float = 0.1,
+        entity_task_ratio: float = 0.75,
+        relbench_mode: bool = False,
     ) -> List:
         """
         Initialize TaskGenerator and generate tasks via TaskDataGenerator.generate_task_data.
@@ -2312,6 +2380,10 @@ class RDB:
             Ratio of data to use for training
         valid_ratio : float
             Ratio of data to use for validation
+        entity_task_ratio : float
+            Probability of selecting an entity table as focal table (default 0.75)
+        relbench_mode : bool
+            If True, RelBench-style: entity as focal + target, predict entity column
 
         Returns
         -------
@@ -2332,7 +2404,10 @@ class RDB:
 
         # Initialize task generator if not provided
         if task_generator is None:
-            task_generator = TaskGenerator(rdb=self, random_seed=42)
+            task_generator = TaskGenerator(
+                rdb=self, random_seed=42, entity_task_ratio=entity_task_ratio,
+                relbench_mode=relbench_mode,
+            )
 
         # Store task generator for reuse
         self.task_generator = task_generator
@@ -2589,6 +2664,101 @@ class RDB:
         for hop in range(num_hops):
             for center in current_centers:
                 neighbors = self.select_neighbor_tables(center, neighbors_each_hop)
+                for neighbor in neighbors:
+                    if neighbor not in past_tables:
+                        schema_graph.add_node(neighbor, self.tables[neighbor])
+                        for relationship in self.relationships:
+                            if (
+                                relationship.from_table == center
+                                and relationship.to_table in neighbors
+                            ):
+                                schema_edge = SchemaEdge(
+                                    from_table=relationship.from_table,
+                                    to_table=relationship.to_table,
+                                    from_column=relationship.from_column,
+                                    to_column=relationship.to_column,
+                                    direction=SchemaEdgeDirection.PK_TO_FK,
+                                )
+                                schema_graph.add_edge(schema_edge)
+                            elif (
+                                relationship.to_table == center
+                                and relationship.from_table in neighbors
+                            ):
+                                schema_edge = SchemaEdge(
+                                    from_table=relationship.to_table,
+                                    to_table=relationship.from_table,
+                                    from_column=relationship.to_column,
+                                    to_column=relationship.from_column,
+                                    direction=SchemaEdgeDirection.FK_TO_PK,
+                                )
+                                schema_graph.add_edge(schema_edge)
+
+                        past_tables.add(neighbor)
+                        new_centers.append(neighbor)
+
+            current_centers = new_centers
+            new_centers = []
+
+        return schema_graph
+
+    def create_multi_hop_schema_graph_biased(
+        self,
+        center_table: str,
+        num_hops: int = 2,
+        neighbors_each_hop: int = 1,
+        prefer_children: bool = False,
+        get_children_fn=None,
+    ):
+        """Multi-hop schema graph with biased first-hop neighbor selection.
+
+        When *prefer_children* is True and the center table has children, the
+        first hop prefers children to ensure entity→child structure, which
+        produces RELATIONAL_AGGREGATION_PREDICTION tasks.
+        """
+        from .task_generation_utils import SchemaGraph, SchemaEdge, SchemaEdgeDirection
+
+        schema_graph = SchemaGraph()
+        schema_graph.add_node(center_table, self.tables[center_table])
+        current_centers = [center_table]
+        new_centers = []
+        past_tables = {center_table}
+
+        for hop in range(num_hops):
+            for center in current_centers:
+                all_neighbors = []
+                for relationship in self.relationships:
+                    if relationship.from_table == center:
+                        all_neighbors.append(relationship.to_table)
+                    elif relationship.to_table == center:
+                        all_neighbors.append(relationship.from_table)
+
+                if not all_neighbors:
+                    continue
+
+                # Bias: prefer children of entity table in first hop
+                if hop == 0 and prefer_children and get_children_fn is not None:
+                    children = get_children_fn(center)
+                    child_neighbors = [n for n in all_neighbors if n in children]
+                    other_neighbors = [n for n in all_neighbors if n not in children]
+                    # 80% chance to pick a child if available
+                    if child_neighbors and (
+                        random.random() < 0.8 or not other_neighbors
+                    ):
+                        neighbors = random.sample(
+                            child_neighbors,
+                            min(neighbors_each_hop, len(child_neighbors)),
+                        )
+                    elif other_neighbors:
+                        neighbors = random.sample(
+                            other_neighbors,
+                            min(neighbors_each_hop, len(other_neighbors)),
+                        )
+                    else:
+                        neighbors = []
+                else:
+                    num = min(neighbors_each_hop, len(all_neighbors))
+                    neighbors = random.sample(all_neighbors, num)
+
                 for neighbor in neighbors:
                     if neighbor not in past_tables:
                         schema_graph.add_node(neighbor, self.tables[neighbor])

@@ -246,6 +246,7 @@ class MLPSCM(nn.Module):
         basis_group_divisor: int = 4,
         coupling_rank: int = 2,
         coupling_lambda: float = 0.15,
+        basis_perturb_eta: float = 0.0,
         num_basis_families: int = 2,
         basis_family_rho: float = 0.7,
         **kwargs: Dict[str, Any],
@@ -319,6 +320,7 @@ class MLPSCM(nn.Module):
         self.basis_group_divisor = basis_group_divisor
         self.coupling_rank = coupling_rank
         self.coupling_lambda = coupling_lambda
+        self.basis_perturb_eta = basis_perturb_eta
         self.num_basis_families = num_basis_families
         self.basis_family_rho = basis_family_rho
 
@@ -1141,9 +1143,10 @@ class MLPSCM(nn.Module):
         TIME_S = 8; PARENT_S = 12; PATH_S = 8
         K_PER_GROUP = {
             "time": min(3, max(1, int(np.ceil(TIME_S / DIV)))),
-            "parent": min(3, max(1, int(np.ceil(PARENT_S / DIV)))),
-            "path": min(3, max(1, int(np.ceil(PATH_S / DIV)))),
+            "parent": max(1, int(np.ceil(PARENT_S / 3))),
+            "path": max(1, int(np.ceil(PATH_S / 2))),
         }
+        self._K_PER_GROUP = K_PER_GROUP.copy()  # save for diagnostic dump
 
         alpha_np = alpha_final.detach().cpu().numpy()
         feature_assignments = []
@@ -1200,14 +1203,17 @@ class MLPSCM(nn.Module):
                     mean=self.loading_log_mean, sigma=self.loading_sigma,
                 ))
 
-                # Per-feature-basis perturbation (reserved for future use)
-                pert = 0.0
+                # Per-feature-basis fixed perturbation vector (unit-norm, scaled by eta)
+                signal_dim_map = {"time": 8, "parent": 12, "path": 8}
+                sig_dim = signal_dim_map.get(g_name, 8)
+                pert_vec = np.random.randn(sig_dim).astype(np.float32)
+                pert_vec = pert_vec / (np.linalg.norm(pert_vec) + 1e-8) * self.basis_perturb_eta
 
                 fa["groups"].append(g_name)
                 fa["basis_indices"][g_name] = [basis_idx]
                 fa["signs"][g_name] = [sign_val]
                 fa["magnitudes"][g_name] = [mag_val]
-                fa.setdefault("perturbations", {})[g_name] = [pert]
+                fa.setdefault("perturbations", {})[g_name] = [pert_vec]
 
             feature_assignments.append(fa)
 
@@ -1224,8 +1230,8 @@ class MLPSCM(nn.Module):
         DIV = self.basis_group_divisor
         TIME_S = 8; PARENT_S = 12; PATH_S = 8
         K_time = min(3, max(1, int(np.ceil(TIME_S / DIV))))
-        K_parent = min(3, max(1, int(np.ceil(PARENT_S / DIV))))
-        K_path = min(3, max(1, int(np.ceil(PATH_S / DIV))))
+        K_parent = max(1, int(np.ceil(PARENT_S / 3)))
+        K_path = max(1, int(np.ceil(PATH_S / 2)))
 
         group_bases: dict[str, dict[str, torch.Tensor]] = {}
         self._basis_families: dict[str, list[int]] = {}
@@ -1398,6 +1404,23 @@ class MLPSCM(nn.Module):
 
         return time_out, parent_out, path_out
 
+    def _perturb_basis(self, B_k: torch.Tensor, pert_vec) -> torch.Tensor:
+        """Return re-normalized B_k + pert_vec if pert_vec is non-zero, else B_k."""
+        if pert_vec is None:
+            return B_k
+        if isinstance(pert_vec, np.ndarray):
+            if not np.any(pert_vec != 0):
+                return B_k
+            pert_t = torch.from_numpy(pert_vec).to(self.device)
+        elif isinstance(pert_vec, torch.Tensor):
+            if not pert_vec.any():
+                return B_k
+            pert_t = pert_vec.to(self.device)
+        else:
+            return B_k
+        B_eff = B_k + pert_t
+        return B_eff / (B_eff.norm() + 1e-8)
+
     def _construct_features(
         self,
         signals: dict,
@@ -1420,6 +1443,7 @@ class MLPSCM(nn.Module):
                 basis_indices = fa["basis_indices"].get(g_name, [])
                 signs = fa["signs"].get(g_name, [])
                 magnitudes = fa["magnitudes"].get(g_name, [])
+                perts = fa.get("perturbations", {}).get(g_name, [])
 
                 if g_name == "time":
                     basis_sig = signals["time_basis"]  # (seq_len, 8)
@@ -1427,23 +1451,31 @@ class MLPSCM(nn.Module):
                     B_basis = self.group_bases["time"]["basis"]  # (K, 8)
                     B_gate = self.group_bases["time"]["gate"]  # (K, 3)
                     for idx_in_list, k in enumerate(basis_indices):
-                        proj = basis_sig @ B_basis[k]
+                        B_eff = self._perturb_basis(
+                            B_basis[k], perts[idx_in_list] if idx_in_list < len(perts) else None)
+                        proj = basis_sig @ B_eff
                         if gate_sig is not None:
-                            proj += gate_sig @ B_gate[k]
+                            B_gate_eff = self._perturb_basis(
+                                B_gate[k], None)  # gates not perturbed
+                            proj += gate_sig @ B_gate_eff
                         X[:, j] += signs[idx_in_list] * magnitudes[idx_in_list] * proj
 
                 elif g_name == "parent":
                     parent_sig = signals["parent"]
                     B_parent = self.group_bases["parent"]["basis"]
                     for idx_in_list, k in enumerate(basis_indices):
-                        proj = parent_sig @ B_parent[k]
+                        B_eff = self._perturb_basis(
+                            B_parent[k], perts[idx_in_list] if idx_in_list < len(perts) else None)
+                        proj = parent_sig @ B_eff
                         X[:, j] += signs[idx_in_list] * magnitudes[idx_in_list] * proj
 
                 elif g_name == "path":
                     path_sig = signals["path"]
                     B_path = self.group_bases["path"]["basis"]
                     for idx_in_list, k in enumerate(basis_indices):
-                        proj = path_sig @ B_path[k]
+                        B_eff = self._perturb_basis(
+                            B_path[k], perts[idx_in_list] if idx_in_list < len(perts) else None)
+                        proj = path_sig @ B_eff
                         X[:, j] += signs[idx_in_list] * magnitudes[idx_in_list] * proj
 
             # Add per-feature residual noise (ε_j ~ N(0, σ²_res))
@@ -1476,6 +1508,38 @@ class MLPSCM(nn.Module):
                 or self.coupling_lambda <= 0):
             return X_struct
         return X_struct + self.coupling_lambda * (X_struct @ self._coupling_W)
+
+    def get_feature_diagnostics(self) -> dict:
+        """Return feature assignment metadata for post-hoc analysis."""
+        K = getattr(self, "_K_PER_GROUP", None)
+        if K is None:
+            DIV = self.basis_group_divisor
+            TIME_S = 8; PARENT_S = 12; PATH_S = 8
+            K = {
+                "time": min(3, max(1, int(np.ceil(TIME_S / DIV)))),
+                "parent": max(1, int(np.ceil(PARENT_S / 3))),
+                "path": max(1, int(np.ceil(PATH_S / 2))),
+            }
+        return {
+            "n_features": len(self.feature_assignments),
+            "K_per_group": K,
+            "alpha_final": self.alpha_final.tolist() if self.alpha_final is not None else None,
+            "feature_assignments": [
+                {
+                    "groups": fa["groups"],
+                    "basis_indices": {g: fa["basis_indices"].get(g, []) for g in fa["groups"]},
+                }
+                for fa in self.feature_assignments
+            ],
+            "coupling_lambda": self.coupling_lambda,
+            "basis_perturb_eta": self.basis_perturb_eta,
+            "group_scales": {
+                "time": self.group_scale_time,
+                "parent": self.group_scale_parent,
+                "path": self.group_scale_path,
+            },
+            "residual_sigma": self.residual_sigma,
+        }
 
 
 if __name__ == "__main__":

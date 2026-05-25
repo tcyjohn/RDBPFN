@@ -153,11 +153,23 @@ class SchemaGraph:
                 return edge
         return None
 
-    def generate_target_table_name(self) -> str:
-        """Generate a target table name."""
-        # Now we only random pick a leaf node as the target table
+    def generate_target_table_name(self, root_p: float = 0.0) -> str:
+        """Generate a target table name.
+
+        Args:
+            root_p: Probability of picking the root node (entity table) as
+                    target, producing RelBench-style DIRECT_ATTRIBUTE_PREDICTION
+                    tasks. Default 0.0 = always pick leaf (old behavior).
+        """
+        order = self.get_topological_order()
+        root = order[0]
         leaf_nodes = [node for node in self.nodes.keys() if not self.get_children(node)]
-        return random.choice(leaf_nodes)
+
+        if root_p > 0 and root in self.nodes and random.random() < root_p:
+            return root
+        if leaf_nodes:
+            return random.choice(leaf_nodes)
+        return order[-1]  # fallback: last in topo order
 
     def compute_table_row_num(self) -> Dict[str, str]:
         """Compute the number of rows for each table. Root Table starts with 1 row.
@@ -232,7 +244,7 @@ class SchemaGraph:
         """Compute possible task types based on schema graph structure."""
 
         num_rows_dict = self.compute_table_row_num()
-        num_rows = int(num_rows_dict[target_table_name])
+        num_rows = num_rows_dict[target_table_name]
         if num_rows == "1":
             return TaskType.DIRECT_ATTRIBUTE_PREDICTION
         else:

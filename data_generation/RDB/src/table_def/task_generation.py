@@ -1166,7 +1166,13 @@ class TaskGenerator:
     Uses TaskDataGenerator internally for data generation.
     """
 
-    def __init__(self, rdb, random_seed: int = 42):
+    def __init__(
+        self,
+        rdb,
+        random_seed: int = 42,
+        entity_task_ratio: float = 0.75,
+        relbench_mode: bool = False,
+    ):
         """
         Initialize TaskGenerator.
 
@@ -1176,15 +1182,57 @@ class TaskGenerator:
             RDB object
         random_seed : int
             Random seed for reproducible task generation
+        entity_task_ratio : float
+            Probability of selecting an entity (parent) table as the focal table.
+            Default 0.75 means ~75% of tasks use entity tables as focal.
+        relbench_mode : bool
+            If True, use RelBench-style tasks: entity as focal AND target,
+            DIRECT_ATTRIBUTE_PREDICTION with child-aggregated features.
+            Overrides entity_task_ratio to 1.0 when True.
         """
         self.rdb = rdb
         self.random_seed = random_seed
+        self.entity_task_ratio = 1.0 if relbench_mode else entity_task_ratio
+        self.relbench_mode = relbench_mode
         random.seed(random_seed)
         np.random.seed(random_seed)
         torch.manual_seed(random_seed)
 
         # Initialize data generator
         self.data_generator = TaskDataGenerator(rdb=rdb, random_seed=random_seed)
+
+    def _classify_tables(self) -> Tuple[List[str], List[str]]:
+        """Classify tables into entity (has children) and non-entity (no children).
+
+        An entity table is referenced by at least one other table's FK.
+        """
+        referenced = set()
+        for rel in self.rdb.relationships:
+            referenced.add(rel.to_table)
+
+        entity_tables = []
+        non_entity_tables = []
+        for table_name in self.rdb.tables:
+            if table_name in referenced:
+                entity_tables.append(table_name)
+            else:
+                non_entity_tables.append(table_name)
+        return entity_tables, non_entity_tables
+
+    def _has_children(self, table_name: str) -> bool:
+        """Check if a table is referenced by any FK from another table."""
+        for rel in self.rdb.relationships:
+            if rel.to_table == table_name:
+                return True
+        return False
+
+    def _get_children(self, table_name: str) -> List[str]:
+        """Get tables that reference this table via FK."""
+        children = []
+        for rel in self.rdb.relationships:
+            if rel.to_table == table_name:
+                children.append(rel.from_table)
+        return children
 
     def generate_single_table_prediction_tasks(
         self,
@@ -1410,16 +1458,26 @@ class TaskGenerator:
             if len(schema_graph.nodes) != 3:
                 print(f"Skipping schema graph with {len(schema_graph.nodes)} nodes")
                 continue
-            target_table_name = schema_graph.generate_target_table_name()
-            # print(f"Selected target table: {target_table_name}")
-            # TODO: Implement the compute_possible_task_types method in SchemaGraph
+            target_table_name = schema_graph.generate_target_table_name(
+                root_p=1.0 if self.relbench_mode else 0.0,
+            )
+            # RelBench mode: entity table is target, predict its own column
+            is_entity_target = (
+                self.relbench_mode
+                and target_table_name == list(schema_graph.nodes.keys())[0]
+            )
             task_type = schema_graph.compute_possible_task_types(target_table_name)
             if task_type == TaskType.DIRECT_ATTRIBUTE_PREDICTION:
-                target_column_name = random.choice(
-                    rdb.tables[target_table_name].get_feature_columns(
-                        only_categorical=True
+                if is_entity_target:
+                    target_column_name = random.choice(
+                        rdb.tables[target_table_name].get_feature_columns()
                     )
-                )
+                else:
+                    target_column_name = random.choice(
+                        rdb.tables[target_table_name].get_feature_columns(
+                            only_categorical=True
+                        )
+                    )
             elif task_type == TaskType.RELATIONAL_AGGREGATION_PREDICTION:
                 target_column_name = random.choice(
                     rdb.tables[target_table_name].get_feature_columns(only_float=True)
@@ -1594,6 +1652,9 @@ class TaskGenerator:
         """
         Randomly select a focal entity table and sample neighbors to create a schema graph.
 
+        Biased toward entity (parent) tables: entity_task_ratio of the time, selects
+        a table that has children, producing RelBench-style aggregation tasks.
+
         Parameters
         ----------
         rdb : RDB
@@ -1612,14 +1673,27 @@ class TaskGenerator:
             - Name of the randomly selected focal table
             - Schema graph containing the focal table and its selected neighbors
         """
-        # Get candidate tables for focal entity selection
-        candidate_tables = []
-        for table_name, table in rdb.tables.items():
-            if exclude_small_tables and table.num_rows < min_table_size:
-                continue
-            candidate_tables.append(table_name)
+        entity_tables, non_entity_tables = self._classify_tables()
 
-        if not candidate_tables:
+        # Filter by size
+        if exclude_small_tables:
+            entity_tables = [
+                t for t in entity_tables
+                if rdb.tables[t].num_rows >= min_table_size
+            ]
+            non_entity_tables = [
+                t for t in non_entity_tables
+                if rdb.tables[t].num_rows >= min_table_size
+            ]
+
+        # Weighted sampling: bias toward entity tables
+        if entity_tables and (
+            random.random() < self.entity_task_ratio or not non_entity_tables
+        ):
+            focal_table_name = random.choice(entity_tables)
+        elif non_entity_tables:
+            focal_table_name = random.choice(non_entity_tables)
+        else:
             print(
                 f"Warning: No suitable tables found for focal entity selection "
                 f"(min_size={min_table_size}, exclude_small={exclude_small_tables}). "
@@ -1627,23 +1701,13 @@ class TaskGenerator:
             )
             return None, None
 
-        # Randomly select a focal entity table
-        focal_table_name = random.choice(candidate_tables)
-        # print(f"Selected focal table: {focal_table_name}")
-
-        # * Currently, we only do 2-hop 1-neighbor schema graph
-        schema_graph = rdb.create_multi_hop_schema_graph(
-            focal_table_name, num_hops=2, neighbors_each_hop=1
+        # Build schema graph: when focal is entity, bias first-hop neighbors toward children
+        schema_graph = rdb.create_multi_hop_schema_graph_biased(
+            focal_table_name,
+            num_hops=2,
+            neighbors_each_hop=1,
+            prefer_children=(focal_table_name in entity_tables),
+            get_children_fn=self._get_children,
         )
-
-        # # Select neighbor tables
-        # neighbor_tables = rdb.select_neighbor_tables(focal_table_name, max_neighbors)
-        # print(f"Selected neighbor tables: {neighbor_tables}")
-
-        # # Create sub-schema graph
-        # schema_graph = rdb.create_sub_schema_graph(focal_table_name, neighbor_tables)
-        # print(
-        #     f"Created schema graph with {len(schema_graph.nodes)} tables and {len(schema_graph.edges)} edges"
-        # )
 
         return focal_table_name, schema_graph
