@@ -1,6 +1,6 @@
 #!/bin/bash
 # Full pipeline: data generation → preprocessing → merge to h5 → training
-# Usage: bash scripts/run_pipeline.sh [num_rdbs] [start_index] [run_name] [skip_gen] [skip_preprocess] [skip_merge] [no_quality_filter] [quality_max_retries] [num_processes] [skip_train] [use_complex_tasks]
+# Usage: bash scripts/run_pipeline.sh [num_rdbs] [start_index] [run_name] [skip_gen] [skip_preprocess] [skip_merge] [no_quality_filter] [quality_max_retries] [num_processes] [skip_train] [use_complex_tasks] [cuda_devices] [relbench_mode]
 #   num_rdbs: number of RDBs to generate (default: 4)
 #   start_index: starting index (default: 0)
 #   run_name: output subdirectory name (default: auto-generated with timestamp, e.g. "run_20260515_003000")
@@ -9,9 +9,11 @@
 #   skip_merge: "true" to skip H5 merge (default: false)
 #   no_quality_filter: "true" to disable quality gate (default: false; enabled by default)
 #   quality_max_retries: max retries for quality gate (default: 3)
-#   num_processes: number of parallel worker processes for generation (default: $(nproc))
+#   num_processes: number of parallel worker processes for generation (default: 16)
 #   skip_train: "true" to skip training (default: false)
 #   use_complex_tasks: "true" for complex tasks, "false" for simple tasks (default: true)
+#   cuda_devices: comma-separated GPU indices, e.g. "0,1" or "1" (default: auto-detect free GPUs)
+#   relbench_mode: "true" to enable RelBench mode (entity focal+target, entity-level prediction) (default: false)
 #
 # Output layout:
 #   data_generation/RDB_datasets/<run_name>/          raw 4DBInfer data
@@ -40,6 +42,8 @@ QUALITY_MAX_RETRIES="${8:-3}"
 NUM_PROCESSES="${9:-16}"
 SKIP_TRAIN="${10:-false}"
 USE_COMPLEX_TASKS="${11:-true}"
+CUDA_DEVICES="${12:-}"
+RELBENCH_MODE="${13:-false}"
 END_INDEX=$((START_INDEX + NUM_RDBS))
 
 RDB_GEN_DIR="${ROOT}/data_generation/RDB"
@@ -51,7 +55,7 @@ H5_OUTPUT="${ROOT}/model_pretrain/pretrain_datasets/${RUN_NAME}.h5"
 PREPROCESS_SCRIPT="${ROOT}/data_preprocessing/run_preprocess.py"
 MERGE_SCRIPT="${ROOT}/data_preprocessing/merge_dbinfer_to_h5.py"
 PRE_DFS_CONFIG="${ROOT}/data_preprocessing/configs/transform/pre-dfs.yaml"
-DFS_CONFIG="${ROOT}/data_preprocessing/configs/dfs/dfs-1-ft.yaml"
+DFS_CONFIG="${ROOT}/data_preprocessing/configs/dfs/dfs-2-ft.yaml"
 POST_DFS_CONFIG="${ROOT}/data_preprocessing/configs/transform/post-dfs.yaml"
 
 export HF_ENDPOINT="https://hf-mirror.com"
@@ -95,7 +99,12 @@ auto_select_gpus() {
     fi
 }
 
-SELECTED_GPUS=$(auto_select_gpus)
+if [ -n "${CUDA_DEVICES}" ]; then
+    SELECTED_GPUS="${CUDA_DEVICES}"
+    echo "GPUs manually specified: ${SELECTED_GPUS}"
+else
+    SELECTED_GPUS=$(auto_select_gpus)
+fi
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-$SELECTED_GPUS}"
 GPU_COUNT=$(echo "${CUDA_VISIBLE_DEVICES}" | tr ',' '\n' | wc -l)
 echo "GPUs available: ${GPU_COUNT} (CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES})"
@@ -108,6 +117,7 @@ echo "║ RDBs: ${NUM_RDBS} (indices ${START_INDEX}-$((END_INDEX - 1)))"
 echo "║ Raw : ${RAW_OUTPUT_DIR}"
 echo "║ H5  : ${H5_OUTPUT}"
 echo "║ QC  : enabled=$([ "${NO_QUALITY_FILTER}" != "true" ] && echo "yes" || echo "no")  max_retries=${QUALITY_MAX_RETRIES}"
+echo "║ RelBench: ${RELBENCH_MODE}"
 echo "║ Proc: ${NUM_PROCESSES}"
 echo "╚══════════════════════════════════════════════════╝"
 echo ""
@@ -126,6 +136,10 @@ if [ "${SKIP_GEN}" != "true" ]; then
         QUALITY_FLAGS+=(--no-quality-filter)
     fi
     QUALITY_FLAGS+=(--quality-max-retries "${QUALITY_MAX_RETRIES}")
+
+    if [ "${RELBENCH_MODE}" = "true" ]; then
+        QUALITY_FLAGS+=(--relbench_mode)
+    fi
 
     pixi run python ./data_generation/RDB/dag_to_rdb_generator.py \
         --dag_data_path "${RDB_GEN_DIR}/datasets/rdb_v1.pth" \
@@ -161,7 +175,7 @@ if [ "${SKIP_PREPROCESS}" != "true" ]; then
             src="${RAW_OUTPUT_DIR}/${ds_name}"
             tmp_pre="${TMP_DIR}/${ds_name}-pre-dfs"
             tmp_post="${TMP_DIR}/${ds_name}-post-dfs"
-            out="${PROCESSED_DIR}/${ds_name}-dfs-1"
+            out="${PROCESSED_DIR}/${ds_name}-dfs-2"
 
             if [ -d "${out}" ]; then
                 echo "[SKIP ${idx}/${ds_name}] Already processed"
@@ -174,11 +188,11 @@ if [ "${SKIP_PREPROCESS}" != "true" ]; then
 
             echo "[${idx}/${ds_name}] Preprocessing..."
             if pixi run python "${PREPROCESS_SCRIPT}" \
-                "${src}" transform "${tmp_pre}" "${PRE_DFS_CONFIG}" 1 \
+                "${src}" transform "${tmp_pre}" "${PRE_DFS_CONFIG}" 2 \
             && pixi run python "${PREPROCESS_SCRIPT}" \
-                "${tmp_pre}" dfs "${tmp_post}" "${DFS_CONFIG}" 1 \
+                "${tmp_pre}" dfs "${tmp_post}" "${DFS_CONFIG}" 2 \
             && pixi run python "${PREPROCESS_SCRIPT}" \
-                "${tmp_post}" transform "${out}" "${POST_DFS_CONFIG}" 1; then
+                "${tmp_post}" transform "${out}" "${POST_DFS_CONFIG}" 2; then
                 rm -rf "${tmp_pre}" "${tmp_post}"
                 echo "[OK ${idx}/${ds_name}]"
             else
