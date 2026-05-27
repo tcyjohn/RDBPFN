@@ -291,9 +291,10 @@ class TaskDataGenerator:
         """
         self.rdb = rdb
         self.random_seed = random_seed
-        random.seed(random_seed)
-        np.random.seed(random_seed)
-        torch.manual_seed(random_seed)
+        if random_seed is not None:
+            random.seed(random_seed)
+            np.random.seed(random_seed)
+            torch.manual_seed(random_seed)
 
     def _compute_column_metadata(
         self,
@@ -1194,9 +1195,10 @@ class TaskGenerator:
         self.random_seed = random_seed
         self.entity_task_ratio = 1.0 if relbench_mode else entity_task_ratio
         self.relbench_mode = relbench_mode
-        random.seed(random_seed)
-        np.random.seed(random_seed)
-        torch.manual_seed(random_seed)
+        if random_seed is not None:
+            random.seed(random_seed)
+            np.random.seed(random_seed)
+            torch.manual_seed(random_seed)
 
         # Initialize data generator
         self.data_generator = TaskDataGenerator(rdb=rdb, random_seed=random_seed)
@@ -1454,8 +1456,7 @@ class TaskGenerator:
             )
             if focal_table_name is None:
                 continue
-            # ! Currently, we only accept one type of schema graph including 3 nodes, otherwise, we skip it.
-            if len(schema_graph.nodes) != 3:
+            if len(schema_graph.nodes) < 2:
                 print(f"Skipping schema graph with {len(schema_graph.nodes)} nodes")
                 continue
             target_table_name = schema_graph.generate_target_table_name(
@@ -1467,10 +1468,17 @@ class TaskGenerator:
                 and target_table_name == list(schema_graph.nodes.keys())[0]
             )
             task_type = schema_graph.compute_possible_task_types(target_table_name)
+            # DIRECT_ATTRIBUTE_PREDICTION (root target) only needs 2 nodes;
+            # RELATIONAL_AGGREGATION_PREDICTION still requires 3 for multi-hop joins
+            if task_type != TaskType.DIRECT_ATTRIBUTE_PREDICTION and len(schema_graph.nodes) < 3:
+                print(f"Skipping schema graph with {len(schema_graph.nodes)} nodes (needs 3 for RELATIONAL_AGGREGATION_PREDICTION)")
+                continue
             if task_type == TaskType.DIRECT_ATTRIBUTE_PREDICTION:
                 if is_entity_target:
                     target_column_name = random.choice(
-                        rdb.tables[target_table_name].get_feature_columns()
+                        rdb.tables[target_table_name].get_feature_columns(
+                            only_categorical=True
+                        )
                     )
                 else:
                     target_column_name = random.choice(

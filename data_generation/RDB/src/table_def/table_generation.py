@@ -2405,7 +2405,7 @@ class RDB:
         # Initialize task generator if not provided
         if task_generator is None:
             task_generator = TaskGenerator(
-                rdb=self, random_seed=42, entity_task_ratio=entity_task_ratio,
+                rdb=self, random_seed=None, entity_task_ratio=entity_task_ratio,
                 relbench_mode=relbench_mode,
             )
 

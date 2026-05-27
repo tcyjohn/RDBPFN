@@ -217,10 +217,15 @@ def compute_hsbm_fk_ids_with_propensity(
 
     # 1. Rank score from parent CAUSAL_OUTPUT
     D = parent_causal_output.shape[1]
-    n_cols = rng.randint(2, min(4, D + 1))
-    selected = rng.choice(D, size=n_cols, replace=False)
-    weights = rng.randn(n_cols)
-    raw_score = parent_causal_output[:, selected] @ weights
+    if D >= 2:
+        n_cols = rng.randint(2, min(4, D + 1))
+        selected = rng.choice(D, size=n_cols, replace=False)
+        weights = rng.randn(n_cols)
+        raw_score = parent_causal_output[:, selected] @ weights
+    elif D == 1:
+        raw_score = parent_causal_output[:, 0]
+    else:
+        raw_score = rng.randn(size_a)
     order = np.argsort(raw_score)
     rank_score = np.empty(size_a, dtype=np.float64)
     for i, idx in enumerate(order):
