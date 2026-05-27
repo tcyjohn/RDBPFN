@@ -283,16 +283,51 @@ dag_rdb_0/
 ### 6.2 Complex Tasks (复杂预测)
 
 `RDB.initialize_tasks_with_complex_tasks()` → `TaskGenerator.generate_tasks_for_rdb_with_complex_tasks()`:
-- 支持 `DIRECT_ATTRIBUTE_PREDICTION` 和 `RELATIONAL_AGGREGATION_PREDICTION`
-- 关系聚合任务: target 是父表列的聚合值 (如 SUM, AVG, COUNT)
-- 此类任务经过 DFS 后会引入父表聚合特征
 
-### 6.3 Quality Gate
+**Task 类型:**
+- `DIRECT_ATTRIBUTE_PREDICTION`: 直接预测目标表的一个 feature 列 (target 在 schema graph 中的 `row_num == "1"`)
+- `RELATIONAL_AGGREGATION_PREDICTION`: 预测目标表的聚合值, 如 SUM/AVG/COUNT/MAX/MIN (target 的 `row_num != "1"`)
+
+**Focal table 选择:**
+- `entity_task_ratio` 控制选 entity 表 (被 FK 引用的表) 作为 focal 的概率
+- 默认 `entity_task_ratio=0.75`: 75% 选 entity, 25% 选 non-entity
+- 选 entity 时, BFS 第一步 80% 偏向选 child; 选 non-entity 时均匀选所有邻居
+
+**Target table 选择:**
+- `root_p` 参数控制选 root (schema graph 拓扑序第一节点) 作为 target 的概率
+- 默认 `root_p=0.0`: 总是选 leaf node → 产生 `RELATIONAL_AGGREGATION_PREDICTION`
+- Focal=entity 且 target=leaf (子表) 时: edge 方向 `FK_TO_PK` → leaf 的 `row_num="1"` → 仍为 `DIRECT_ATTRIBUTE_PREDICTION`
+
+**RelBench Mode** (`relbench_mode=True`):
+- `entity_task_ratio` 强制为 1.0: focal 永远是 entity 表
+- `root_p` 强制为 1.0: target 永远是 root (= entity 表)
+- 生成 RelBench 风格的 **entity-level prediction** 任务: 预测 entity 自身的一个 categorical feature 列
+- Target column 限制为 `only_categorical=True` (质量门的 `np.bincount` 只接受整数 label)
+
+### 6.3 Task 类型约束 (Schema Graph 节点数)
+
+Schema graph 由 focal 表出发 BFS (2 hops, 每跳 1 个邻居) 构建:
+
+| Task 类型 | 最少节点数 | 原因 |
+|---|---|---|
+| `DIRECT_ATTRIBUTE_PREDICTION` | ≥2 | 只需 focal→neighbor 的单跳关系即可生成特征 |
+| `RELATIONAL_AGGREGATION_PREDICTION` | ≥3 | 需要两跳关系进行聚合计算 |
+
+- `<2 节点`: 始终跳过 (孤立表, 无 FK)
+- 2 节点 + `DIRECT_ATTRIBUTE_PREDICTION`: 接受 (focal=entity, BFS 选 child; 或 focal=non-entity, BFS 选 parent 且 target=root)
+- 2 节点 + `RELATIONAL_AGGREGATION_PREDICTION`: 跳过 (需要 ≥3 节点)
+- ≥3 节点: 两种 task 类型都接受
+
+在 `relbench_mode` 下, focal 固定为 entity (有子表), BFS 第一步 80% 选 child → 大部分 schema graph 为 2 节点 Entity→Child (`DIRECT_ATTRIBUTE_PREDICTION`)。
+
+### 6.4 Quality Gate
 
 `DAGToRDBGenerator._generate_tasks_with_quality_gate()`:
-- **Stage A** (规则): 标签单一值、极端不平衡、样本过少、无有效特征、结构独立性问题、父子表大小比极端
-- **Stage B** (模型): ExtraTrees OOF AUC 检查 (AUC<0.52 拒绝, AUC≥0.58 接受, 中间灰区做 bootstrap CI)
-- 最多重试 `quality_max_retries` 次, 保留通过最多的那次
+- **Stage A** (规则): 标签单一值、极端不平衡 (`pos_ratio < 0.05` 或 `> 0.95`)、样本过少 (`n < 64` 或 min_class < 8)、无有效特征、结构独立性问题、父子表大小比极端
+- **Stage B** (模型): ExtraTrees OOF AUC 检查 (AUC≤0.52 拒绝, AUC≥0.58 接受, 中间灰区做 bootstrap CI, CI 上界需 ≥0.55)
+- 最多重试 `quality_max_retries` 次, 每次使用不同 seed (`base_seed + attempt × 1000`), 保留通过最多的那次
+- `TaskGenerator` 和 `TaskDataGenerator` 的 `random_seed` 参数设为 `None` 时不覆盖全局 random state, 确保 retry seed 差异生效
+- **注意**: Stage B 使用 `np.bincount(y)` 计算类别分布, 只支持整数 label。若 target 列是 float, `_etoof()` 会 crash → 任务被丢弃。因此 entity target 限制为 `only_categorical=True`
 
 ---
 
@@ -309,14 +344,17 @@ Step 5a: Pre-DFS Transform
   输出: 临时目录 tmp_pre/
 
 Step 5b: DFS (Deep Feature Synthesis)
-  配置: dfs-1-ft.yaml → max_depth=1, engine=featuretools
-  处理: 对每张表, 用 featuretools 自动生成父表列的聚合特征
-        (如 MEAN, SUM, STD, COUNT 等)
+  配置: dfs-2-ft.yaml → max_depth=2, engine=featuretools
+  处理: 从 __task__ 表出发, 沿 FK 关系聚合子表特征
+        所有聚合特征来自 depth=2 (DirectFeatures + AggregationFeatures)
+        聚合函数: MEAN, STD, COUNT, MAX, MIN, MODE, SUM
+  depth=1 仅产生 IdentityFeatures (全部被 filter_features 过滤为 key 列)
+  → 实际有效特征从 depth≥2 开始
   输出: 临时目录 tmp_post/
 
 Step 5c: Post-DFS Transform
   处理: 列筛选、规范化、标签提取
-  输出: PROCESSED_DIR/dag_rdb_X-dfs-1/
+  输出: PROCESSED_DIR/dag_rdb_X-dfs-2/
 ```
 
 ### 7.2 H5 合并
@@ -661,9 +699,9 @@ data_preprocessing/
 ├── merge_dbinfer_to_h5.py           # 合并处理后的数据为 H5
 └── configs/
     ├── transform/pre-dfs.yaml       # Pre-DFS 转换配置
-    ├── dfs/dfs-1-ft.yaml            # DFS 配置 (depth=1, featuretools)
+    ├── dfs/dfs-2-ft.yaml            # DFS 配置 (depth=2, featuretools)
     └── transform/post-dfs.yaml      # Post-DFS 转换配置
 
 scripts/
-└── run_pipeline.sh                  # 一键运行全流水线 (data gen → preprocess → h5 → train)
+└── run_pipeline.sh                  # 一键运行全流水线 (支持 --relbench_mode)
 ```
