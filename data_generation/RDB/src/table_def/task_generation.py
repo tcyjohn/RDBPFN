@@ -593,7 +593,10 @@ class TaskDataGenerator:
                         pk_col_name2 = t_linked.column_names[0]
                         if pk_col_name2 in combined_df.columns:
                             child_df = t_other.dataframe[[fk_col_name2] + feat_cols].copy()
-                            agg_funcs = {c: ["mean", "std"] for c in feat_cols}
+                            agg_funcs = {
+                                c: ["mean", lambda x: x.std(ddof=0) if len(x) >= 1 else 0.0]
+                                for c in feat_cols
+                            }
                             agg_df = child_df.groupby(fk_col_name2, as_index=False).agg(agg_funcs)
                             agg_df.columns = [
                                 fk_col_name2

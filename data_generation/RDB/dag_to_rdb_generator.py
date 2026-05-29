@@ -503,6 +503,7 @@ class DAGToRDBGenerator:
                 quality_filter,
                 quality_max_retries,
                 relbench_mode,
+                snr_threshold,
             ) = args
 
             # Set random seed for reproducibility (each worker gets different seed)
@@ -588,7 +589,20 @@ class DAGToRDBGenerator:
                     rdb.save_to_4dbinfer_dataset_with_tasks(rdb_dir)
 
             # Dump feature assignment diagnostics for post-hoc analysis
-            DAGToRDBGenerator._dump_feature_diagnostics(rdb, rdb_dir)
+            diag = DAGToRDBGenerator._dump_feature_diagnostics(rdb, rdb_dir)
+
+            # SNR-based quality pre-filter
+            if snr_threshold is not None and snr_threshold > 0 and diag:
+                snr_proxy = DAGToRDBGenerator._compute_snr_proxy_from_diag(diag)
+                if snr_proxy < snr_threshold:
+                    import shutil
+
+                    shutil.rmtree(rdb_dir, ignore_errors=True)
+                    return (
+                        False,
+                        rdb_index,
+                        f"SNR {snr_proxy:.2f} < threshold {snr_threshold}, RDB discarded",
+                    )
 
             # Return success info
             return (
@@ -701,6 +715,30 @@ class DAGToRDBGenerator:
             diag_path = os.path.join(rdb_dir, "_feature_diagnostics.json")
             with open(diag_path, "w") as f:
                 json.dump(diag, f, indent=2)
+        return diag
+
+    @staticmethod
+    def _compute_snr_proxy_from_diag(diag: dict) -> float:
+        """Compute per-RDB SNR proxy from feature diagnostics dict.
+
+        SNR_proxy = mean(all active group_scales) / mean(residual_sigmas).
+        Returns float('inf') if no signal-group features are present (pass-through).
+        """
+        group_scales = []
+        residual_sigmas = []
+        for _table_name, td in diag.items():
+            for gs_key in ("time", "parent", "path"):
+                gs = td.get("group_scales", {}).get(gs_key, 0.0)
+                if gs > 0:
+                    group_scales.append(gs)
+            rs = td.get("residual_sigma", 0.0)
+            if rs > 0:
+                residual_sigmas.append(rs)
+        if not group_scales or not residual_sigmas:
+            return float("inf")
+        mean_gs = sum(group_scales) / len(group_scales)
+        mean_rs = sum(residual_sigmas) / len(residual_sigmas)
+        return mean_gs / max(mean_rs, 0.001)
 
     def generate_rdbs_from_dags(
         self,
@@ -712,6 +750,7 @@ class DAGToRDBGenerator:
         use_complex_tasks: bool = False,
         quality_filter: bool = True,
         quality_max_retries: int = 3,
+        snr_threshold: float = 5.0,
     ) -> List[RDB]:
         """
         Generate RDBs from the loaded DAG data.
@@ -735,6 +774,10 @@ class DAGToRDBGenerator:
             Whether to run the quality gate on complex tasks (default: True)
         quality_max_retries : int
             Maximum retry attempts for the quality gate (default: 3)
+        snr_threshold : float, optional
+            Minimum SNR proxy (mean group_scale / mean residual_sigma) for an RDB
+            to be accepted. RDBs below this threshold are discarded. Set to 0 or None
+            to disable. Default: 5.0 (filters ~12% of RDBs, loses ~8% of tasks).
         Returns
         -------
         List[RDB]
@@ -784,6 +827,7 @@ class DAGToRDBGenerator:
                 quality_filter,
                 quality_max_retries,
                 relbench_mode,
+                snr_threshold,
             )
             for i in range(start_index, start_index + num_rdbs)
         ]
@@ -1003,6 +1047,7 @@ def main():
             use_complex_tasks=use_complex_tasks,
             quality_filter=quality_filter,
             quality_max_retries=quality_max_retries,
+            snr_threshold=snr_threshold,
         )
         end_time = time.time()
         elapsed_time = end_time - start_time
@@ -1107,6 +1152,14 @@ if __name__ == "__main__":
         default=3,
         help="Maximum retry attempts for the quality gate (default: 3)",
     )
+    parser.add_argument(
+        "--snr-threshold",
+        type=float,
+        default=5.0,
+        help="Minimum SNR proxy for RDB acceptance. RDBs below this are discarded. "
+        "Recommended: 5.0 (filters ~12%% of RDBs, loses ~8%% of tasks). "
+        "Set to 0 to disable.",
+    )
     args = parser.parse_args()
 
     num_rdbs_to_generate = args.num_rdbs
@@ -1124,6 +1177,7 @@ if __name__ == "__main__":
     gnn_device = args.gnn_device
     quality_filter = not args.no_quality_filter
     quality_max_retries = args.quality_max_retries
+    snr_threshold = args.snr_threshold
 
     # Validate num_processes
     if num_processes is not None and num_processes <= 0:
