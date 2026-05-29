@@ -14,7 +14,8 @@
 #   use_complex_tasks: "true" for complex tasks, "false" for simple tasks (default: true)
 #   cuda_devices: comma-separated GPU indices, e.g. "0,1" or "1" (default: auto-detect free GPUs)
 #   relbench_mode: "true" to enable RelBench mode (entity focal+target, entity-level prediction) (default: false)
-#
+#   load_ckpt: path to checkpoint .pt to resume from (default: "" = train from scratch)
+#   note: if need to continue from last training ckpt, you should also pass "train.load_optimizer_state=true"s
 # Output layout:
 #   data_generation/RDB_datasets/<run_name>/          raw 4DBInfer data
 #   data_generation/RDB_datasets/<run_name>-processed/  DFS-preprocessed data
@@ -44,6 +45,7 @@ SKIP_TRAIN="${10:-false}"
 USE_COMPLEX_TASKS="${11:-true}"
 CUDA_DEVICES="${12:-}"
 RELBENCH_MODE="${13:-false}"
+LOAD_CKPT="${14:-}"  # optional: path to checkpoint .pt to resume/load from
 END_INDEX=$((START_INDEX + NUM_RDBS))
 
 RDB_GEN_DIR="${ROOT}/data_generation/RDB"
@@ -296,15 +298,24 @@ fi
 
 cd "${ROOT}/model_pretrain"
 
+# Build training args
+TRAIN_ARGS=(
+    --config-name=RDBPFN_hsbm
+    "train.datasets.0.path=pretrain_datasets/${RUN_NAME}.h5"
+    "train.save_model_path=checkpoints/${RUN_NAME}/model.pt"
+    "wandb.run_name=${RUN_NAME}"
+)
+if [ -n "${LOAD_CKPT}" ]; then
+    TRAIN_ARGS+=("train.load_model_path=${LOAD_CKPT}")
+    echo "Loading checkpoint: ${LOAD_CKPT}"
+fi
+
 pixi run torchrun \
     --standalone \
     --nnodes=1 \
     --nproc_per_node="${NPROC:-$GPU_COUNT}" \
     run_train.py \
-    --config-name=RDBPFN_hsbm \
-    "train.datasets.0.path=pretrain_datasets/${RUN_NAME}.h5" \
-    "train.save_model_path=checkpoints/${RUN_NAME}/model.pt" \
-    "wandb.run_name=${RUN_NAME}"
+    "${TRAIN_ARGS[@]}"
 
 echo ""
 echo "╔══════════════════════════════════════════════════╗"
