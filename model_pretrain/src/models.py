@@ -500,18 +500,18 @@ class NanoTabPFNClassifierCategorical(NanoTabPFNClassifier):
 
 
 def load_checkpoint(model: torch.nn.Module, path: Path, device: str, output_log: bool = False):
-    """Load checkpoint and return optimizer state dict if available."""
+    """Load checkpoint and return full state dict for resuming training."""
     checkpoint = torch.load(path, map_location=device)
     state_dict = checkpoint.get("model_state_dict", checkpoint)
     consume_prefix_in_state_dict_if_present(state_dict, "module.")
     model.load_state_dict(state_dict)
-    optimizer_state = checkpoint.get("optimizer_state_dict")
+    has_optim = "optimizer_state_dict" in checkpoint
     if output_log:
-        if optimizer_state:
+        if has_optim:
             logger.info("Loaded checkpoint from %s (with optimizer state)", path)
         else:
             logger.info("Loaded checkpoint from %s (model only)", path)
-    return optimizer_state
+    return checkpoint
 
 
 def build_model(model_cfg: ModelConfig):

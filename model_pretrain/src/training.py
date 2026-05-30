@@ -583,6 +583,7 @@ def _prepare_batch(
 def _handle_evaluation(
     model: NanoTabPFNModel,
     optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler | None,
     classifier_factory: (
         Callable[[NanoTabPFNModel, torch.device], NanoTabPFNClassifier] | None
     ),
@@ -619,7 +620,6 @@ def _handle_evaluation(
 
     eval_start_time = time.time()
     model.eval()
-    optimizer.eval()
 
     model_to_eval = accelerator.unwrap_model(model) if accelerator else model
     factory = classifier_factory or (lambda m, d: NanoTabPFNClassifier(m, d))
@@ -676,6 +676,7 @@ def _handle_evaluation(
         checkpoint_payload = {
             "model_state_dict": model_state_dict,
             "optimizer_state_dict": optimizer_state_dict,
+            "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
             "step": global_step,
             "train_time": train_time,
             "eval_time": eval_time,
@@ -707,6 +708,7 @@ def _handle_evaluation(
             checkpoint_payload = {
                 "model_state_dict": model_state_dict,
                 "optimizer_state_dict": optimizer_state_dict,
+                "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
                 "step": global_step,
                 "train_time": train_time,
                 "eval_time": eval_time,
@@ -723,7 +725,6 @@ def _handle_evaluation(
         )
 
     model.train()
-    optimizer.train()
     return (
         eval_time,
         best_score,
@@ -787,6 +788,7 @@ def train(
     prior,
     optimizer: torch.optim.Optimizer,
     steps_per_epoch: int,
+    scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
     augment_repeats: int = 0,
     augment_split_ratio_range: Sequence[float] = (0.1, 0.9),
     device: torch.device | None = None,
@@ -816,7 +818,6 @@ def train(
     criterion = nn.CrossEntropyLoss()
 
     model.train()
-    optimizer.train()
 
     train_time = 0.0
     eval_time = 0.0
@@ -942,6 +943,8 @@ def train(
                         accelerator.clip_grad_norm_(model.parameters(), 1.0)
                     optimizer.step()
                     optimizer.zero_grad()
+                    if scheduler is not None and accelerator.sync_gradients:
+                        scheduler.step()
 
                 step_train_duration = time.time() - step_start_time
                 train_time += step_train_duration
@@ -967,6 +970,7 @@ def train(
                             ) = _handle_evaluation(
                                 model,
                                 optimizer,
+                                scheduler,
                                 classifier_factory,
                                 device,
                                 eval_func,

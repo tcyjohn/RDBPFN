@@ -224,8 +224,8 @@ DEFAULT_SAMPLED_HP = {
     },
     "archetype_perturb_std": {
         "distribution": "uniform",
-        "min": 0.1,
-        "max": 0.4,
+        "min": 0.05,
+        "max": 0.15,
     },
     "max_groups_per_feature": {
         "distribution": "meta_choice",
@@ -257,8 +257,8 @@ DEFAULT_SAMPLED_HP = {
     },
     "residual_sigma": {
         "distribution": "uniform",
-        "min": 0.5,
-        "max": 2.0,
+        "min": 0.1,
+        "max": 0.4,
     },
     "basis_perturb_eta": {
         "distribution": "meta_choice",
