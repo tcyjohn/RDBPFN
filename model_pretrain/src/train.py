@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import math
 import os
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
@@ -10,6 +9,7 @@ from typing import Literal, Sequence
 import hydra
 import torch
 import wandb
+import schedulefree
 from hydra.utils import to_absolute_path
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
@@ -219,24 +219,22 @@ def main(cfg: Config):
 
     device = accelerator.device
     model = build_model(cfg.model)
-    optimizer = torch.optim.AdamW(
+    optimizer = schedulefree.AdamWScheduleFree(
         model.parameters(), lr=cfg.train.lr, weight_decay=cfg.train.weight_decay,
+        betas=(0.95, 0.999),
     )
 
     load_model_path = _resolve_path(cfg.train.load_model_path)
     optimizer_state = None
-    scheduler_state = None
 
     if load_model_path:
         ckpt = load_checkpoint(
             model, load_model_path, device, output_log=accelerator.is_main_process
         )
         optimizer_state = ckpt.get("optimizer_state_dict")
-        scheduler_state = ckpt.get("scheduler_state_dict")
         load_optimizer_state = getattr(cfg.train, "load_optimizer_state", False)
         if not load_optimizer_state:
             optimizer_state = None
-            scheduler_state = None
             if accelerator.is_main_process:
                 logger.info(
                     "Skipping optimizer state loading (load_optimizer_state=False)"
@@ -248,9 +246,6 @@ def main(cfg: Config):
         optimizer.load_state_dict(optimizer_state)
         if accelerator.is_main_process:
             logger.info("Loaded optimizer state from checkpoint")
-
-    # Scheduler will be created after prior setup — actual step count depends on dataset size.
-    _pending_scheduler_state = scheduler_state
 
     if accelerator.is_main_process:
         configured_gpus = getattr(cfg.train, "num_gpus", None)
@@ -364,32 +359,6 @@ def main(cfg: Config):
     if checkpoint_path:
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Create scheduler AFTER prior setup — actual optimizer step count depends on dataset size.
-    total_optim_steps = prior.steps_per_epoch * cfg.train.num_epochs // grad_accum_steps
-    warmup_steps = int(total_optim_steps * cfg.train.warmup_fraction)
-    scheduler_warmup = torch.optim.lr_scheduler.LinearLR(
-        optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps,
-    )
-    scheduler_cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=total_optim_steps - warmup_steps, eta_min=cfg.train.lr / 100,
-    )
-    scheduler = torch.optim.lr_scheduler.SequentialLR(
-        optimizer,
-        schedulers=[scheduler_warmup, scheduler_cosine],
-        milestones=[warmup_steps],
-    )
-    if _pending_scheduler_state is not None:
-        scheduler.load_state_dict(_pending_scheduler_state)
-        if accelerator.is_main_process:
-            logger.info("Loaded scheduler state from checkpoint")
-
-    if accelerator.is_main_process:
-        logger.info(
-            "Scheduler: total_optim_steps=%d warmup=%d (lr %.2e → %.2e → %.2e)",
-            total_optim_steps, warmup_steps,
-            cfg.train.lr * 0.01, cfg.train.lr, cfg.train.lr / 100,
-        )
-
     def log_callback(time_elapsed, losses, metrics):
         if cfg.wandb.enabled and accelerator.is_main_process:
             wandb.log({**losses, **metrics, "time": time_elapsed})
@@ -404,7 +373,6 @@ def main(cfg: Config):
         model,
         prior,
         optimizer,
-        scheduler=scheduler,
         steps_per_epoch=prior.steps_per_epoch,
         steps_per_eval=cfg.train.steps_per_eval,
         augment_repeats=augment_times,
