@@ -14,7 +14,7 @@ import numpy as np
 import torch
 from hydra.utils import to_absolute_path
 from omegaconf import OmegaConf
-from sklearn.metrics import accuracy_score, balanced_accuracy_score
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, roc_auc_score
 
 from .dbinfer_bench_simplified.dataset_meta import DBBTaskType
 from .dbinfer_bench_simplified.rdb_dataset import DBBRDBDataset
@@ -30,6 +30,7 @@ from .eval_utils import (
     save_results_to_csv,
     append_results_to_csv,
     fill_nans,
+    prepare_eval_splits,
 )
 from .eval_classifiers import AutoGluonConfig, LimiXConfig, build_classifier_factory
 
@@ -43,6 +44,7 @@ DEFAULT_MAX_TEST_SAMPLES = 50000
 @dataclass
 class DatasetConfig:
     paths: List[str] = field(default_factory=list)
+    dirs: List[str] = field(default_factory=list)
     max_train_samples: int | None = None
     max_test_samples: int | None = DEFAULT_MAX_TEST_SAMPLES
     eval_chunk_size: int | None = None
@@ -137,70 +139,70 @@ def _evaluate_datasets(
     per_seed_results: list[dict] = []
     aggregate: dict[tuple[str, str], list[dict]] = defaultdict(list)
     chunk_override = eval_chunk_size_override
-    dataset_eval_times: dict[int, float] = defaultdict(float)
+    max_test_samples = OmegaConf.select(
+        cfg, "dataset.max_test_samples", default=DEFAULT_MAX_TEST_SAMPLES
+    )
 
-    for seed in cfg.dataset.seeds:
-        logger.info("Evaluating with seed %s", seed)
-        dataset_start_time = time.perf_counter()
-        for dataset_path_str in cfg.dataset.paths:
-            dataset_path = _resolve(dataset_path_str)
-            if dataset_path is None or not dataset_path.exists():
-                logger.warning("Skipping dataset %s (path missing)", dataset_path_str)
-                continue
-            dataset = DBBRDBDataset(dataset_path)
-            logger.info("Dataset %s", dataset.dataset_name)
-            for task in dataset.tasks:
-                if task.metadata.task_type != DBBTaskType.classification:
-                    logger.info(
-                        "Skipping task %s (%s)",
-                        task.metadata.name,
-                        task.metadata.task_type,
-                    )
-                    continue
-                try:
-                    X_train, y_train = load_task_split(task, "train")
-                    X_test, y_test = load_task_split(task, "test")
-                except ValueError as exc:
-                    logger.warning(
-                        "Failed to load splits for %s/%s: %s",
-                        dataset.dataset_name,
-                        task.metadata.name,
-                        exc,
-                    )
-                    continue
+    # evaluate one dataset at a time: load data once, iterate all seeds, then release
+    for dataset_path_str in cfg.dataset.paths:
+        dataset_path = _resolve(dataset_path_str)
+        if dataset_path is None or not dataset_path.exists():
+            logger.warning("Skipping dataset %s (path missing)", dataset_path_str)
+            continue
+        dataset = DBBRDBDataset(dataset_path)
+        logger.info("Dataset %s", dataset.dataset_name)
 
-                # Log original dataset sizes
-                n_train_orig, n_cols = X_train.shape
-                n_test_orig = X_test.shape[0]
+        # ── Load all classification tasks for this dataset ──
+        task_entries: list[
+            tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, object, str]
+        ] = []
+        for task in dataset.tasks:
+            if task.metadata.task_type != DBBTaskType.classification:
                 logger.info(
-                    "Task %s/%s: #train=%d, #test=%d, #cols=%d",
+                    "Skipping task %s (%s)", task.metadata.name, task.metadata.task_type
+                )
+                continue
+            try:
+                X_train, y_train = load_task_split(task, "train")
+                X_test, y_test = load_task_split(task, "test")
+            except ValueError as exc:
+                logger.warning(
+                    "Failed to load splits for %s/%s: %s",
                     dataset.dataset_name,
                     task.metadata.name,
-                    n_train_orig,
-                    n_test_orig,
-                    n_cols,
+                    exc,
                 )
+                continue
+            task_entries.append(
+                (X_train, y_train, X_test, y_test, task, task.metadata.name)
+            )
+            logger.info(
+                "Task %s/%s: #train=%d, #test=%d, #cols=%d",
+                dataset.dataset_name,
+                task.metadata.name,
+                X_train.shape[0],
+                X_test.shape[0],
+                X_train.shape[1],
+            )
 
-                # Downsample training data
-                seed_key = f"{dataset.dataset_name}:{task.metadata.name}:{seed}"
+        if not task_entries:
+            continue
+
+        # ── Evaluate all seeds for this dataset's tasks ──
+        for seed in cfg.dataset.seeds:
+            for X_train, y_train, X_test, y_test, task, task_name in task_entries:
+                seed_key = f"{dataset.dataset_name}:{task_name}:{seed}"
                 seed_offset = _stable_random_state(seed_key)
                 X_train_ds, y_train_ds = downsample_split(
                     X_train, y_train, cfg.dataset.max_train_samples, seed_offset
                 )
 
-                # Downsample test data if it exceeds the threshold
-                test_seed_key = (
-                    f"{dataset.dataset_name}:{task.metadata.name}:{seed}:test"
-                )
+                test_seed_key = f"{dataset.dataset_name}:{task_name}:{seed}:test"
                 test_seed_offset = _stable_random_state(test_seed_key)
-                max_test_samples = OmegaConf.select(
-                    cfg, "dataset.max_test_samples", default=DEFAULT_MAX_TEST_SAMPLES
-                )
                 X_test_ds, y_test_ds = downsample_split(
                     X_test, y_test, max_test_samples, test_seed_offset
                 )
 
-                # Fill NaNs using train data statistics
                 X_train_ds, X_test_ds = fill_nans(X_train_ds, X_test_ds)
 
                 unique_labels = np.unique(y_train_ds)
@@ -208,7 +210,7 @@ def _evaluate_datasets(
                     logger.warning(
                         "Skipping task %s/%s: train split has a single class after downsampling",
                         dataset.dataset_name,
-                        task.metadata.name,
+                        task_name,
                     )
                     continue
 
@@ -240,13 +242,11 @@ def _evaluate_datasets(
                     "seed %s | %s / %s -> %s %.4f (acc %.4f)",
                     seed,
                     dataset.dataset_name,
-                    task.metadata.name,
+                    task_name,
                     task_result["metric"],
                     task_result["metric_value"],
                     task_result["accuracy"],
                 )
-        dataset_elapsed = time.perf_counter() - dataset_start_time
-        dataset_eval_times[seed] = dataset_elapsed
 
     aggregated_results: list[dict] = []
     for (dataset_name, task_name), entries in aggregate.items():
@@ -279,7 +279,95 @@ def _evaluate_datasets(
         cfg, "dataset.enable_eval_timing", default=False
     )
     if enable_eval_timing:
-        _save_dataset_eval_times(dataset_eval_times, model_label)
+        logger.warning("eval_timing is disabled in this eval mode; skipping timing output")
+    return per_seed_results, aggregated_results
+
+
+def _evaluate_csv_datasets(
+    cfg: EvaluationConfig,
+    classifier_factory,
+    eval_chunk_size_override: int | None,
+    model_label: str,
+) -> tuple[list[dict], list[dict]]:
+    data_dirs = [Path(to_absolute_path(d)) for d in cfg.dataset.dirs]
+    splits_by_dir, names_by_dir = prepare_eval_splits(data_dirs)
+
+    max_train = cfg.dataset.max_train_samples
+    max_test = OmegaConf.select(
+        cfg, "dataset.max_test_samples", default=DEFAULT_MAX_TEST_SAMPLES
+    )
+    chunk_override = eval_chunk_size_override
+
+    per_seed_results: list[dict] = []
+    aggregate: dict[tuple[str, str], list[dict]] = defaultdict(list)
+
+    for dir_key, dir_splits in splits_by_dir.items():
+        dir_names = names_by_dir[dir_key]
+        for seed in cfg.dataset.seeds:
+            for (X_train, X_test, y_train, y_test), task_name in zip(dir_splits, dir_names):
+                seed_key = f"{dir_key}:{task_name}:{seed}"
+                seed_offset = _stable_random_state(seed_key)
+                X_train_ds, y_train_ds = downsample_split(
+                    X_train, y_train, max_train, seed_offset
+                )
+                test_seed_key = f"{dir_key}:{task_name}:{seed}:test"
+                test_seed_offset = _stable_random_state(test_seed_key)
+                X_test_ds, y_test_ds = downsample_split(
+                    X_test, y_test, max_test, test_seed_offset
+                )
+
+                X_train_ds, X_test_ds = fill_nans(X_train_ds, X_test_ds)
+
+                unique_labels = np.unique(y_train_ds)
+                if unique_labels.size < 2:
+                    logger.warning(
+                        "Skipping %s/%s: single class after downsampling",
+                        dir_key, task_name,
+                    )
+                    continue
+
+                classifier = classifier_factory()
+                classifier.fit(X_train_ds, y_train_ds)
+                prob = predict_proba_in_chunks(
+                    classifier, X_test_ds,
+                    None if (chunk_override is not None and chunk_override <= 0)
+                    else (chunk_override if chunk_override is not None else cfg.dataset.eval_chunk_size),
+                )
+                pred = prob.argmax(axis=1)
+
+                if prob.shape[1] == 2:
+                    metric_value = float(roc_auc_score(y_test_ds, prob[:, 1]))
+                else:
+                    metric_value = float(roc_auc_score(y_test_ds, prob, multi_class="ovr"))
+
+                result = {
+                    "dataset": dir_key,
+                    "task": task_name,
+                    "metric": "roc_auc",
+                    "metric_value": metric_value,
+                    "accuracy": float(accuracy_score(y_test_ds, pred)),
+                    "balanced_acc": float(balanced_accuracy_score(y_test_ds, pred)),
+                    "seed": seed,
+                }
+                per_seed_results.append(result)
+                aggregate[(dir_key, task_name)].append(result)
+                logger.info(
+                    "seed %s | %s / %s -> roc_auc %.4f (acc %.4f)",
+                    seed, dir_key, task_name, metric_value, result["accuracy"],
+                )
+
+    aggregated_results: list[dict] = []
+    for (dataset_name, task_name), entries in aggregate.items():
+        aggregated_results.append({
+            "dataset": dataset_name,
+            "task": task_name,
+            "metric": "roc_auc",
+            "metric_value": float(np.nanmean([e["metric_value"] for e in entries])),
+            "accuracy": float(np.nanmean([e["accuracy"] for e in entries])),
+            "balanced_acc": float(np.nanmean([e["balanced_acc"] for e in entries])),
+            "num_runs": len(entries),
+        })
+
     return per_seed_results, aggregated_results
 
 
@@ -299,8 +387,10 @@ def _save_dataset_eval_times(
 
 @hydra.main(config_path="../conf_eval", config_name="eval", version_base=None)
 def main(cfg: EvaluationConfig):
-    if not cfg.dataset.paths:
-        raise ValueError("No dataset paths provided for evaluation.")
+    has_rdb_paths = bool(OmegaConf.select(cfg, "dataset.paths", default=[]))
+    has_csv_dirs = bool(OmegaConf.select(cfg, "dataset.dirs", default=[]))
+    if not has_rdb_paths and not has_csv_dirs:
+        raise ValueError("No dataset paths or dirs provided for evaluation.")
 
     set_randomness_seed(42)
     device = torch.device(get_default_device())
@@ -345,9 +435,20 @@ def main(cfg: EvaluationConfig):
         eval_chunk_override = OmegaConf.select(
             cfg, "model.eval_chunk_size_override", default=None
         )
-        per_seed_results, aggregated_results = _evaluate_datasets(
-            cfg, classifier_factory, eval_chunk_override, label
-        )
+        per_seed_results: list[dict] = []
+        aggregated_results: list[dict] = []
+        if has_csv_dirs:
+            csv_seeds, csv_agg = _evaluate_csv_datasets(
+                cfg, classifier_factory, eval_chunk_override, label
+            )
+            per_seed_results.extend(csv_seeds)
+            aggregated_results.extend(csv_agg)
+        if has_rdb_paths:
+            rdb_seeds, rdb_agg = _evaluate_datasets(
+                cfg, classifier_factory, eval_chunk_override, label
+            )
+            per_seed_results.extend(rdb_seeds)
+            aggregated_results.extend(rdb_agg)
 
         # Store results for CSV output
         all_model_results[label] = aggregated_results
