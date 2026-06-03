@@ -294,6 +294,13 @@ DEFAULT_SAMPLED_HP = {
         "round": False,
         "lower_bound": 0.5,
     },
+    "group_scale_intrinsic": {
+        "distribution": "meta_trunc_norm_log_scaled",
+        "max_mean": 15.0,
+        "min_mean": 3.0,
+        "round": False,
+        "lower_bound": 0.5,
+    },
     # --- Deprecated: kept for backward compat, ignored by HSBM path ---
     "parent_sampling_dist": {
         "distribution": "meta_choice",

@@ -125,7 +125,10 @@ DAG 数据来自 `datasets/rdb_v1.pth`，是一个 PyTorch 保存的字典:
 - 确定 `num_rows` (含 ±20% 波动)
 - 确定 `num_features` = 原始 num_cols
 - 确定 `num_cols` = feature 数 + 1 (PK) + num_parents (FKs) + (可选 timestamp)
-- 70% 概率设为 timestamp 表 (`is_timestamp_table`)
+- Timestamp 分配策略 (v2):
+  - Source 表 (`num_parents == 0`): 永不 timestamp
+  - Entity 表 (`out_degree >= 1`): `entity_prob` (当前 0.0, 永不 timestamp)
+  - Activity/Leaf 表 (`out_degree == 0`): `activity_prob` (当前 1.0, 必定 timestamp)
 
 ### 3.3 创建 RDB 对象
 
@@ -176,14 +179,15 @@ for table_name in topological_sort(graph):
 - `hsbm_clusters_per_level`: {1, 2, 3} (均匀选择)
 
 **Signal-Group Feature Generation 参数** (详见第 8 节):
-- `group_scale_{time,parent,path}`: log-normal, max_mean=15, min_mean=3
+- `group_scale_{time,parent,path,intrinsic}`: log-normal, max_mean=15, min_mean=3
+- `intrinsic_dim`: 8 (固定, 计划可配置化)
 - `loading_log_mean`: [0.35, 1.7]
 - `loading_sigma`: [0.2, 0.6]
 - `max_groups_per_feature`: {2, 3}
-- `archetype_perturb_std`: [0.1, 0.4]
+- `archetype_perturb_std`: [0.05, 0.15]
 - `coupling_lambda`: [0.02, 0.06]
 - `coupling_rank`: {2, 3}
-- `residual_sigma`: [0.5, 2.0]
+- `residual_sigma`: [0.1, 0.4]
 - `basis_perturb_eta`: {0.10} (固定)
 
 **Temporal 参数**:
@@ -207,19 +211,18 @@ for table_name in topological_sort(graph):
     if 没有父表 (源表):
         MLPSCM.forward_without_input()
             ├── XSampler 采样 root causes (seq_len, num_causes)
-            ├── [可选] _prepare_time_features(): 采样时间戳 → basis(8)+gates(3)
-            ├── MLP layers 前向传播
-            ├── handle_outputs(): 从中间层提取 X, y
-            └── [Signal-Group]: _construct_features() 覆盖 X
+            ├── MLP layers 前向传播 → CAUSAL_OUTPUT, Y
+            ├── [可选] _prepare_time_features() (time_dim=0 → 跳过)
+            ├── _build_intrinsic_signal(): causes_raw → Linear → (seq_len, 8)
+            └── [Signal-Group]: _construct_features() 覆盖 X (α=[0,0,0,1])
 
     else (有父表):
         _compute_hsbm_fk_ids(): HSBM 采样 FK 连接
         MLPSCM.forward_with_input(parent_data, fk_ids)
             ├── XSampler 采样 root causes
-            ├── [可选] _prepare_time_features() + t_min (>=父表时间戳)
+            ├── [可选] _prepare_time_features() + t_min (仅 timestamp child)
             ├── 拼接 parent_data[CAUSAL_OUTPUT][fk_ids] 作为额外输入
-            ├── MLP layers 前向传播
-            ├── handle_outputs()
+            ├── MLP layers 前向传播 → CAUSAL_OUTPUT, Y
             └── [Signal-Group]: _construct_features() 覆盖 X
 
     cache_pending_outputs(X, fk_ids) → row_embeddings
@@ -230,13 +233,14 @@ _materialize_tables_from_pending() → Table.process_data()
 
 ### 5.2 源表 vs 子表的区别
 
-| | 源表 (no parents) | 子表 (有 parents) |
-|---|---|---|
-| MLP 输入 | `causes + [time_features?]` | `causes + [time_features?] + parent_causal_outputs` |
-| FK 生成 | 无 | HSBM 采样 |
-| t_min | Uniform(0, 0.15T) | max(所有父表时间戳) |
-| Signal-Group α | [1, 0, 0] (仅 time) | [0.1, 0.55, 0.35] (time+parent+path) |
-| 时间戳依赖 α | 无 | [0.5, 0.25, 0.25] |
+| | 源表 (no parents) | Timestamp child (leaf 表) | Non-ts child (entity 表) |
+|---|---|---|---|
+| MLP 输入 | `causes_raw` | `causes_raw + time_features + parent_causal_outputs` | `causes_raw + parent_causal_outputs` |
+| FK 生成 | 无 | HSBM 采样 | HSBM 采样 |
+| time_dim | 0 | >0 | 0 |
+| Signal-Group α (4维) | `[0, 0, 0, 1]` (仅 intrinsic) | `[~0.5, ~0.25, ~0.25, 0]` (time+parent+path) | `[0, ~0.6, ~0.4, 0]` (parent+path only) |
+
+**关键架构分离**: MLP 负责生成 Y (预测目标) 和 CAUSAL_OUTPUT (传给子表的隐层表示)；Signal-Group 负责构造 X (特征列)。两者通过 `causes_raw` 共享随机种子，但计算路径独立。Intrinsic signal 使 source 表在无 timestamp 的情况下仍能产生结构化特征。
 
 ### 5.3 数据后处理: ColumnDataProcessor
 
@@ -345,11 +349,15 @@ Step 5a: Pre-DFS Transform
 
 Step 5b: DFS (Deep Feature Synthesis)
   配置: dfs-2-ft.yaml → max_depth=2, engine=featuretools
-  处理: 从 __task__ 表出发, 沿 FK 关系聚合子表特征
-        所有聚合特征来自 depth=2 (DirectFeatures + AggregationFeatures)
-        聚合函数: MEAN, STD, COUNT, MAX, MIN, MODE, SUM
-  depth=1 仅产生 IdentityFeatures (全部被 filter_features 过滤为 key 列)
-  → 实际有效特征从 depth≥2 开始
+  处理: 从 __task__ 表出发, 沿 FK 关系构造特征。depth=0 为自身列,
+        depth=1 为一步关系可达的表, depth=2 为两步关系可达的表。
+        - forward (子→父, many-to-one): depth=1 直接拿到父表列值 (IdentityFeature)
+        - backward (父→子, one-to-many): depth=1 即可产生聚合特征 (MEAN/SUM/COUNT 等)
+        - depth=2 产生穿透两步的递归聚合特征 (e.g. MEAN(child.MEAN(grandchild.col)))
+  聚合函数: MEAN, STD, COUNT, MAX, MIN, MODE, SUM
+  filter_features 仅过滤根 IdentityFeature 是 PK/FK key column 的特征
+  (如 COUNT(child) 基于 child.PK), 非 key 的 IdentityFeature 和 AggregationFeature 均保留
+  → 实际有效特征从 depth≥1 开始 (backward 聚合) 和 depth≥2 (递归聚合)
   输出: 临时目录 tmp_post/
 
 Step 5c: Post-DFS Transform
@@ -374,15 +382,16 @@ Step 5c: Post-DFS Transform
 
 ## 8. 核心机制详解: Signal-Group Feature Generation
 
-这是整个系统最核心的设计。当 `use_signal_group_features=True` 时, SCM 不再直接使用 MLP 中间层输出作为特征, 而是通过三组信号源 (time, parent, path) 的基向量投影来构造特征。
+这是整个系统最核心的设计。当 `use_signal_group_features=True` 时, SCM 不再直接使用 MLP 中间层输出作为特征, 而是通过四组信号源 (time, parent, path, intrinsic) 的基向量投影来构造特征。
 
-### 8.1 三组信号源
+### 8.1 四组信号源
 
 | 信号组 | 维度 | 含义 | 来源 |
 |---|---|---|---|
 | **time** | 11 | 时间信号 | basis(8) + gates(3), 来自 TemporalVocab |
 | **parent** | 12 | 父表特征信号 | 每个 FK 边: parent CAUSAL_OUTPUT → Linear → mean-pool |
 | **path** | 8 | HSBM 块路径信号 | 每个 FK 边: Block indices → Embedding → PathEncoder → mean-pool |
+| **intrinsic** | 8 | 内在信号 (v2 新增) | `causes_raw → Linear(num_causes, 8)`; 计划改为 `CAUSAL_OUTPUT → Linear(num_outputs, 8)` |
 
 信号产生流程:
 ```
@@ -399,23 +408,45 @@ parent_sig:
 path_sig:
   block_paths[:, :n_levels] → Embedding per level → concat → Linear → mean over edges
     → (seq_len, 8)
+
+intrinsic_sig (当前):
+  causes_raw → Linear(num_causes → 8) → (seq_len, 8)
+
+intrinsic_sig (计划, MLP-integrated):
+  MLP(causes_raw) → CAUSAL_OUTPUT → Linear(num_outputs → 8) → (seq_len, 8)
 ```
 
 ### 8.2 原型 (Archetype) 驱动的 α 分配
 
 `MLPSCM._compute_base_alpha(archetype)`:
 
-每张表被分类为一个原型 (archetype), 决定三个信号组的相对权重 α:
+每张表被分类为一个原型 (archetype), 决定四个信号组的相对权重 α:
 
-| 原型 | 条件 | α = [time, parent, path] |
+| 原型 | 条件 | α = [time, parent, path, intrinsic] |
 |---|---|---|
-| Source table | `num_parents == 0` | [1.0, 0, 0] |
-| Timestamp child | `is_timestamp=True` | [0.5, 0.25, 0.25] |
-| Dependent non-ts | 其他子表 | [0.1, 0.55, 0.35] |
+| Source table | `num_parents == 0` | `[0, 0, 0, 1.0]` |
+| Timestamp child | `is_timestamp=True` | `[~0.5, ~0.25, ~0.25, 0]` |
+| Dependent non-ts | 其他子表 | `[0, ~0.6, ~0.4, 0]` (计划改为 `[0, ~0.5, ~0.35, ~0.15]`) |
 
-多父表情况下, parent 份额上调 (最多 0.6)。
+多父表情况下, parent 份额上调 (最多 0.6)。不可用组 (如 source 表的 parent/path, non-ts 表的 time) 被 mask 为零后重新归一化。
 
-然后 `_perturb_alpha()` 施加乘性对数正态扰动 (`archetype_perturb_std ∈ [0.1, 0.4]`), 并重新归一化。
+然后 `_perturb_alpha()` 施加乘性对数正态扰动 (`archetype_perturb_std ∈ [0.05, 0.15]`), 并重新归一化。
+
+### 8.2.1 X-Y 耦合分析
+
+MLP 和 Signal-Group 是两个解耦的机制:
+- **MLP 路径**: `causes → MLP → Y, CAUSAL_OUTPUT` — 生成预测目标和子表隐层表示
+- **Signal-Group 路径**: `signals → basis projection → X` — 构造特征列
+
+**各 archetype 的 X-Y 耦合程度**:
+
+| Archetype | X 信号来源 | MLP 输入共享 | 耦合强度 |
+|-----------|-----------|-------------|---------|
+| Source | intrinsic (当前: Linear(causes_raw)) | causes_raw | 弱 |
+| Timestamp child | time + parent + path | time_features + parent_causes | 强 |
+| Non-ts child | parent + path | parent_causes | 中 |
+
+**改进方向**: 将 intrinsic signal 的输入从 `causes_raw` 改为 `CAUSAL_OUTPUT` (MLP 中间层输出)，使 intrinsic signal 建立在 MLP 计算之上，增强 source 表和非 ts child 表的 X-Y 耦合。
 
 ### 8.3 特征分配
 
@@ -467,14 +498,15 @@ X_out = X + λ · X @ W    # W = (1 - I) / (n - 1), uniform off-diagonal couplin
 - time_gates: 不做 RMS (直接透传)
 - parent: RMS-norm × `group_scale_parent`
 - path: RMS-norm × `group_scale_path`
+- intrinsic: RMS-norm × `group_scale_intrinsic`
 
 ### 8.6 完整特征构造流程
 
 ```
-输入: signals = {time_basis(8), time_gates(3), parent(12), path(8)}
+输入: signals = {time_basis(8), time_gates(3), parent(12), path(8), intrinsic(8)}
 
 对每个特征 j:
-  ├── 从 Dirichlet(α) 采样 group weights
+  ├── 从 Dirichlet(α) 采样 group weights  (α 为 4 维向量)
   ├── 选 top-K 活跃组
   ├── 对每个活跃组 g:
   │   ├── 取 round-robin 分配的 basis index k
@@ -585,6 +617,18 @@ HPs: `matching_latent_dim` ∈ {2, 3, 4}, `matching_temperature` ∈ {0.10, 0.20
 
 ## 10. 核心机制详解: 时间戳生成
 
+### 10.0 Timestamp 分配策略 (v2)
+
+当前策略 (config: `entity_prob=0.0, activity_prob=1.0`):
+
+| 表类型 | 条件 | timestamp 概率 | 说明 |
+|--------|------|---------------|------|
+| Source | `num_parents == 0` | 0% | 源表无时间戳，靠 intrinsic signal |
+| Entity | `out_degree >= 1` | `entity_prob` (0%) | 非 leaf 表均无时间戳 |
+| Activity/Leaf | `out_degree == 0` | `activity_prob` (100%) | 所有 leaf 表必定有时间戳 |
+
+注: `num_parents == 0` 且 `out_degree == 0` 的表（孤立节点，极少见）按 source 分支处理，但也可能被 activity 分支捕获。
+
 ### 10.1 TemporalVocab: 日历对齐的强度函数
 
 `TemporalVocab.generate(time_range)`:
@@ -645,15 +689,15 @@ intensity(t) = base_intensity(t) × p_dow[dow(t)] × 7
 
 | 参数 | 值 | 说明 |
 |---|---|---|
-| `group_scale_time/parent/path` | log-normal, max_mean=15, min_mean=3 | 信号能量缩放 |
+| `group_scale_{time,parent,path,intrinsic}` | log-normal, max_mean=15, min_mean=3 | 四组信号能量缩放 |
 | `basis_perturb_eta` | 0.10 (固定) | 打破 rank-1 块结构 |
 | `loading_log_mean` | Uniform(0.35, 1.7) | LogNormal 加载幅度的均值 |
 | `loading_sigma` | Uniform(0.2, 0.6) | LogNormal 加载幅度的标准差 |
 | `max_groups_per_feature` | {2, 3} | 每个特征最多几个信号组 |
-| `archetype_perturb_std` | Uniform(0.1, 0.4) | α 乘性扰动的标准差 |
+| `archetype_perturb_std` | Uniform(0.05, 0.15) | α 乘性扰动的标准差 |
 | `coupling_lambda` | Uniform(0.02, 0.06) | 跨特征 uniform 耦合强度 |
 | `coupling_rank` | {2, 3} | 耦合矩阵的秩 (当前 uniform 耦合下等价于 lambda) |
-| `residual_sigma` | Uniform(0.5, 2.0) | 每特征独立噪声标准差 |
+| `residual_sigma` | Uniform(0.1, 0.4) | 每特征独立噪声标准差 |
 | `basis_group_divisor` | {3} | 用于计算 `K_time` (parent/path 用固定公式) |
 
 ### 11.2 K 计算总结
@@ -663,6 +707,7 @@ intensity(t) = base_intensity(t) × p_dow[dow(t)] × 7
 | time | 8 | 3 | `min(3, max(1, ceil(8/divisor)))` |
 | parent | 12 | 4 | `max(1, ceil(12/3))` |
 | path | 8 | 4 | `max(1, ceil(8/2))` |
+| intrinsic | 8 | 4 | `max(1, ceil(intrinsic_dim/2))` |
 
 ---
 

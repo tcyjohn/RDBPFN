@@ -43,6 +43,7 @@ FEATURE_GEN_MODE_ACTIVE_HPS = {
         "archetype_perturb_std", "max_groups_per_feature", "loading_sigma",
         "loading_log_mean", "residual_sigma", "basis_group_divisor",
         "group_scale_time", "group_scale_parent", "group_scale_path",
+        "group_scale_intrinsic",
     },
     False: {"parent_injection_scale"},
 }
@@ -238,6 +239,8 @@ class MLPSCM(nn.Module):
         group_scale_time: float = 1.0,
         group_scale_parent: float = 1.0,
         group_scale_path: float = 1.0,
+        group_scale_intrinsic: float = 1.0,
+        intrinsic_dim: int = 8,
         residual_sigma: float = 0.1,
         loading_sigma: float = 0.5,
         loading_log_mean: float = -0.5,
@@ -312,6 +315,8 @@ class MLPSCM(nn.Module):
         self.group_scale_time = group_scale_time
         self.group_scale_parent = group_scale_parent
         self.group_scale_path = group_scale_path
+        self.group_scale_intrinsic = group_scale_intrinsic
+        self.intrinsic_dim = intrinsic_dim
         self.residual_sigma = residual_sigma
         self.loading_sigma = loading_sigma
         self.loading_log_mean = loading_log_mean
@@ -345,6 +350,9 @@ class MLPSCM(nn.Module):
                 self.alpha_final, n_feat,
             )
             self.group_bases = self._init_group_bases()
+            self.intrinsic_projector = nn.Linear(
+                self.num_outputs, self.intrinsic_dim, device=self.device,
+            )
             self._init_parent_projectors(_relation_keys, _parent_causal_dims)
             self._init_path_encoders(_relation_keys, _levels_per_edge)
             self._init_cross_feature_coupling(n_feat)
@@ -607,11 +615,13 @@ class MLPSCM(nn.Module):
         This case is for generate tables without parent tables.
         Therefore, we do not need to sample the parent tables.
         """
-        causes = self.xsampler.sample()  # (seq_len, num_causes)
+        causes_raw = self.xsampler.sample()  # (seq_len, num_causes)
         n_sampled = int(self.seq_len * self.sampling_ratio)
         if self.time_dim > 0:
             timestamps_norm, time_features = self._prepare_time_features(n_sampled)
-            causes = torch.cat([causes, time_features], dim=-1)
+            causes = torch.cat([causes_raw, time_features], dim=-1)
+        else:
+            causes = causes_raw
 
         # Generate outputs through MLP layers
         outputs = [causes]
@@ -633,15 +643,15 @@ class MLPSCM(nn.Module):
                 value[:] = 0.0
 
         if self.use_signal_group_features:
-            # Source table: only time signal available; parent/path masked by α
             self._cached_time_features = time_features if self.time_dim > 0 else None
 
             time_sig_raw = self._build_time_signal()
+            intrinsic_sig_raw = self._build_intrinsic_signal(X[MASK_TYPE.CAUSAL_OUTPUT])
             parent_sig_raw = torch.zeros(self.seq_len, 12, device=self.device)
             path_sig_raw = torch.zeros(self.seq_len, 8, device=self.device)
 
-            time_sig, parent_sig, path_sig = self._normalize_signals(
-                time_sig_raw, parent_sig_raw, path_sig_raw,
+            time_sig, parent_sig, path_sig, intrinsic_sig = self._normalize_signals(
+                time_sig_raw, parent_sig_raw, path_sig_raw, intrinsic_sig_raw,
             )
 
             signals = {
@@ -649,6 +659,7 @@ class MLPSCM(nn.Module):
                 "time_gates": time_sig[:, TIME_GATE_DIMS[0]:TIME_GATE_DIMS[1]],
                 "parent": parent_sig,
                 "path": path_sig,
+                "intrinsic": intrinsic_sig,
             }
 
             X_sg = self._construct_features(signals, self.residual_sigma)
@@ -681,13 +692,15 @@ class MLPSCM(nn.Module):
             Shape ``(seq_len, max_levels)``. Hierarchical block path per child
             row from HSBM. Only used when ``use_signal_group_features=True``.
         """
-        causes = self.xsampler.sample()  # (seq_len, num_causes)
+        causes_raw = self.xsampler.sample()  # (seq_len, num_causes)
         if self.time_dim > 0:
             timestamps_norm, time_features = self._prepare_time_features(
                 n=self.seq_len,
                 t_min=getattr(self, "t_min", None),
             )
-            causes = torch.cat([causes, time_features], dim=-1)
+            causes = torch.cat([causes_raw, time_features], dim=-1)
+        else:
+            causes = causes_raw
 
         for i, parent_table_data in enumerate(parent_data_list):
             parent_idx = fk_ids[:, i]
@@ -725,9 +738,10 @@ class MLPSCM(nn.Module):
             time_sig_raw = self._build_time_signal()
             parent_sig_raw = self._build_parent_signal(parent_data_list, fk_ids)
             path_sig_raw = self._build_path_signal(block_paths)
+            intrinsic_sig_raw = self._build_intrinsic_signal(X[MASK_TYPE.CAUSAL_OUTPUT])
 
-            time_sig, parent_sig, path_sig = self._normalize_signals(
-                time_sig_raw, parent_sig_raw, path_sig_raw,
+            time_sig, parent_sig, path_sig, intrinsic_sig = self._normalize_signals(
+                time_sig_raw, parent_sig_raw, path_sig_raw, intrinsic_sig_raw,
             )
 
             # Split time signal for feature construction
@@ -736,6 +750,7 @@ class MLPSCM(nn.Module):
                 "time_gates": time_sig[:, TIME_GATE_DIMS[0]:TIME_GATE_DIMS[1]],
                 "parent": parent_sig,
                 "path": path_sig,
+                "intrinsic": intrinsic_sig,
             }
 
             X_sg = self._construct_features(signals, self.residual_sigma)
@@ -1062,21 +1077,22 @@ class MLPSCM(nn.Module):
         }
 
     def _compute_base_alpha(self, archetype: dict) -> torch.Tensor:
-        """Map archetype signals to base Dirichlet α (3-vector: time, parent, path).
+        """Map archetype signals to base Dirichlet α (4-vector: time, parent, path, intrinsic).
 
-        Source tables only use the time group; parent and path are masked (α=0).
+        Source tables use only the intrinsic group (latent causes);
+        timestamp children use time+parent+path;
+        dependent non-ts tables use only parent+path (no time, no intrinsic).
         """
         is_source = archetype["is_source"]
         is_timestamp = archetype["is_timestamp"]
         num_parents = archetype["num_parents"]
 
         if is_source:
-            alpha = torch.tensor([1.0, 0.0, 0.0], device=self.device)
-            # Mask unavailable groups: source tables have no FK edges
-            # parent=0 and path=0 already applied
+            # Source tables: 100% intrinsic from MLP CAUSAL_OUTPUT
+            alpha = torch.tensor([0.0, 0.0, 0.0, 1.0], device=self.device)
         elif is_timestamp:
-            alpha = torch.tensor([0.5, 0.25, 0.25], device=self.device)
-            # Multi-parent: inflate parent share, capped at 0.6
+            # Timestamp child: time + parent + path
+            alpha = torch.tensor([0.5, 0.25, 0.25, 0.0], device=self.device)
             if num_parents > 1:
                 parent_share = min(0.6, max(0.25, num_parents * 0.10))
                 alpha[1] = parent_share
@@ -1084,14 +1100,12 @@ class MLPSCM(nn.Module):
                 alpha[0] = remain * 0.5
                 alpha[2] = remain * 0.5
         else:
-            # Dependent non-timestamp table
-            alpha = torch.tensor([0.1, 0.55, 0.35], device=self.device)
+            # Dependent non-timestamp: parent + path only, no time weight
+            alpha = torch.tensor([0.0, 0.6, 0.4, 0.0], device=self.device)
             if num_parents > 1:
-                parent_share = min(0.6, max(0.55, num_parents * 0.10))
+                parent_share = min(0.6, max(0.6, num_parents * 0.10))
                 alpha[1] = parent_share
-                remain = 1.0 - alpha[1]
-                alpha[0] = remain * 0.22  # 0.1 / 0.45
-                alpha[2] = remain * 0.78  # 0.35 / 0.45
+                alpha[2] = 1.0 - parent_share
 
         # Mask unavailable groups
         if num_parents == 0:
@@ -1105,8 +1119,7 @@ class MLPSCM(nn.Module):
         if total > 0:
             alpha = alpha / total
         else:
-            # All groups masked — fall back to uniform residual dominance
-            alpha = torch.tensor([0.0, 0.0, 0.0], device=self.device)
+            alpha = torch.zeros(4, device=self.device)
 
         return alpha
 
@@ -1119,7 +1132,8 @@ class MLPSCM(nn.Module):
         if active_mask.sum() == 0:
             return alpha_base.clone()
 
-        eta = torch.randn(3, device=self.device) * self.archetype_perturb_std
+        n_groups = len(alpha_base)
+        eta = torch.randn(n_groups, device=self.device) * self.archetype_perturb_std
         alpha_perturbed = alpha_base.clone()
         alpha_perturbed[active_mask] = alpha_base[active_mask] * torch.exp(
             eta[active_mask],
@@ -1135,16 +1149,17 @@ class MLPSCM(nn.Module):
         Returns list of dicts, one per feature, with keys: groups, basis_indices,
         signs, magnitudes.
         """
-        GROUP_NAMES = ["time", "parent", "path"]
+        GROUP_NAMES = ["time", "parent", "path", "intrinsic"]
         # K_g = min(3, max(1, ceil(S_g / divisor))). With divisor=8→K=2.
         # When divisor ≥ S_g → K=1, forcing all features in a group
         # to share the same basis vector (max within-group correlation).
         DIV = self.basis_group_divisor
-        TIME_S = 8; PARENT_S = 12; PATH_S = 8
+        TIME_S = 8; PARENT_S = 12; PATH_S = 8; INT_S = self.intrinsic_dim
         K_PER_GROUP = {
             "time": min(3, max(1, int(np.ceil(TIME_S / DIV)))),
             "parent": max(1, int(np.ceil(PARENT_S / 3))),
             "path": max(1, int(np.ceil(PATH_S / 2))),
+            "intrinsic": max(1, int(np.ceil(INT_S / 2))),
         }
         self._K_PER_GROUP = K_PER_GROUP.copy()  # save for diagnostic dump
 
@@ -1228,10 +1243,11 @@ class MLPSCM(nn.Module):
         controlled solely by the coupling layer.
         """
         DIV = self.basis_group_divisor
-        TIME_S = 8; PARENT_S = 12; PATH_S = 8
+        TIME_S = 8; PARENT_S = 12; PATH_S = 8; INT_S = self.intrinsic_dim
         K_time = min(3, max(1, int(np.ceil(TIME_S / DIV))))
         K_parent = max(1, int(np.ceil(PARENT_S / 3)))
         K_path = max(1, int(np.ceil(PATH_S / 2)))
+        K_intrinsic = max(1, int(np.ceil(INT_S / 2)))
 
         group_bases: dict[str, dict[str, torch.Tensor]] = {}
         self._basis_families: dict[str, list[int]] = {}
@@ -1267,6 +1283,11 @@ class MLPSCM(nn.Module):
         group_bases["path"] = {"basis": B_path}
         self._basis_families["path"] = list(range(K_path))
         self._basis_subspaces["path"] = subspaces_path
+
+        B_intrinsic, subspaces_intrinsic = _make_subspace_bases(K_intrinsic, INT_S)
+        group_bases["intrinsic"] = {"basis": B_intrinsic}
+        self._basis_families["intrinsic"] = list(range(K_intrinsic))
+        self._basis_subspaces["intrinsic"] = subspaces_intrinsic
 
         return group_bases
 
@@ -1364,18 +1385,28 @@ class MLPSCM(nn.Module):
         # Mean-pool across edges (single edge → identity)
         return torch.stack(edge_outputs, dim=0).mean(dim=0)
 
+    def _build_intrinsic_signal(self, causes: torch.Tensor) -> torch.Tensor:
+        """Project CAUSAL_OUTPUT (MLP intermediate) to intrinsic signal → (seq_len, intrinsic_dim).
+
+        The intrinsic signal captures the table's own latent variation,
+        independent of time, parent, or path signals.
+        """
+        return self.intrinsic_projector(causes)
+
     def _normalize_signals(
         self,
         time_sig: torch.Tensor,
         parent_sig: torch.Tensor,
         path_sig: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        intrinsic_sig: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Apply group-specific RMS normalization + scaling.
 
         - time_basis[:, 0:8]: RMS-norm × group_scale_time
         - time_gates[:, 8:11]: AS-IS (no RMS, no scale)
         - parent: RMS-norm × group_scale_parent
         - path: RMS-norm × group_scale_path
+        - intrinsic: RMS-norm × group_scale_intrinsic
         """
         # Time: split at hard boundary
         time_basis = time_sig[:, TIME_BASIS_DIMS[0]:TIME_BASIS_DIMS[1]]
@@ -1402,7 +1433,19 @@ class MLPSCM(nn.Module):
         else:
             path_out = path_sig * 0.0
 
-        return time_out, parent_out, path_out
+        # Intrinsic: RMS norm
+        if intrinsic_sig is None:
+            intrinsic_out = torch.zeros(
+                time_sig.shape[0], self.intrinsic_dim, device=self.device,
+            )
+        else:
+            rms_int = torch.sqrt(torch.mean(intrinsic_sig ** 2))
+            if rms_int > 1e-8:
+                intrinsic_out = intrinsic_sig / rms_int * self.group_scale_intrinsic
+            else:
+                intrinsic_out = intrinsic_sig * 0.0
+
+        return time_out, parent_out, path_out, intrinsic_out
 
     def _perturb_basis(self, B_k: torch.Tensor, pert_vec) -> torch.Tensor:
         """Return re-normalized B_k + pert_vec if pert_vec is non-zero, else B_k."""
@@ -1478,6 +1521,15 @@ class MLPSCM(nn.Module):
                         proj = path_sig @ B_eff
                         X[:, j] += signs[idx_in_list] * magnitudes[idx_in_list] * proj
 
+                elif g_name == "intrinsic":
+                    int_sig = signals["intrinsic"]
+                    B_int = self.group_bases["intrinsic"]["basis"]
+                    for idx_in_list, k in enumerate(basis_indices):
+                        B_eff = self._perturb_basis(
+                            B_int[k], perts[idx_in_list] if idx_in_list < len(perts) else None)
+                        proj = int_sig @ B_eff
+                        X[:, j] += signs[idx_in_list] * magnitudes[idx_in_list] * proj
+
             # Add per-feature residual noise (ε_j ~ N(0, σ²_res))
             if residual_sigma > 0:
                 X[:, j] += torch.randn(self.seq_len, device=self.device) * residual_sigma
@@ -1514,11 +1566,12 @@ class MLPSCM(nn.Module):
         K = getattr(self, "_K_PER_GROUP", None)
         if K is None:
             DIV = self.basis_group_divisor
-            TIME_S = 8; PARENT_S = 12; PATH_S = 8
+            TIME_S = 8; PARENT_S = 12; PATH_S = 8; INT_S = self.intrinsic_dim
             K = {
                 "time": min(3, max(1, int(np.ceil(TIME_S / DIV)))),
                 "parent": max(1, int(np.ceil(PARENT_S / 3))),
                 "path": max(1, int(np.ceil(PATH_S / 2))),
+                "intrinsic": max(1, int(np.ceil(INT_S / 2))),
             }
         return {
             "n_features": len(self.feature_assignments),
@@ -1537,6 +1590,7 @@ class MLPSCM(nn.Module):
                 "time": self.group_scale_time,
                 "parent": self.group_scale_parent,
                 "path": self.group_scale_path,
+                "intrinsic": self.group_scale_intrinsic,
             },
             "residual_sigma": self.residual_sigma,
         }

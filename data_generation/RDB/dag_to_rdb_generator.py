@@ -295,9 +295,16 @@ class DAGToRDBGenerator:
                 original_num_cols + 1 + num_parents
             )  # num_col from DAG + 1 + parent's tables num
 
-            # Optional timestamp column: any parent count; probability from config.
+            # Timestamp column: source tables (num_parents=0) never get timestamps;
+            # entity tables (out_degree>=1) never get timestamps;
+            # activity/leaf tables (out_degree=0) always get timestamps.
             ts_cfg = self.dimension_config.get("timestamp", {})
-            timestamp_prob = float(ts_cfg.get("prob", 1.0))
+            if num_parents == 0:
+                timestamp_prob = 0.0  # source table: never timestamp
+            elif dag_structure["out_degree"].get(node, []):
+                timestamp_prob = float(ts_cfg.get("entity_prob", 0.0))
+            else:
+                timestamp_prob = float(ts_cfg.get("activity_prob", 1.0))
             is_timestamp_table = random.random() < timestamp_prob
             if is_timestamp_table:
                 num_cols += 1  # Add one more column for timestamp
@@ -997,10 +1004,12 @@ class DAGToRDBGenerator:
                 count = parent_count_distribution[parent_count]
                 print(f"  {parent_count} parents: {count} tables")
 
-            ts_prob = self.dimension_config.get("timestamp", {}).get("prob", 1.0)
+            ts_cfg = self.dimension_config.get("timestamp", {})
+            entity_prob = ts_cfg.get("entity_prob", 0.0)
+            activity_prob = ts_cfg.get("activity_prob", 1.0)
             print(
-                f"\nTables in corpus (all may get timestamp with prob={ts_prob}): "
-                f"{sum(total_table_counts)}"
+                f"\nTables in corpus ({sum(total_table_counts)} total): "
+                f"source→never ts, entity→prob={entity_prob}, leaf→prob={activity_prob}"
             )
 
 
