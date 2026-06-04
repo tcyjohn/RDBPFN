@@ -222,6 +222,10 @@ DEFAULT_SAMPLED_HP = {
         "distribution": "meta_choice",
         "choice_values": [True],
     },
+    "use_percol_mlp": {
+        "distribution": "meta_choice",
+        "choice_values": [True],
+    },
     "archetype_perturb_std": {
         "distribution": "uniform",
         "min": 0.05,
@@ -390,4 +394,23 @@ DEFAULT_HSBM_HP = {
         "distribution": "meta_choice",
         "choice_values": [0.10, 0.20, 0.35, 0.50],
     },
+    "hsbm_fk_sparsity_min": {
+        "distribution": "uniform",
+        "min": 0.0,
+        "max": 0.15,
+    },
+    "hsbm_fk_sparsity_max": {
+        "distribution": "uniform",
+        "min": 0.05,
+        "max": 0.35,
+    },
+}
+
+# Per-column nonlinear MLP hyperparameters (replaces SG linear basis when active).
+PERCOL_MLP_HP = {
+    "percol_mlp_num_layers": {
+        "distribution": "meta_choice",
+        "choice_values": [2, 3, 4],
+    },
+    "percol_mlp_hidden_dim": 32,  # fixed, not sampled
 }
