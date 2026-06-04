@@ -762,8 +762,11 @@ class MLPSCM(nn.Module):
                 "intrinsic": intrinsic_sig,
             }
 
-            X_sg = self._construct_features(signals, self.residual_sigma)
-            X_sg = self._apply_cross_feature_coupling(X_sg)
+            if self.use_percol_mlp:
+                X_sg = self._construct_features_mlp(signals, self.residual_sigma)
+            else:
+                X_sg = self._construct_features(signals, self.residual_sigma)
+                X_sg = self._apply_cross_feature_coupling(X_sg)
             X[MASK_TYPE.X] = X_sg
 
         # Diagnostic: per-feature max |pearsonr| with CAUSAL_OUTPUT
@@ -867,8 +870,11 @@ class MLPSCM(nn.Module):
                 "intrinsic": intrinsic_sig,
             }
 
-            X_sg = self._construct_features(signals, self.residual_sigma)
-            X_sg = self._apply_cross_feature_coupling(X_sg)
+            if self.use_percol_mlp:
+                X_sg = self._construct_features_mlp(signals, self.residual_sigma)
+            else:
+                X_sg = self._construct_features(signals, self.residual_sigma)
+                X_sg = self._apply_cross_feature_coupling(X_sg)
             X[MASK_TYPE.X] = X_sg
 
         elif not self.use_signal_group_features:
@@ -1645,6 +1651,54 @@ class MLPSCM(nn.Module):
             return B_k
         B_eff = B_k + pert_t
         return B_eff / (B_eff.norm() + 1e-8)
+
+    def _construct_features_mlp(
+        self,
+        signals: dict,
+        residual_sigma: float,
+    ) -> torch.Tensor:
+        """Per-column MLP feature construction (replaces linear SG basis).
+
+        Each feature_j = MLP_j(concat(selected_signals)) + epsilon_j.
+
+        Parameters
+        ----------
+        signals : dict
+            Normalized signals: "time_basis", "time_gates", "parent", "path", "intrinsic".
+        residual_sigma : float
+            Per-feature residual noise std.
+
+        Returns
+        -------
+        X : (seq_len, n_features)
+        """
+        ap = self.archetype_params or {}
+        is_source = ap.get("is_source", False)
+        is_timestamp = ap.get("is_timestamp", False)
+
+        parts = []
+        if is_timestamp:
+            parts.append(signals["time_basis"])
+            parts.append(signals.get("time_gates",
+                torch.zeros(signals["time_basis"].shape[0], 3, device=self.device)))
+        if not is_source:
+            parts.append(signals["parent"])
+            parts.append(signals["path"])
+        parts.append(signals["intrinsic"])
+
+        x_input = torch.cat(parts, dim=1)  # (N, input_dim)
+
+        n_features = len(self.percol_mlps)
+        X = torch.zeros(self.seq_len, n_features, device=self.device)
+
+        for j, mlp_j in enumerate(self.percol_mlps):
+            if j >= X.shape[1]:
+                break
+            X[:, j] = mlp_j(x_input).squeeze(-1)
+            if residual_sigma > 0:
+                X[:, j] += torch.randn(self.seq_len, device=self.device) * residual_sigma
+
+        return X
 
     def _construct_features(
         self,
