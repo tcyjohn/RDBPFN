@@ -423,6 +423,7 @@ class MLPSCM(nn.Module):
         self.group_bases: dict[str, dict[str, torch.Tensor]] = {}
         self.parent_projectors = nn.ModuleDict()
         self.path_encoders = nn.ModuleDict()
+        self.archetype_params = archetype_params or {}
 
         if self.use_signal_group_features:
             _archetype_params = archetype_params or {}
