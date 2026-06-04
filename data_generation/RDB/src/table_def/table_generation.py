@@ -838,6 +838,17 @@ class Table:
                 # For float data types
                 df_dict[column_name] = data[:, i]
 
+        # Append X_mlp columns if available (pre-signal-group MLP features)
+        if hasattr(self, "data_x_mlp") and self.data_x_mlp is not None:
+            x_mlp_data = self.data_x_mlp.cpu().numpy()
+            for i in range(self.num_features):
+                processer_idx = i + self.num_cols - self.num_features
+                mlp_col_name = f"{self.column_names[processer_idx]}_mlp"
+                if self.data_type_configs[processer_idx].data_type == DataType.CATEGORICAL:
+                    df_dict[mlp_col_name] = np.round(x_mlp_data[:, i]).astype(np.int32)
+                elif self.data_type_configs[processer_idx].data_type == DataType.FLOAT:
+                    df_dict[mlp_col_name] = x_mlp_data[:, i]
+
         self.dataframe = pd.DataFrame(df_dict)
         return self.dataframe
 
@@ -861,17 +872,22 @@ class Table:
         # Handle dict input from temporal sampling
         from src.prior.utils import MASK_TYPE
 
+        x_mlp_raw = None
         timestamp_values = None
         if isinstance(raw_data, dict):
             # Extract timestamp if available
             if MASK_TYPE.TIMESTAMP in raw_data:
                 timestamp_values = raw_data[MASK_TYPE.TIMESTAMP]
+            # Save X_mlp for paired diagnostic (pre-signal-group MLP features)
+            if MASK_TYPE.X_MLP in raw_data:
+                x_mlp_raw = raw_data[MASK_TYPE.X_MLP]
             raw_data = raw_data[MASK_TYPE.X]
 
         assert raw_data.shape[0] == self.num_rows
         assert raw_data.shape[1] == self.num_features
 
         self.data = torch.zeros(self.num_rows, self.num_cols, device=self.device)
+        self.data_x_mlp = None
 
         # Set PK first
         self.data[:, 0] = torch.arange(self.num_rows, device=self.device)
@@ -907,6 +923,18 @@ class Table:
             self.data[:, processer_idx] = self.column_data_processors[
                 processer_idx
             ].process_data(raw_data[:, i], data_type_config)
+
+        # Process X_mlp features through the same column processors
+        if x_mlp_raw is not None:
+            self.data_x_mlp = torch.zeros(self.num_rows, self.num_features, device=self.device)
+            for i in range(self.num_features):
+                processer_idx = i + self.num_cols - self.num_features
+                if self.time_column is not None and processer_idx == self.time_column:
+                    continue
+                data_type_config = self.data_type_configs[processer_idx]
+                self.data_x_mlp[:, i] = self.column_data_processors[
+                    processer_idx
+                ].process_data(x_mlp_raw[:, i], data_type_config)
 
         return self.data
 
@@ -1085,6 +1113,9 @@ class TableGenerator:
         # key = parent_table_name, value = sampled parameter value.
         self.hsbm_num_levels: Dict[str, int] = {}
         self.hsbm_clusters_per_level: Dict[str, int] = {}
+        # FK sparsity config — per parent relation.
+        self.hsbm_fk_sparsity_min: Dict[str, float] = {}
+        self.hsbm_fk_sparsity_max: Dict[str, float] = {}
         # FK Propensity params (table-level, used for single-parent)
         self.propensity_rho: float = 0.0
         self.propensity_beta: float = 0.0
@@ -1103,6 +1134,12 @@ class TableGenerator:
                 self.hsbm_clusters_per_level[parent_name] = params[
                     "hsbm_clusters_per_level"
                 ]
+                self.hsbm_fk_sparsity_min[parent_name] = params.get(
+                    "hsbm_fk_sparsity_min", 0.0
+                )
+                self.hsbm_fk_sparsity_max[parent_name] = params.get(
+                    "hsbm_fk_sparsity_max", 0.0
+                )
 
         self.table_SCM = MLPSCM(
             **kwargs,
@@ -1194,6 +1231,21 @@ class TableGenerator:
             _, hierarchy_a = self._clip_hierarchy(nlv, cpl, parent_rows_val, child_rows)
             hierarchies_parent.append(hierarchy_a)
 
+        # Sample FK sparsity (null_prob) per parent relation
+        sparsity_rng = np.random.RandomState(
+            hash((fk_seed, "fk_sparsity")) & 0x7FFFFFFF
+        )
+        null_probs = []
+        for i in range(num_parents):
+            pname = parent_names[i] if parent_names and i < len(parent_names) else str(i)
+            sp_min = self.hsbm_fk_sparsity_min.get(pname, 0.0)
+            sp_max = self.hsbm_fk_sparsity_max.get(pname, 0.0)
+            if sp_max > 0:
+                p_null = sparsity_rng.uniform(max(sp_min, 0.0), sp_max)
+            else:
+                p_null = 0.0
+            null_probs.append(p_null)
+
         if num_parents == 1:
             use_propensity = self.propensity_rho > 0
             if use_propensity:
@@ -1209,6 +1261,7 @@ class TableGenerator:
                     propensity_rho=self.propensity_rho,
                     propensity_beta=self.propensity_beta,
                     seed=fk_seed,
+                    null_prob=null_probs[0],
                 )
             else:
                 fk_ids_np, block_paths_np = compute_hsbm_fk_ids(
@@ -1217,6 +1270,7 @@ class TableGenerator:
                     hierarchy_a=hierarchies_parent[0],
                     hierarchy_b=hierarchies_parent[0],
                     seed=fk_seed,
+                    null_prob=null_probs[0],
                 )
             fk_ids = torch.tensor(fk_ids_np, device=self.device).long().unsqueeze(-1)
             block_paths = torch.tensor(block_paths_np, device=self.device).long()
@@ -1241,6 +1295,7 @@ class TableGenerator:
                 matching_latent_dim=self.matching_latent_dim,
                 matching_temperature=self.matching_temperature,
                 seed=fk_seed,
+                null_probs=null_probs,
             )
         else:
             fk_ids_np, block_paths_np = compute_hsbm_fk_ids_multi(
@@ -1249,6 +1304,7 @@ class TableGenerator:
                 hierarchies_parent=hierarchies_parent,
                 hierarchy_child=hierarchy_child,
                 seed=fk_seed,
+                null_probs=null_probs,
             )
         fk_ids = torch.tensor(fk_ids_np, device=self.device).long()
         block_paths = torch.tensor(block_paths_np, device=self.device).long()
@@ -1286,7 +1342,11 @@ class TableGenerator:
         for p_idx in range(num_parents):
             if parent_is_time_table[p_idx] and MASK_TYPE.TIMESTAMP in parent_data_list[p_idx]:
                 p_ts = parent_data_list[p_idx][MASK_TYPE.TIMESTAMP].squeeze(-1)  # (N_p,)
-                row_ts = p_ts[fk_ids[:, p_idx].long()]  # (child_rows,)
+                parent_idx = fk_ids[:, p_idx].long()
+                null_mask = parent_idx < 0
+                safe_idx = parent_idx.clamp(min=0)
+                row_ts = p_ts[safe_idx]  # (child_rows,)
+                row_ts[null_mask] = 0.0  # FK=-1 rows get earliest possible t_min
                 parent_ts_list.append(row_ts)
 
         if parent_ts_list:
@@ -1725,9 +1785,15 @@ class RDB:
             hsbm_per_parent: Dict[str, Dict[str, int]] = {}
             for parent_name in parent_tables:
                 hsbm_sample = hsbm_sampler.sample()
+                sp_min = hsbm_sample.get("hsbm_fk_sparsity_min", 0.0)
+                sp_max = hsbm_sample.get("hsbm_fk_sparsity_max", 0.0)
+                sp_min = sp_min() if callable(sp_min) else sp_min
+                sp_max = sp_max() if callable(sp_max) else sp_max
                 hsbm_per_parent[parent_name] = {
                     "hsbm_num_levels": hsbm_sample["hsbm_num_levels"],
                     "hsbm_clusters_per_level": hsbm_sample["hsbm_clusters_per_level"],
+                    "hsbm_fk_sparsity_min": sp_min,
+                    "hsbm_fk_sparsity_max": sp_max,
                 }
                 # FK Propensity params (table-level, extract from first parent)
                 if len(parent_tables) == 1:
@@ -1828,6 +1894,17 @@ class RDB:
             combined_params["relation_keys"] = relation_keys
             combined_params["parent_causal_dims"] = parent_causal_dims
             combined_params["levels_per_edge"] = levels_per_edge
+
+            # Per-column MLP parameters (consumed by MLPSCM._init_percol_mlps)
+            # use_percol_mlp and percol_mlp_num_layers sampled via DEFAULT_SAMPLED_HP
+            use_percol_mlp_val = combined_params.get("use_percol_mlp", False)
+            percol_mlp_num_layers_val = combined_params.get("percol_mlp_num_layers", 3)
+            combined_params["use_percol_mlp"] = use_percol_mlp_val
+            combined_params["percol_mlp_hp"] = {
+                "percol_mlp_num_layers": percol_mlp_num_layers_val,
+                "percol_mlp_hidden_dim": 32,
+                "percol_mlp_activation": None,  # resolved in MLPSCM._init_percol_mlps
+            }
 
             # Create separate mask dictionaries for different purposes
             # For SCM: use original MASK_TYPE enums
@@ -2233,6 +2310,17 @@ class RDB:
                     df_dict[col_name] = datetime64_values
                 else:
                     df_dict[col_name] = data_np[:, i].astype(np.float32)
+
+            # Append X_mlp columns if available (pre-signal-group MLP features)
+            if hasattr(table, "data_x_mlp") and table.data_x_mlp is not None:
+                x_mlp_data = table.data_x_mlp.cpu().numpy()
+                for i in range(table.num_features):
+                    processer_idx = i + table.num_cols - table.num_features
+                    mlp_col_name = f"{table.column_names[processer_idx]}_mlp"
+                    if table.data_type_configs[processer_idx].data_type == DataType.CATEGORICAL:
+                        df_dict[mlp_col_name] = np.round(x_mlp_data[:, i]).astype(np.int32)
+                    elif table.data_type_configs[processer_idx].data_type == DataType.FLOAT:
+                        df_dict[mlp_col_name] = x_mlp_data[:, i].astype(np.float32)
 
             df = pd.DataFrame(df_dict)
             df.to_parquet(table_file_path, index=False)
