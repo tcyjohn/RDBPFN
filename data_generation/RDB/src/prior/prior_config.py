@@ -226,6 +226,10 @@ DEFAULT_SAMPLED_HP = {
         "distribution": "meta_choice",
         "choice_values": [True],
     },
+    "percol_mlp_num_layers": {
+        "distribution": "meta_choice",
+        "choice_values": [2, 3, 4],
+    },
     "archetype_perturb_std": {
         "distribution": "uniform",
         "min": 0.05,
