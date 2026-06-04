@@ -312,6 +312,9 @@ class MLPSCM(nn.Module):
         basis_family_rho: float = 0.7,
         # Experiment flag: skip signal-group, use raw MLP X directly
         _exp_skip_sg: bool = False,
+        # Per-column nonlinear MLP (replaces linear SG basis when active)
+        use_percol_mlp: bool = False,
+        percol_mlp_hp: dict | None = None,
         **kwargs: Dict[str, Any],
     ):
         super(MLPSCM, self).__init__()
@@ -391,6 +394,8 @@ class MLPSCM(nn.Module):
         self._exp_skip_sg = _exp_skip_sg or (
             os.environ.get("EXP_SKIP_SG", "0") == "1"
         )
+        self.use_percol_mlp = use_percol_mlp
+        self.percol_mlp_hp = percol_mlp_hp or {}
 
         # --- Experiment: parameter ablation overrides (env-var controlled) ---
         # These must run BEFORE the signal-group init block below,
@@ -440,6 +445,10 @@ class MLPSCM(nn.Module):
             self._init_parent_projectors(_relation_keys, _parent_causal_dims)
             self._init_path_encoders(_relation_keys, _levels_per_edge)
             self._init_cross_feature_coupling(n_feat)
+
+            # --- Per-column MLP init (replaces SG basis when active) ---
+            if self.use_percol_mlp:
+                self._init_percol_mlps(masks)
 
         if self.is_causal:
             total_features = masks[MASK_TYPE.X]
@@ -1404,6 +1413,61 @@ class MLPSCM(nn.Module):
         self._basis_subspaces["intrinsic"] = subspaces_intrinsic
 
         return group_bases
+
+    def _init_percol_mlps(self, masks: dict) -> None:
+        """Initialize per-column random nonlinear MLPs for feature generation.
+
+        Each feature column j gets its own MLP_j with independent random weights.
+        Input signals are selected by archetype and concatenated.
+        """
+        from .activations import get_activations
+
+        hp = self.percol_mlp_hp
+        num_layers = hp.get("percol_mlp_num_layers", 3)
+        hidden_dim = hp.get("percol_mlp_hidden_dim", 32)
+        init_std = self.init_std
+        n_features = masks.get(MASK_TYPE.X, 12)
+
+        # Resolve activation functions
+        act_choices = hp.get("percol_mlp_activation", get_activations(
+            random=True, scale=True, diverse=True,
+        ))
+        if isinstance(act_choices, list):
+            activations = [act() if callable(act) else act for act in act_choices]
+        elif callable(act_choices):
+            activations = [act_choices() for _ in range(num_layers - 1)]
+        else:
+            activations = [act_choices] * (num_layers - 1)
+
+        # Pad/trim activations to match num_layers - 1
+        while len(activations) < num_layers - 1:
+            activations.append(activations[-1])
+        activations = activations[:num_layers - 1]
+
+        # Compute input dimension from archetype
+        ap = self.archetype_params or {}
+        is_source = ap.get("is_source", False)
+        is_timestamp = ap.get("is_timestamp", False)
+        dim = 0
+        if is_timestamp:
+            dim += 11  # time_basis(8) + time_gates(3)
+        if not is_source:
+            dim += 12 + 8  # parent_sig(12) + path_sig(8)
+        dim += self.intrinsic_dim  # intrinsic always present
+        self._percol_input_dim = dim
+
+        self.percol_mlps = nn.ModuleList()
+        for j in range(n_features):
+            seed = hash((id(self), j)) & 0x7FFFFFFF
+            mlp_j = PerColumnMLP(
+                in_dim=self._percol_input_dim,
+                hidden_dim=hidden_dim,
+                num_layers=num_layers,
+                activations=activations,
+                init_std=init_std,
+                seed=seed,
+            )
+            self.percol_mlps.append(mlp_j)
 
     def _init_parent_projectors(
         self,
