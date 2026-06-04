@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import random
 import warnings
 from collections import namedtuple
@@ -119,6 +120,63 @@ class PathEncoder(nn.Module):
             embeds.append(self.embeddings[l](block_paths[:, l]))
         concat = torch.cat(embeds, dim=-1)
         return self.projection(concat)
+
+
+class PerColumnMLP(nn.Module):
+    """Per-column random nonlinear MLP for feature diversity.
+
+    Takes concatenated normalized signals and produces a scalar feature value.
+    Weights are randomly initialized and FIXED (not trained).
+
+    Parameters
+    ----------
+    in_dim : int
+        Input dimension (varies by archetype: 12/32/43).
+    hidden_dim : int
+        Hidden layer dimension (fixed at 32).
+    num_layers : int
+        Total layers including input and output (2-4).
+    activations : list[nn.Module]
+        Per-hidden-layer activation functions.
+    init_std : float
+        Weight init std for all Linear layers.
+    seed : int
+        RNG seed for deterministic weight init.
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int,
+        num_layers: int,
+        activations: list,
+        init_std: float,
+        seed: int,
+    ):
+        super().__init__()
+        assert num_layers >= 2, "num_layers must be >= 2"
+        assert len(activations) == num_layers - 1, (
+            f"Need {num_layers - 1} activations, got {len(activations)}"
+        )
+
+        g = torch.Generator()
+        g.manual_seed(seed)
+
+        self.layers = nn.ModuleList()
+        dims = [in_dim] + [hidden_dim] * (num_layers - 1) + [1]
+        for i in range(num_layers):
+            linear = nn.Linear(dims[i], dims[i + 1], bias=True)
+            nn.init.normal_(linear.weight, std=init_std)
+            nn.init.zeros_(linear.bias)
+            self.layers.append(linear)
+            if i < num_layers - 1:
+                self.layers.append(activations[i])
+
+    def forward(self, x):
+        """x: (seq_len, in_dim) -> (seq_len, 1)"""
+        for layer in self.layers:
+            x = layer(x)
+        return x
 
 
 class MLPSCM(nn.Module):
@@ -252,6 +310,8 @@ class MLPSCM(nn.Module):
         basis_perturb_eta: float = 0.0,
         num_basis_families: int = 2,
         basis_family_rho: float = 0.7,
+        # Experiment flag: skip signal-group, use raw MLP X directly
+        _exp_skip_sg: bool = False,
         **kwargs: Dict[str, Any],
     ):
         super(MLPSCM, self).__init__()
@@ -328,6 +388,30 @@ class MLPSCM(nn.Module):
         self.basis_perturb_eta = basis_perturb_eta
         self.num_basis_families = num_basis_families
         self.basis_family_rho = basis_family_rho
+        self._exp_skip_sg = _exp_skip_sg or (
+            os.environ.get("EXP_SKIP_SG", "0") == "1"
+        )
+
+        # --- Experiment: parameter ablation overrides (env-var controlled) ---
+        # These must run BEFORE the signal-group init block below,
+        # because basis_perturb_eta is used in _sample_feature_groups(),
+        # and coupling_lambda/max_groups_per_feature/archetype_perturb_std
+        # affect init-time ops (_init_cross_feature_coupling, etc.).
+        if os.environ.get("EXP_ZERO_BASIS_PERTURB", "0") == "1":
+            self.basis_perturb_eta = 0.0
+        if os.environ.get("EXP_ZERO_COUPLING", "0") == "1":
+            self.coupling_lambda = 0.0
+        if os.environ.get("EXP_ZERO_RESIDUAL", "0") == "1":
+            self.residual_sigma = 0.0
+        if os.environ.get("EXP_UNIFORM_SCALE", "0") == "1":
+            self.group_scale_time = 1.0
+            self.group_scale_parent = 1.0
+            self.group_scale_path = 1.0
+            self.group_scale_intrinsic = 1.0
+        if os.environ.get("EXP_NO_ALPHA_PERTURB", "0") == "1":
+            self.archetype_perturb_std = 0.0
+        if os.environ.get("EXP_MAX_GROUPS_1", "0") == "1":
+            self.max_groups_per_feature = 1
 
         self.alpha_final: torch.Tensor | None = None
         self.feature_assignments: list[dict] = []
@@ -642,7 +726,14 @@ class MLPSCM(nn.Module):
             if torch.any(torch.isnan(value)):
                 value[:] = 0.0
 
-        if self.use_signal_group_features:
+        if self.use_signal_group_features and not self._exp_skip_sg:
+            # Save MLP original X before overwrite, for diagnostic comparison
+            X_mlp = X[MASK_TYPE.X].clone()
+            self._x_causal_corr_mlp = self._compute_x_causal_corr(
+                X_mlp, X[MASK_TYPE.CAUSAL_OUTPUT],
+            )
+            X[MASK_TYPE.X_MLP] = X_mlp
+
             self._cached_time_features = time_features if self.time_dim > 0 else None
 
             time_sig_raw = self._build_time_signal()
@@ -665,6 +756,10 @@ class MLPSCM(nn.Module):
             X_sg = self._construct_features(signals, self.residual_sigma)
             X_sg = self._apply_cross_feature_coupling(X_sg)
             X[MASK_TYPE.X] = X_sg
+
+        # Diagnostic: per-feature max |pearsonr| with CAUSAL_OUTPUT
+        self._x_causal_corr = self._compute_x_causal_corr(
+            X[MASK_TYPE.X], X[MASK_TYPE.CAUSAL_OUTPUT])
 
         # Return both masked outputs and full outputs for TableGenerator
         return X, outputs_flat
@@ -704,7 +799,10 @@ class MLPSCM(nn.Module):
 
         for i, parent_table_data in enumerate(parent_data_list):
             parent_idx = fk_ids[:, i]
-            parent_causes = parent_table_data[MASK_TYPE.CAUSAL_OUTPUT][parent_idx]
+            null_mask = (parent_idx < 0).unsqueeze(-1)
+            safe_idx = parent_idx.clamp(min=0)
+            parent_causes = parent_table_data[MASK_TYPE.CAUSAL_OUTPUT][safe_idx]
+            parent_causes = parent_causes * (~null_mask).float()  # FK=-1 → zero
             causes = torch.cat([causes, parent_causes], dim=-1)
 
         assert causes.shape[0] == self.seq_len, (
@@ -730,7 +828,14 @@ class MLPSCM(nn.Module):
             if torch.any(torch.isnan(value)):
                 value[:] = 0.0
 
-        if self.use_signal_group_features:
+        if self.use_signal_group_features and not self._exp_skip_sg:
+            # Save MLP original X before overwrite, for diagnostic comparison
+            X_mlp = X[MASK_TYPE.X].clone()
+            self._x_causal_corr_mlp = self._compute_x_causal_corr(
+                X_mlp, X[MASK_TYPE.CAUSAL_OUTPUT],
+            )
+            X[MASK_TYPE.X_MLP] = X_mlp
+
             # --- Signal-group feature construction ---
             # Cache time features for _build_time_signal
             self._cached_time_features = time_features if self.time_dim > 0 else None
@@ -757,14 +862,19 @@ class MLPSCM(nn.Module):
             X_sg = self._apply_cross_feature_coupling(X_sg)
             X[MASK_TYPE.X] = X_sg
 
-        else:
+        elif not self.use_signal_group_features:
             # Old path: parent feature explicit injection
             if self.parent_injection_scale > 0:
                 parent_parts = []
                 for i, parent_data in enumerate(parent_data_list):
                     if MASK_TYPE.FULL in parent_data:
                         parent_full = parent_data[MASK_TYPE.FULL]
-                        parent_parts.append(parent_full[fk_ids[:, i]])
+                        parent_idx = fk_ids[:, i]
+                        null_mask = (parent_idx < 0).unsqueeze(-1)
+                        safe_idx = parent_idx.clamp(min=0)
+                        parent_feat = parent_full[safe_idx]
+                        parent_feat = parent_feat * (~null_mask).float()
+                        parent_parts.append(parent_feat)
                 if parent_parts:
                     parent_flat = torch.cat(parent_parts, dim=-1)
                     n_feat = X[MASK_TYPE.X].shape[1]
@@ -773,6 +883,10 @@ class MLPSCM(nn.Module):
                         w = torch.randn(D, device=self.device)
                         w = w * (self.parent_injection_scale / (D**0.5))
                         X[MASK_TYPE.X][:, j] += parent_flat @ w
+
+        # Diagnostic: per-feature max |pearsonr| with CAUSAL_OUTPUT
+        self._x_causal_corr = self._compute_x_causal_corr(
+            X[MASK_TYPE.X], X[MASK_TYPE.CAUSAL_OUTPUT])
 
         return X, fk_ids, outputs_flat
 
@@ -1348,7 +1462,11 @@ class MLPSCM(nn.Module):
         edge_outputs = []
         for i in range(num_parents):
             parent_data = parent_data_list[i]
-            parent_rows = parent_data[MASK_TYPE.CAUSAL_OUTPUT][fk_ids[:, i]]
+            parent_idx = fk_ids[:, i]
+            null_mask = (parent_idx < 0).unsqueeze(-1)
+            safe_idx = parent_idx.clamp(min=0)
+            parent_rows = parent_data[MASK_TYPE.CAUSAL_OUTPUT][safe_idx]
+            parent_rows = parent_rows * (~null_mask).float()  # FK=-1 → zero
             projector = list(self.parent_projectors.values())[i]
             edge_outputs.append(projector(parent_rows))
 
@@ -1561,6 +1679,43 @@ class MLPSCM(nn.Module):
             return X_struct
         return X_struct + self.coupling_lambda * (X_struct @ self._coupling_W)
 
+    def _compute_x_causal_corr(
+        self, x: torch.Tensor, causal: torch.Tensor,
+    ) -> dict:
+        """Compute per-feature max |pearsonr| with any CAUSAL_OUTPUT dimension.
+
+        Returns a dict with per-feature stats for diagnostic comparison.
+        """
+        x_np = x.detach().cpu().numpy()  # (seq_len, n_features)
+        causal_np = causal.detach().cpu().numpy()  # (seq_len, num_outputs)
+
+        n_feat = x_np.shape[1]
+        per_feat_corr = []
+        for j in range(n_feat):
+            xj = x_np[:, j]
+            # Max |pearsonr| across all causal output dims
+            max_corr = 0.0
+            for c in range(causal_np.shape[1]):
+                xc = causal_np[:, c]
+                # Skip constant columns
+                if xj.std() < 1e-8 or xc.std() < 1e-8:
+                    continue
+                corr = abs(float(np.corrcoef(xj, xc)[0, 1]))
+                if corr > max_corr:
+                    max_corr = corr
+            per_feat_corr.append(max_corr)
+
+        arr = np.array(per_feat_corr)
+        return {
+            "per_feature": arr.tolist(),
+            "mean": float(arr.mean()),
+            "std": float(arr.std()),
+            "p10": float(np.percentile(arr, 10)),
+            "p50": float(np.percentile(arr, 50)),
+            "p90": float(np.percentile(arr, 90)),
+            "mode": "skip_sg" if self._exp_skip_sg else "signal_group",
+        }
+
     def get_feature_diagnostics(self) -> dict:
         """Return feature assignment metadata for post-hoc analysis."""
         K = getattr(self, "_K_PER_GROUP", None)
@@ -1593,6 +1748,9 @@ class MLPSCM(nn.Module):
                 "intrinsic": self.group_scale_intrinsic,
             },
             "residual_sigma": self.residual_sigma,
+            "x_causal_corr": getattr(self, "_x_causal_corr", None),
+            "x_causal_corr_mlp": getattr(self, "_x_causal_corr_mlp", None),
+            "mode": "skip_sg" if self._exp_skip_sg else "signal_group",
         }
 
 
