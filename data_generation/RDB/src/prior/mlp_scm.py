@@ -1436,9 +1436,9 @@ class MLPSCM(nn.Module):
         n_features = masks.get(MASK_TYPE.X, 12)
 
         # Resolve activation functions
-        act_choices = hp.get("percol_mlp_activation", get_activations(
+        act_choices = hp.get("percol_mlp_activation") or get_activations(
             random=True, scale=True, diverse=True,
-        ))
+        )
         if isinstance(act_choices, list):
             activations = [act() if callable(act) else act for act in act_choices]
         elif callable(act_choices):
