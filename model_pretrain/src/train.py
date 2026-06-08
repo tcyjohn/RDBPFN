@@ -23,7 +23,7 @@ from .models import (
 )
 from .training import ColumnModificationConfig, train
 from accelerate import Accelerator
-from accelerate.utils import set_seed
+from accelerate.utils import DistributedDataParallelKwargs, set_seed
 
 from .utils import set_randomness_seed
 
@@ -71,6 +71,8 @@ class TrainConfig:
     )
     num_gpus: int | None = None
     gradient_accumulation_steps: int = 1
+    full_eval_steps: int = 0  # Run full relational eval every N steps (0=disabled)
+    full_eval_dataset_dir: str = ""  # Dir of DBBRDBDataset subdirs (e.g. rdb_datasets)
 
 
 @dataclass
@@ -173,7 +175,10 @@ def _log_training_schedule(train_cfg: TrainConfig, world_size: int):
 @hydra.main(config_path="../conf_train", config_name="config", version_base=None)
 def main(cfg: Config):
     grad_accum_steps = max(1, int(getattr(cfg.train, "gradient_accumulation_steps", 1)))
-    accelerator = Accelerator(gradient_accumulation_steps=grad_accum_steps)
+    accelerator = Accelerator(
+        gradient_accumulation_steps=grad_accum_steps,
+        kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)],
+    )
     set_seed(cfg.seed)
     _validate_model_config(cfg.model)
 
@@ -393,6 +398,8 @@ def main(cfg: Config):
         per_dataset_group_size=dataset_group_sizes,
         per_dataset_column_modify_config=dataset_column_modify_config,
         accelerator=accelerator,
+        full_eval_steps=cfg.train.full_eval_steps,
+        full_eval_dataset_dir=cfg.train.full_eval_dataset_dir,
     )
     if accelerator.is_main_process:
         final_metrics = eval_fn(build_classifier(model, device, cfg.model))

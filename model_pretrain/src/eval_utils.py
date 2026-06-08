@@ -208,7 +208,7 @@ def evaluate_classifier(classifier, splits_by_dir: dict[str, list]):
     return scores
 
 
-def load_task_split(task: DBBRDBTask, split: str) -> Tuple[np.ndarray, np.ndarray]:
+def load_task_split(task: DBBRDBTask, split: str) -> Tuple[np.ndarray, np.ndarray, list[int]]:
     if split == "train":
         source = task.train_set
     elif split in {"val", "validation"}:
@@ -226,18 +226,23 @@ def load_task_split(task: DBBRDBTask, split: str) -> Tuple[np.ndarray, np.ndarra
         if (
             col.dtype == DBBColumnDType.float_t
             or col.dtype == DBBColumnDType.category_t
+            or col.dtype == DBBColumnDType.foreign_key
         )
         and col.name != target_col
-        # # If a column is feature includes max, min, sum, remove it
-        # and not any(sub in col.name for sub in ("MAX", "MIN", "SUM"))
     ]
-    # print(feature_cols)
     if not feature_cols:
         raise ValueError(f"Task {task.metadata.name} has no feature columns")
     feature_cols.sort()
+    # Track which selected features are FK columns
+    fk_set = {
+        col.name
+        for col in task.metadata.columns
+        if col.dtype == DBBColumnDType.foreign_key
+    }
+    fk_column_indices = [i for i, name in enumerate(feature_cols) if name in fk_set]
     X = np.column_stack([source[col] for col in feature_cols]).astype(np.float32)
     y = np.asarray(source[target_col])
-    return X, y
+    return X, y, fk_column_indices
 
 
 def downsample_split(

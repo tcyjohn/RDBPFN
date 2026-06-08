@@ -390,4 +390,29 @@ DEFAULT_HSBM_HP = {
         "distribution": "meta_choice",
         "choice_values": [0.10, 0.20, 0.35, 0.50],
     },
+    "hsbm_fk_sparsity_min": {
+        "distribution": "uniform",
+        "min": 0.0,
+        "max": 0.15,
+    },
+    "hsbm_fk_sparsity_max": {
+        "distribution": "uniform",
+        "min": 0.05,
+        "max": 0.35,
+    },
+}
+
+# Homophily-controlled label diversity hyperparameters.
+# Based on OPENRFM (arXiv:2606.04320) Appendix G.
+DEFAULT_HOMOPHILY_HP = {
+    # Per-RDB homophily target grid: K=20 values uniformly spanning [-1, +1].
+    "homophily_grid_size": 20,
+    # Probability a given task table uses homophily-controlled label (vs. original).
+    "prob_use_homophily": 0.5,
+    # Number of feature columns pooled for pseudo-block construction.
+    "feature_pool_size": 5,
+    # Number of parent-level pseudo-blocks (when HSBM blocks unavailable).
+    "pseudo_n_parent": 2,
+    # Number of child-level pseudo-blocks (when HSBM blocks unavailable).
+    "pseudo_n_child": 4,
 }

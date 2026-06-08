@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from typing import List, Sequence
@@ -41,6 +42,11 @@ class InMemoryDataset(Dataset):
             if "feature_is_categorical" in self._file
             else None
         )
+        self.fk_column_indices: list[list[int]] = (
+            json.loads(self._file.attrs["fk_column_indices"])
+            if "fk_column_indices" in self._file.attrs
+            else []
+        )
 
         self.dataset_size = self.X.shape[0]
         if self.output_log:
@@ -78,6 +84,17 @@ class InMemoryDataset(Dataset):
         num_feat = int(self.num_features[idx])
         num_rows = int(self.num_datapoints[idx])
 
+        fk_indices = (
+            self.fk_column_indices[idx]
+            if idx < len(self.fk_column_indices)
+            else []
+        )
+        if fk_indices:
+            fk_vals_np = self.X[idx, :num_rows, fk_indices].astype(np.int64)
+            fk_values = torch.from_numpy(fk_vals_np)
+        else:
+            fk_values = torch.zeros(num_rows, 0, dtype=torch.long)
+
         sample = {
             "x": torch.from_numpy(self.X[idx, :num_rows, :num_feat]),
             "y": torch.from_numpy(self.y[idx, :num_rows]),
@@ -91,6 +108,8 @@ class InMemoryDataset(Dataset):
                 ),
                 dtype=torch.long,
             ),
+            "fk_column_indices": fk_indices,
+            "fk_values": fk_values,
         }
 
         # if self.feature_is_categorical is not None:
@@ -125,6 +144,19 @@ def collate_batch(batch: List[dict]) -> dict:
     #         dtype=batch[0]["category_mask"].dtype,
     #     )
 
+    has_fk_values = any(
+        sample.get("fk_values") is not None and sample["fk_values"].shape[-1] > 0
+        for sample in batch
+    )
+    if has_fk_values:
+        max_fk_cols = max(
+            sample.get("fk_values", torch.zeros(0, 0)).shape[-1]
+            for sample in batch
+        )
+        fk_out = torch.full(
+            (batch_size, max_rows, max_fk_cols), -1, dtype=torch.long,
+        )
+
     for idx, sample in enumerate(batch):
         rows, feats = sample["x"].shape
         x_out[idx, :rows, :feats] = sample["x"]
@@ -132,8 +164,11 @@ def collate_batch(batch: List[dict]) -> dict:
         num_features[idx] = sample["num_features"]
         num_available[idx] = sample["num_available_features"]
 
-        # if has_category_mask:
-        #     category_mask_out[idx, :feats] = sample["category_mask"]
+        if has_fk_values:
+            fk = sample.get("fk_values")
+            if fk is not None and fk.shape[-1] > 0:
+                fk_rows, fk_cols = fk.shape
+                fk_out[idx, :fk_rows, :fk_cols] = fk
 
     collated = {
         "x": x_out,
@@ -142,6 +177,8 @@ def collate_batch(batch: List[dict]) -> dict:
         "num_features": num_features,
         "num_available_features": num_available,
     }
+    if has_fk_values:
+        collated["fk_values"] = fk_out
 
     # if has_category_mask and category_mask_out is not None:
     #     collated["category_mask"] = category_mask_out

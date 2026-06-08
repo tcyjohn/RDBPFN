@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 
 import h5py
@@ -11,6 +12,31 @@ from .utils import get_default_device
 
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_fk_values(
+    X: h5py.Dataset,
+    indices: np.ndarray,
+    fk_indices_per_sample: list[list[int]],
+    max_rows: int,
+) -> torch.Tensor:
+    """Extract FK column values from H5 X dataset for a batch.
+
+    Returns (B, max_rows, max_fk_cols) LongTensor padded with -1 for
+    samples with no FK columns or fewer FK columns than the max.
+    """
+    max_fk_cols = max((len(fi) for fi in fk_indices_per_sample), default=0)
+    if max_fk_cols == 0:
+        return torch.zeros(len(indices), max_rows, 0, dtype=torch.long)
+
+    B = len(indices)
+    fk_vals = torch.full((B, max_rows, max_fk_cols), -1, dtype=torch.long)
+    for b, (ds_idx, fk_idx_list) in enumerate(zip(indices, fk_indices_per_sample)):
+        if not fk_idx_list:
+            continue
+        vals = X[ds_idx, :max_rows, fk_idx_list].astype(np.int64)
+        fk_vals[b, :, :len(fk_idx_list)] = torch.from_numpy(vals)
+    return fk_vals
 
 
 class PriorDumpDataLoader(DataLoader):
@@ -27,6 +53,8 @@ class PriorDumpDataLoader(DataLoader):
             self.dataset_size = f["X"].shape[0]
             self.has_category_mask = "feature_is_categorical" in f
             self.has_available_features = "num_available_features" in f
+            fk_raw = f.attrs.get("fk_column_indices", "[]")
+            self.fk_column_indices: list[list[int]] = json.loads(fk_raw) if isinstance(fk_raw, str) else list(fk_raw)
         self.pointer = start_index % self.dataset_size
         if start_index > 0:
             logger.info("Starting dataset iteration from index %d", self.pointer)
@@ -93,6 +121,15 @@ class PriorDumpDataLoader(DataLoader):
             if self.pointer <= prev_pointer:
                 logger.info("Finished iteration over all stored datasets!")
 
+            # Extract FK values for FK attention bias
+            fk_indices_for_batch = [
+                self.fk_column_indices[i] if i < len(self.fk_column_indices) else []
+                for i in indices
+            ]
+            fk_values = _extract_fk_values(
+                f["X"], indices, fk_indices_for_batch, max_seq_in_batch,
+            )
+
             batch = dict(
                 x=x.to(self.device),
                 y=y.to(self.device),
@@ -102,6 +139,8 @@ class PriorDumpDataLoader(DataLoader):
             )
             if category_mask is not None:
                 batch["category_mask"] = category_mask.to(self.device)
+            if any(fk_indices_for_batch):
+                batch["fk_values"] = fk_values.to(self.device)
             yield batch
             step_counter += 1
 

@@ -17,6 +17,70 @@ from torch.nn.modules.utils import consume_prefix_in_state_dict_if_present
 logger = logging.getLogger(__name__)
 
 
+class FKAttentionBias(nn.Module):
+    """Learnable FK-aware attention bias for between-datapoints attention.
+
+    For each FK column j, adds λ_j * I[fk_i == fk_k] to attention scores,
+    letting rows that share the same FK value attend more strongly to each other.
+
+    λ_j is softplus-constrained to stay positive.
+    """
+
+    def __init__(self, max_fk_cols: int = 8, init_lambda: float = 0.1):
+        super().__init__()
+        raw_init = float(np.log(np.exp(init_lambda) - 1))  # invert softplus
+        self.raw_lambdas = nn.Parameter(torch.full((max_fk_cols,), raw_init))
+
+    def forward(
+        self,
+        fk_values: torch.Tensor,
+        train_rows: int,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Compute FK attention bias matrices.
+
+        Args:
+            fk_values: (B, total_rows, num_fk_cols) long tensor, -1 for null FK.
+            train_rows: number of support rows.
+
+        Returns:
+            (bias_left, bias_right) — each is (B, tr, tr) or (B, te, tr), or
+            None when fk_values has no FK columns.
+        """
+        if fk_values is None or fk_values.shape[-1] == 0:
+            return None, None
+
+        B, total_rows, K = fk_values.shape
+        test_rows = total_rows - train_rows
+        lambdas = F.softplus(self.raw_lambdas[:K])  # (K,)
+
+        fk_train = fk_values[:, :train_rows, :]  # (B, tr, K)
+        fk_test = fk_values[:, train_rows:, :]    # (B, te, K)
+
+        # Mask: only match VALID (non-negative) FK values
+        valid_train = (fk_train >= 0)  # (B, tr, K)
+        valid_test = (fk_test >= 0)    # (B, te, K)
+
+        # bias_left: (B, tr, tr) — support↔support
+        match_left = (
+            fk_train.unsqueeze(2) == fk_train.unsqueeze(1)
+        ).float()  # (B, tr, tr, K)
+        both_valid_left = (
+            valid_train.unsqueeze(2) & valid_train.unsqueeze(1)
+        ).float()
+        bias_left = ((match_left * both_valid_left) * lambdas).sum(dim=-1)
+
+        # bias_right: (B, te, tr) — query→support
+        match_right = (
+            fk_test.unsqueeze(2) == fk_train.unsqueeze(1)
+        ).float()  # (B, te, tr, K)
+        both_valid_right = (
+            valid_test.unsqueeze(2) & valid_train.unsqueeze(1)
+        ).float()
+        bias_right = ((match_right * both_valid_right) * lambdas).sum(dim=-1)
+
+        return bias_left, bias_right
+
+
 @dataclass
 class ModelConfig:
     type: Literal["base", "categorical"] = "base"
@@ -31,6 +95,7 @@ class ModelConfig:
     invariant_noise_encoder: bool = False
     dual_feature_attention: bool = False
     category_as_numeric: bool = False
+    use_fk_bias: bool = False
 
 
 class FeatureEncoder(nn.Module):
@@ -82,6 +147,7 @@ class TransformerEncoderLayer(nn.Module):
         device=None,
         dtype=None,
         dual_feature_attention: bool = False,
+        use_fk_bias: bool = False,
     ):
         super().__init__()
         self.self_attention_between_datapoints = MultiheadAttention(
@@ -126,12 +192,14 @@ class TransformerEncoderLayer(nn.Module):
         self.norm3 = LayerNorm(
             embedding_size, eps=layer_norm_eps, device=device, dtype=dtype
         )
+        self.fk_bias = FKAttentionBias() if use_fk_bias else None
 
     def forward(
         self,
         src: torch.Tensor,
         train_test_split_index: int,
         category_mask: torch.Tensor | None = None,
+        fk_values: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch_size, rows_size, col_size, embedding_size = src.shape
         src = src.reshape(batch_size * rows_size, col_size, embedding_size)
@@ -154,15 +222,35 @@ class TransformerEncoderLayer(nn.Module):
         src = self.norm1(src)
         src = src.transpose(1, 2)
         src = src.reshape(batch_size * col_size, rows_size, embedding_size)
+
+        # FK attention bias (row-level → replicated across feature columns)
+        fk_bias_left, fk_bias_right = None, None
+        if self.fk_bias is not None and fk_values is not None:
+            fb_left, fb_right = self.fk_bias(fk_values, train_test_split_index)
+            if fb_left is not None:
+                # Handle batch mismatch from augmentation concatenation
+                fk_b = fb_left.shape[0]
+                if fk_b < batch_size:
+                    fb_left = fb_left.repeat(batch_size // fk_b, 1, 1)
+                    fb_right = fb_right.repeat(batch_size // fk_b, 1, 1)
+                # Expand from (B, tr, tr) to (B*C*nhead, tr, tr)
+                fb_left = fb_left.repeat_interleave(col_size, dim=0)
+                fb_right = fb_right.repeat_interleave(col_size, dim=0)
+                nhead = self.self_attention_between_datapoints.num_heads
+                fk_bias_left = fb_left.repeat_interleave(nhead, dim=0)
+                fk_bias_right = fb_right.repeat_interleave(nhead, dim=0)
+
         src_left = self.self_attention_between_datapoints(
             src[:, :train_test_split_index],
             src[:, :train_test_split_index],
             src[:, :train_test_split_index],
+            attn_mask=fk_bias_left,
         )[0]
         src_right = self.self_attention_between_datapoints(
             src[:, train_test_split_index:],
             src[:, :train_test_split_index],
             src[:, :train_test_split_index],
+            attn_mask=fk_bias_right,
         )[0]
         src = torch.cat([src_left, src_right], dim=1) + src
         src = src.reshape(batch_size, col_size, rows_size, embedding_size)
@@ -192,9 +280,11 @@ class NanoTabPFNModel(nn.Module):
         num_layers: int,
         num_outputs: int,
         dual_feature_attention: bool = False,
+        use_fk_bias: bool = False,
     ):
         super().__init__()
         self.dual_feature_attention = dual_feature_attention
+        self.use_fk_bias = use_fk_bias
         self.use_category_mask = False
         self.feature_encoder = FeatureEncoder(embedding_size)
         self.target_encoder = TargetEncoder(embedding_size)
@@ -205,6 +295,7 @@ class NanoTabPFNModel(nn.Module):
                     num_attention_heads,
                     mlp_hidden_size,
                     dual_feature_attention=dual_feature_attention,
+                    use_fk_bias=use_fk_bias,
                 )
                 for _ in range(num_layers)
             ]
@@ -212,7 +303,10 @@ class NanoTabPFNModel(nn.Module):
         self.decoder = Decoder(embedding_size, mlp_hidden_size, num_outputs)
 
     def forward(
-        self, src: tuple[torch.Tensor, torch.Tensor], train_test_split_index: int
+        self,
+        src: tuple[torch.Tensor, torch.Tensor],
+        train_test_split_index: int,
+        fk_values: torch.Tensor | None = None,
     ) -> torch.Tensor:
         x_src, y_src = src
         if len(y_src.shape) < len(x_src.shape):
@@ -227,6 +321,7 @@ class NanoTabPFNModel(nn.Module):
                 src,
                 train_test_split_index=train_test_split_index,
                 category_mask=category_mask,
+                fk_values=fk_values,
             )
         output = src[:, train_test_split_index:, -1, :]
         output = self.decoder(output)
@@ -354,6 +449,7 @@ class NanoTabPFNModelCategorical(NanoTabPFNModel):
         invariant_noise_encoder: bool = False,
         dual_feature_attention: bool = False,
         category_as_numeric: bool = False,
+        use_fk_bias: bool = False,
     ):
         super().__init__(
             embedding_size,
@@ -362,6 +458,7 @@ class NanoTabPFNModelCategorical(NanoTabPFNModel):
             num_layers,
             num_outputs,
             dual_feature_attention=dual_feature_attention,
+            use_fk_bias=use_fk_bias,
         )
         self.category_as_numeric = category_as_numeric
         if self.category_as_numeric:
@@ -383,6 +480,7 @@ class NanoTabPFNModelCategorical(NanoTabPFNModel):
         self,
         src: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         train_test_split_index: int,
+        fk_values: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if len(src) == 2:
             if not self.category_as_numeric or self.dual_feature_attention:
@@ -419,6 +517,7 @@ class NanoTabPFNModelCategorical(NanoTabPFNModel):
                 src,
                 train_test_split_index=train_test_split_index,
                 category_mask=feature_category_mask,
+                fk_values=fk_values,
             )
         output = src[:, train_test_split_index:, -1, :]
         output = self.decoder(output)
@@ -429,11 +528,21 @@ class NanoTabPFNClassifier:
     def __init__(self, model: NanoTabPFNModel, device: torch.device):
         self.model = model.to(device)
         self.device = device
+        self.fk_values: torch.Tensor | None = None
 
-    def fit(self, X_train: np.ndarray, y_train: np.ndarray):
+    def fit(
+        self,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        fk_values: np.ndarray | None = None,
+    ):
         self.X_train = X_train
         self.y_train = y_train
         self.num_classes = max(set(y_train)) + 1
+        if fk_values is not None:
+            self.fk_values = torch.from_numpy(fk_values).long().to(self.device)
+        else:
+            self.fk_values = None
 
     def predict_proba(self, X_test: np.ndarray) -> np.ndarray:
         x = np.concatenate((self.X_train, X_test))
@@ -441,9 +550,12 @@ class NanoTabPFNClassifier:
         with torch.no_grad():
             x = torch.from_numpy(x).unsqueeze(0).to(torch.float).to(self.device)
             y = torch.from_numpy(y).unsqueeze(0).to(torch.float).to(self.device)
-            out = self.model((x, y), train_test_split_index=len(self.X_train)).squeeze(
-                0
-            )
+            fk = self.fk_values.unsqueeze(0) if self.fk_values is not None else None
+            out = self.model(
+                (x, y),
+                train_test_split_index=len(self.X_train),
+                fk_values=fk,
+            ).squeeze(0)
             out = out[:, : self.num_classes]
             probabilities = F.softmax(out, dim=1)
             return probabilities.to("cpu").numpy()
@@ -463,8 +575,13 @@ class NanoTabPFNClassifierCategorical(NanoTabPFNClassifier):
         self.max_category_cardinality = max_category_cardinality
         self.category_mask: np.ndarray | None = None
 
-    def fit(self, X_train: np.ndarray, y_train: np.ndarray):
-        super().fit(X_train, y_train)
+    def fit(
+        self,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        fk_values: np.ndarray | None = None,
+    ):
+        super().fit(X_train, y_train, fk_values)
         num_features = X_train.shape[1]
         mask = np.zeros(num_features, dtype=np.uint8)
         for idx in range(num_features):
@@ -490,9 +607,11 @@ class NanoTabPFNClassifierCategorical(NanoTabPFNClassifier):
             y_tensor = (
                 torch.from_numpy(y).unsqueeze(0).to(torch.float32).to(self.device)
             )
+            fk = self.fk_values.unsqueeze(0) if self.fk_values is not None else None
             out = self.model(
                 (x_tensor, y_tensor, category_mask.to(self.device)),
                 train_test_split_index=len(self.X_train),
+                fk_values=fk,
             ).squeeze(0)
             out = out[:, : self.num_classes]
             probabilities = F.softmax(out, dim=1)
@@ -504,7 +623,12 @@ def load_checkpoint(model: torch.nn.Module, path: Path, device: str, output_log:
     checkpoint = torch.load(path, map_location=device)
     state_dict = checkpoint.get("model_state_dict", checkpoint)
     consume_prefix_in_state_dict_if_present(state_dict, "module.")
-    model.load_state_dict(state_dict)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if output_log:
+        if missing:
+            logger.warning("Missing keys in checkpoint (will use init values): %s", missing)
+        if unexpected:
+            logger.warning("Unexpected keys in checkpoint (ignored): %s", unexpected)
     has_optim = "optimizer_state_dict" in checkpoint
     if output_log:
         if has_optim:
@@ -515,6 +639,7 @@ def load_checkpoint(model: torch.nn.Module, path: Path, device: str, output_log:
 
 
 def build_model(model_cfg: ModelConfig):
+    use_fk_bias = getattr(model_cfg, "use_fk_bias", False)
     if model_cfg.type == "categorical":
         return NanoTabPFNModelCategorical(
             embedding_size=model_cfg.embedding_size,
@@ -528,6 +653,7 @@ def build_model(model_cfg: ModelConfig):
             invariant_noise_encoder=model_cfg.invariant_noise_encoder,
             dual_feature_attention=model_cfg.dual_feature_attention,
             category_as_numeric=model_cfg.category_as_numeric,
+            use_fk_bias=use_fk_bias,
         )
     return NanoTabPFNModel(
         embedding_size=model_cfg.embedding_size,
@@ -535,6 +661,7 @@ def build_model(model_cfg: ModelConfig):
         mlp_hidden_size=model_cfg.mlp_hidden_size,
         num_layers=model_cfg.num_layers,
         num_outputs=model_cfg.num_outputs,
+        use_fk_bias=use_fk_bias,
     )
 
 

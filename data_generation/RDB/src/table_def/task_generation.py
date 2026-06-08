@@ -45,6 +45,118 @@ from .task_generation_utils import (
     PredicateFunctionList,
 )
 
+# ---------------------------------------------------------------------------
+# Homophily-controlled label generation helpers
+# ---------------------------------------------------------------------------
+
+_HOMOPHILY_GRID = None  # lazily initialized per RDB generation
+
+
+def _get_homophily_grid(k: int = 20, seed: int = 0) -> list[float]:
+    """Return K evenly-spaced homophily targets on [-1, +1] excluding 0."""
+    rng = np.random.RandomState(seed)
+    # Slightly asymmetric to avoid exact ±1 boundary (well-defined XOR logic)
+    epsilon = 0.02
+    values = np.linspace(-1 + epsilon, 1 - epsilon, k + 1)
+    values = values[values != 0]  # exclude exact 0
+    if len(values) > k:
+        values = values[:k]
+    rng.shuffle(values)
+    return [float(v) for v in values]
+
+
+def _sample_homophily_target(rdb_index: int, grid_size: int = 20) -> float:
+    """Sample a homophily target h for an RDB from the global grid."""
+    global _HOMOPHILY_GRID
+    if _HOMOPHILY_GRID is None or len(_HOMOPHILY_GRID) != grid_size:
+        _HOMOPHILY_GRID = _get_homophily_grid(k=grid_size, seed=42)
+    return _HOMOPHILY_GRID[rdb_index % grid_size]
+
+
+def _maybe_apply_homophily_label(
+    rdb,
+    target_table_name: str,
+    target_column_name: str,
+    prob_use: float = 0.5,
+    rdb_index: int = 0,
+) -> dict | None:
+    """Conditionally replace a target column with a homophily-controlled label.
+
+    Args:
+        rdb: The RDB object.
+        target_table_name: Name of the target table.
+        target_column_name: Name of the original target column (used for feature pool).
+        prob_use: Probability of applying homophily (rest keep original column).
+        rdb_index: Index for deterministic h-target sampling.
+
+    Returns:
+        meta dict if homophily was applied, None otherwise.
+    """
+    from ..prior.homophily import (
+        HomophilyLabelGenerator,
+        get_block_assignments,
+    )
+
+    rng = np.random.RandomState(rdb_index + hash(target_table_name) % 10007)
+    if rng.random() > prob_use:
+        return None
+
+    # Guard against re-modification during quality gate retries
+    modified_key = f"{target_table_name}.{target_column_name}"
+    if not hasattr(rdb, "_homophily_modified"):
+        rdb._homophily_modified = set()
+    if modified_key in rdb._homophily_modified:
+        return None  # already modified; deterministic repeat
+    rdb._homophily_modified.add(modified_key)
+
+    table = rdb.tables[target_table_name]
+    n_rows = table.num_rows
+    if n_rows < 4:
+        return None
+
+    # Get block assignments (HSBM first, pseudo-block fallback)
+    hsbm_paths = getattr(rdb, "hsbm_block_paths", {})
+    block_assignments = get_block_assignments(
+        target_table_name, rdb, hsbm_block_paths=hsbm_paths, seed=rdb_index,
+    )
+    if block_assignments is None or block_assignments.shape[0] != n_rows:
+        return None
+
+    # Feature pool for feature-driven label channel
+    feature_cols = table.get_feature_columns(only_categorical=False)
+    col_idx = [table.column_names.index(c) for c in feature_cols[:5]]
+    features = table.data[:, col_idx]
+
+    # Sample h_target
+    h_target = _sample_homophily_target(rdb_index)
+
+    # Generate homophily-controlled label
+    gen = HomophilyLabelGenerator(
+        h_target=h_target,
+        block_assignments=block_assignments,
+        features=features,
+        seed=rdb_index,
+    )
+    y_new, meta = gen.generate_label()
+
+    # Replace column data in-place
+    target_col_idx = table.column_names.index(target_column_name)
+    table.data[:, target_col_idx] = y_new.float()
+
+    # Update dataframe if it exists
+    if table.dataframe is not None:
+        table.dataframe[target_column_name] = y_new.numpy()
+
+    # Ensure data_type_config reflects binary categorical
+    from .table_generation import DataTypeConfig, DataType as DType
+    table.data_type_configs[target_col_idx] = DataTypeConfig(
+        DType.CATEGORICAL,
+        num_categories=2,
+        balanced=True,
+    )
+
+    return meta
+
 
 class Task:
     """
@@ -1432,6 +1544,7 @@ class TaskGenerator:
         tasks_per_rdb: int = 3,
         exclude_small_tables: bool = True,
         min_table_size: int = 10,
+        use_homophily_labels: bool = False,
     ) -> List[Task]:
         """Generate tasks for an RDB with complex tasks.
 
@@ -1440,6 +1553,8 @@ class TaskGenerator:
             tasks_per_rdb (int, optional): Number of tasks to generate per RDB. Defaults to 3.
             exclude_small_tables (bool, optional): Whether to exclude small tables. Defaults to True.
             min_table_size (int, optional): Minimum table size to consider for task generation. Defaults to 10.
+            use_homophily_labels (bool, optional): If True, conditionally replace target
+                columns with homophily-controlled labels. Defaults to False.
 
         Returns:
             List[Task]: List of generated tasks
@@ -1537,6 +1652,20 @@ class TaskGenerator:
                 evaluation_metric = DBBTaskEvalMetric.accuracy
                 dbb_task_type = DBBTaskType.classification
                 num_classes = 2
+
+            # --- Homophily-controlled label substitution ---
+            homophily_meta = None
+            if (
+                use_homophily_labels
+                and task_type == TaskType.DIRECT_ATTRIBUTE_PREDICTION
+                and dbb_task_type == DBBTaskType.classification
+            ):
+                homophily_meta = _maybe_apply_homophily_label(
+                    rdb, target_table_name, target_column_name,
+                    rdb_index=hash(rdb.name) & 0x7FFFFFFF,
+                )
+                if homophily_meta is not None:
+                    num_classes = 2  # homophily labels are always binary
 
             task = Task(
                 task_name=f"complex_task_{focal_table_name}_{task_type.value}_{i+1}",

@@ -12,6 +12,7 @@ from typing import Dict
 class MASK_TYPE(Enum):
     FULL = "full"
     X = "x"
+    X_MLP = "x_mlp"
     EDGE_PROB = "edge_prob"
     CAUSAL_OUTPUT = "causal_output"
     TIMESTAMP = "timestamp"

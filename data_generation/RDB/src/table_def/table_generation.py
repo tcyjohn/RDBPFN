@@ -1085,6 +1085,8 @@ class TableGenerator:
         # key = parent_table_name, value = sampled parameter value.
         self.hsbm_num_levels: Dict[str, int] = {}
         self.hsbm_clusters_per_level: Dict[str, int] = {}
+        # HSBM block paths — stored after generate_data() for downstream use
+        self.hsbm_block_paths: torch.Tensor | None = None
         # FK Propensity params (table-level, used for single-parent)
         self.propensity_rho: float = 0.0
         self.propensity_beta: float = 0.0
@@ -1375,6 +1377,7 @@ class TableGenerator:
                     parent_data_list, fk_ids, block_paths=block_paths,
                 )
 
+                self.hsbm_block_paths = block_paths
                 self.all_scm_outputs = X.copy()
 
                 return X, FK_ids
@@ -1650,6 +1653,7 @@ class RDB:
     def init_table_SCMs(
         self,
         seed: int = 42,
+        use_path_signal: bool = True,
     ) -> None:
         """
         Initialize the SCMs for all tables.
@@ -1782,6 +1786,7 @@ class RDB:
 
             # 3rd dict: combine sampled and base parameters
             combined_params = sampled_scm_params.copy()
+            combined_params["use_path_signal"] = use_path_signal
             for k, v in base_params.items():
                 if k not in combined_params:
                     combined_params[k] = v
@@ -1920,6 +1925,12 @@ class RDB:
 
         self._run_row_gnn_if_enabled()
         self._materialize_tables_from_pending()
+
+        # Collect HSBM block paths for downstream homophily label generation
+        self.hsbm_block_paths: Dict[str, torch.Tensor] = {}
+        for tname, gen in self.table_generators.items():
+            if gen.hsbm_block_paths is not None:
+                self.hsbm_block_paths[tname] = gen.hsbm_block_paths
 
         return
 
@@ -2362,6 +2373,7 @@ class RDB:
         valid_ratio: float = 0.1,
         entity_task_ratio: float = 0.75,
         relbench_mode: bool = False,
+        use_homophily_labels: bool = False,
     ) -> List:
         """
         Initialize TaskGenerator and generate tasks via TaskDataGenerator.generate_task_data.
@@ -2419,6 +2431,7 @@ class RDB:
             tasks_per_rdb=tasks_per_rdb,
             exclude_small_tables=exclude_small_tables,
             min_table_size=min_table_size,
+            use_homophily_labels=use_homophily_labels,
         )
 
         if len(tasks) == 0:

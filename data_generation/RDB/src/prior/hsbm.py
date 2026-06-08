@@ -78,6 +78,7 @@ def compute_hsbm_fk_ids(
     hierarchy_a: list,
     hierarchy_b: list,
     seed: int | None = None,
+    null_prob: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compute parent FK indices via HSBM bipartite sampling.
 
@@ -98,12 +99,14 @@ def compute_hsbm_fk_ids(
         Cluster counts per level on the child side.
     seed : int or None
         RNG seed for reproducibility (applied locally).
+    null_prob : float
+        Probability a child row gets FK=-1 (no parent connection).
 
     Returns
     -------
     fk_ids : np.ndarray of shape ``(size_b,)``
         ``fk_ids[j]`` is the parent-row index (0-based) that child row ``j``
-        connects to.
+        connects to, or -1 if no connection.
     block_paths : np.ndarray of shape ``(size_b, len(hierarchy_b))``
         Cluster path per child row (hierarchical block assignment).
     """
@@ -124,6 +127,7 @@ def compute_hsbm_fk_ids(
         cluster_b=cluster_b,
         probs_at_levels=probs_at_levels,
         rng=rng,
+        null_prob=null_prob,
     )
     return fk_ids, cluster_b
 
@@ -135,6 +139,7 @@ def _sample_fk_per_parent(
     cluster_b: np.ndarray,
     probs_at_levels: list,
     rng: np.random.RandomState,
+    null_prob: float = 0.0,
 ) -> np.ndarray:
     """Sample one parent row per child row via HSBM.
 
@@ -142,6 +147,12 @@ def _sample_fk_per_parent(
     identical probability vectors over parent rows.  We group by cluster path,
     compute probs once per group, then sample all rows in the group in a single
     call to ``rng.choice(..., size=N)``.
+
+    Parameters
+    ----------
+    null_prob : float
+        Probability that a child row gets FK=-1 (no parent connection).
+        Applied independently per row after HSBM sampling.
     """
     num_levels = len(probs_at_levels)
     fk_ids = np.empty(size_b, dtype=np.int64)
@@ -170,6 +181,10 @@ def _sample_fk_per_parent(
 
         fk_ids[indices] = rng.choice(size_a, size=n_in_cluster, p=probs)
 
+    if null_prob > 0:
+        null_mask = rng.random(size_b) < null_prob
+        fk_ids[null_mask] = -1
+
     return fk_ids
 
 
@@ -182,6 +197,7 @@ def compute_hsbm_fk_ids_with_propensity(
     propensity_rho: float,
     propensity_beta: float,
     seed: int | None = None,
+    null_prob: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compute FK indices via HSBM + FK Propensity (S12).
 
@@ -204,6 +220,8 @@ def compute_hsbm_fk_ids_with_propensity(
         Temperature for exp(-beta * |rank_score[a] - t(j)|).
     seed : int or None
         RNG seed.
+    null_prob : float
+        Probability a child row gets FK=-1 (no parent connection).
 
     Returns
     -------
@@ -275,6 +293,10 @@ def compute_hsbm_fk_ids_with_propensity(
                 w = None
             fk_ids[idx] = rng.choice(size_a, p=w)
 
+    if null_prob > 0:
+        null_mask = rng.random(size_b) < null_prob
+        fk_ids[null_mask] = -1
+
     return fk_ids, cluster_b
 
 
@@ -284,6 +306,7 @@ def compute_hsbm_fk_ids_multi(
     hierarchies_parent: list[list[int]],
     hierarchy_child: list[int],
     seed: int | None = None,
+    null_probs: list[float] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Joint FK sampling for multiple parents via shared latent cluster path.
 
@@ -314,18 +337,27 @@ def compute_hsbm_fk_ids_multi(
         elements of this hierarchy.
     seed : int or None
         RNG seed for reproducibility.
+    null_probs : list of float or None
+        Per-parent null probability. Child rows with FK=-1 have no connection
+        to that parent. Length must match ``num_parents``.
 
     Returns
     -------
     fk_ids : np.ndarray of shape ``(child_size, num_parents)``
         ``fk_ids[j, p]`` is the parent-row index (0-based) that child row ``j``
-        connects to for parent ``p``.
+        connects to for parent ``p``, or -1 if no connection.
     block_paths : np.ndarray of shape ``(child_size, len(hierarchy_child))``
         Shared child cluster path used for all parents.
     """
     rng = np.random.RandomState(seed)
     num_parents = len(parent_sizes)
     num_levels = len(hierarchy_child)  # max depth across all parents
+
+    if null_probs is None:
+        null_probs = [0.0] * num_parents
+    assert len(null_probs) == num_parents, (
+        f"null_probs length {len(null_probs)} != num_parents {num_parents}"
+    )
 
     # 1. Parent-side cluster assignments (deterministic, per parent)
     cluster_per_parent = []
@@ -362,6 +394,7 @@ def compute_hsbm_fk_ids_multi(
             cluster_b=cluster_b,
             probs_at_levels=shared_probs_per_parent[p],
             rng=rng,
+            null_prob=null_probs[p],
         )
 
     return fk_ids, cluster_b
@@ -376,6 +409,7 @@ def compute_hsbm_fk_ids_multi_with_matching(
     matching_latent_dim: int,
     matching_temperature: float,
     seed: int | None = None,
+    null_probs: list[float] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Joint FK sampling with shared matching latent across parents.
 
@@ -402,6 +436,8 @@ def compute_hsbm_fk_ids_multi_with_matching(
         Softmax temperature (smaller = stronger bias).
     seed : int or None
         RNG seed.
+    null_probs : list of float or None
+        Per-parent null probability. FK=-1 for null rows.
 
     Returns
     -------
@@ -411,6 +447,12 @@ def compute_hsbm_fk_ids_multi_with_matching(
     rng = np.random.RandomState(seed)
     num_parents = len(parent_sizes)
     num_levels = len(hierarchy_child)
+
+    if null_probs is None:
+        null_probs = [0.0] * num_parents
+    assert len(null_probs) == num_parents, (
+        f"null_probs length {len(null_probs)} != num_parents {num_parents}"
+    )
 
     # 1. Per-table z-score normalization (per-column)
     X_norm_list: list[np.ndarray] = []
@@ -493,6 +535,11 @@ def compute_hsbm_fk_ids_multi_with_matching(
                 else:
                     scores = None
                 fk_ids[idx, p] = candidates[rng.choice(len(candidates), p=scores)]
+
+    for p in range(num_parents):
+        if null_probs[p] > 0:
+            null_mask = rng.random(child_size) < null_probs[p]
+            fk_ids[null_mask, p] = -1
 
     return fk_ids, cluster_b
 

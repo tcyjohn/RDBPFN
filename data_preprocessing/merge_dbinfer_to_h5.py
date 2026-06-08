@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List
 
 from tqdm import tqdm
 import h5py
@@ -124,7 +124,7 @@ def _select_feature_names(
     importance_lookup: Dict[tuple[str, str], List[str]] | None,
     top_k: int | None,
     dataset_name: str,
-) -> tuple[list[str], int]:
+) -> tuple[list[str], int, list[int]]:
     target = task.metadata.target_column
     base_features = [
         col.name
@@ -133,6 +133,7 @@ def _select_feature_names(
         and (
             col.dtype == DBBColumnDType.float_t
             or col.dtype == DBBColumnDType.category_t
+            or col.dtype == DBBColumnDType.foreign_key
         )
     ]
     key = (dataset_name, task.metadata.name)
@@ -148,7 +149,16 @@ def _select_feature_names(
             indices = rng.choice(len(feature_names), size=max_columns, replace=False)
             indices.sort()
             feature_names = [feature_names[i] for i in indices]
-    return feature_names[:max_columns], len(base_features)
+
+    feature_names = feature_names[:max_columns]
+    # Track which selected features are FK columns
+    fk_set = {
+        col.name
+        for col in task.metadata.columns
+        if col.dtype == DBBColumnDType.foreign_key
+    }
+    fk_indices = [i for i, name in enumerate(feature_names) if name in fk_set]
+    return feature_names, len(base_features), fk_indices
 
 
 def _build_encoders(task: DBBRDBTask, feature_names: list[str]) -> Dict[str, tuple[str, object]]:
@@ -241,7 +251,7 @@ def _prepare_task_sample(
         return None
     if total_rows < 2:
         raise ValueError("total_rows must be at least 2.")
-    feature_names, total_available_features = _select_feature_names(
+    feature_names, total_available_features, fk_column_indices = _select_feature_names(
         task, max_columns, importance_lookup, top_k, dataset_name
     )
     if not feature_names:
@@ -288,6 +298,7 @@ def _prepare_task_sample(
         "num_available_features": total_available_features,
         "split_idx": train_rows,
         "category_mask": category_mask,
+        "fk_column_indices": fk_column_indices,
     }
 
 
@@ -369,6 +380,7 @@ def _write_hdf5(samples: list[dict], output: Path, total_rows: int, max_columns:
         num_features_buffer = np.zeros(total, dtype=np.int32)
         num_available_buffer = np.zeros(total, dtype=np.int32)
         split_idx_buffer = np.zeros(total, dtype=np.int32)
+        fk_indices_all = []
         for idx, sample in enumerate(samples):
             cols = sample["num_features"]
             dset_X[idx, :, :cols] = sample["X"]
@@ -377,12 +389,15 @@ def _write_hdf5(samples: list[dict], output: Path, total_rows: int, max_columns:
             num_available_buffer[idx] = sample["num_available_features"]
             split_idx_buffer[idx] = sample["split_idx"]
             dset_category_mask[idx, :cols] = sample["category_mask"]
+            fk_indices_all.append(sample.get("fk_column_indices", []))
             if (idx + 1) % 50 == 0 or idx + 1 == total:
                 print(f"Written {idx + 1}/{total} tasks", end="\r", flush=True)
         dset_num_features[...] = num_features_buffer
         dset_num_available_features[...] = num_available_buffer
         dset_num_datapoints[...] = num_datapoints_buffer
         dset_single_eval_pos[...] = split_idx_buffer
+        # Store FK column indices as JSON attribute for FK attention bias
+        h5.attrs["fk_column_indices"] = json.dumps(fk_indices_all)
     print(f"\nSuccessfully wrote {total} tasks to {output}")
 
 

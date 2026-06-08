@@ -511,6 +511,8 @@ class DAGToRDBGenerator:
                 quality_max_retries,
                 relbench_mode,
                 snr_threshold,
+                use_homophily_labels,
+                use_path_signal,
             ) = args
 
             # Set random seed for reproducibility (each worker gets different seed)
@@ -553,7 +555,7 @@ class DAGToRDBGenerator:
             )
 
             # Initialize SCMs with eta
-            rdb.init_table_SCMs(seed=rdb_index)
+            rdb.init_table_SCMs(seed=rdb_index, use_path_signal=use_path_signal)
 
             # Generate data
             rdb.generate_all_data_from_SCM()
@@ -575,11 +577,13 @@ class DAGToRDBGenerator:
                         valid_ratio=0.05, max_retries=quality_max_retries,
                         base_seed=rdb_index, use_complex_tasks=True,
                         relbench_mode=relbench_mode,
+                        use_homophily_labels=use_homophily_labels,
                     )
                 else:
                     rdb.initialize_tasks_with_complex_tasks(
                         tasks_per_rdb=5, train_ratio=0.75, valid_ratio=0.05,
                         relbench_mode=relbench_mode,
+                        use_homophily_labels=use_homophily_labels,
                     )
                     rdb.save_to_4dbinfer_dataset_with_tasks(rdb_dir)
             else:
@@ -636,7 +640,8 @@ class DAGToRDBGenerator:
                                            train_ratio=0.75, valid_ratio=0.05,
                                            max_retries=3, base_seed=42,
                                            use_complex_tasks=True,
-                                           relbench_mode=False):
+                                           relbench_mode=False,
+                                           use_homophily_labels=False):
         """Generate tasks with quality gate (supports both simple and complex tasks).
 
         Retries up to ``max_retries`` times with different seeds. Keeps the
@@ -662,6 +667,7 @@ class DAGToRDBGenerator:
                     train_ratio=train_ratio,
                     valid_ratio=valid_ratio,
                     relbench_mode=relbench_mode,
+                    use_homophily_labels=use_homophily_labels,
                 )
             else:
                 rdb.initialize_tasks(
@@ -758,6 +764,8 @@ class DAGToRDBGenerator:
         quality_filter: bool = True,
         quality_max_retries: int = 3,
         snr_threshold: float = 5.0,
+        use_homophily_labels: bool = False,
+        use_path_signal: bool = True,
     ) -> List[RDB]:
         """
         Generate RDBs from the loaded DAG data.
@@ -785,6 +793,12 @@ class DAGToRDBGenerator:
             Minimum SNR proxy (mean group_scale / mean residual_sigma) for an RDB
             to be accepted. RDBs below this threshold are discarded. Set to 0 or None
             to disable. Default: 5.0 (filters ~12% of RDBs, loses ~8% of tasks).
+        use_homophily_labels : bool, optional
+            If True, conditionally replace target columns with homophily-controlled
+            labels (OPENRFM-style). Default: False.
+        use_path_signal : bool, optional
+            If False, skip path signal in SG feature construction. Use when explicit
+            FK block_id columns are added to the table. Default: True.
         Returns
         -------
         List[RDB]
@@ -835,6 +849,8 @@ class DAGToRDBGenerator:
                 quality_max_retries,
                 relbench_mode,
                 snr_threshold,
+                use_homophily_labels,
+                use_path_signal,
             )
             for i in range(start_index, start_index + num_rdbs)
         ]
@@ -1057,6 +1073,8 @@ def main():
             quality_filter=quality_filter,
             quality_max_retries=quality_max_retries,
             snr_threshold=snr_threshold,
+            use_homophily_labels=use_homophily_labels,
+            use_path_signal=use_path_signal,
         )
         end_time = time.time()
         elapsed_time = end_time - start_time
@@ -1134,6 +1152,16 @@ if __name__ == "__main__":
         help="Use RelBench-style tasks: entity as focal + target, DIRECT_ATTRIBUTE_PREDICTION",
     )
     parser.add_argument(
+        "--use_homophily_labels",
+        action="store_true",
+        help="Enable homophily-controlled label diversity (OPENRFM-style)",
+    )
+    parser.add_argument(
+        "--no_path_signal",
+        action="store_true",
+        help="Disable path signal in SG feature construction (use with explicit FK block_id columns)",
+    )
+    parser.add_argument(
         "--random_seed",
         type=int,
         default=42,
@@ -1181,6 +1209,8 @@ if __name__ == "__main__":
     start_index = args.start_index
     use_complex_tasks = args.use_complex_tasks
     relbench_mode = args.relbench_mode
+    use_homophily_labels = args.use_homophily_labels
+    use_path_signal = not args.no_path_signal
     use_row_gnn = args.use_row_gnn
     random_seed = args.random_seed
     gnn_device = args.gnn_device

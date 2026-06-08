@@ -114,8 +114,9 @@ def _evaluate_task(
     X_test: np.ndarray,
     y_test: np.ndarray,
     chunk_size: int | None,
+    fk_values_train: np.ndarray | None = None,
 ):
-    classifier.fit(X_train, y_train)
+    classifier.fit(X_train, y_train, fk_values=fk_values_train)
     prob = predict_proba_in_chunks(classifier, X_test, chunk_size)
     pred = prob.argmax(axis=1)
     metric = task.metadata.evaluation_metric
@@ -154,7 +155,7 @@ def _evaluate_datasets(
 
         # ── Load all classification tasks for this dataset ──
         task_entries: list[
-            tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, object, str]
+            tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, object, str, list[int]]
         ] = []
         for task in dataset.tasks:
             if task.metadata.task_type != DBBTaskType.classification:
@@ -163,8 +164,8 @@ def _evaluate_datasets(
                 )
                 continue
             try:
-                X_train, y_train = load_task_split(task, "train")
-                X_test, y_test = load_task_split(task, "test")
+                X_train, y_train, fk_indices = load_task_split(task, "train")
+                X_test, y_test, _ = load_task_split(task, "test")
             except ValueError as exc:
                 logger.warning(
                     "Failed to load splits for %s/%s: %s",
@@ -174,7 +175,7 @@ def _evaluate_datasets(
                 )
                 continue
             task_entries.append(
-                (X_train, y_train, X_test, y_test, task, task.metadata.name)
+                (X_train, y_train, X_test, y_test, task, task.metadata.name, fk_indices)
             )
             logger.info(
                 "Task %s/%s: #train=%d, #test=%d, #cols=%d",
@@ -190,7 +191,7 @@ def _evaluate_datasets(
 
         # ── Evaluate all seeds for this dataset's tasks ──
         for seed in cfg.dataset.seeds:
-            for X_train, y_train, X_test, y_test, task, task_name in task_entries:
+            for X_train, y_train, X_test, y_test, task, task_name, fk_indices in task_entries:
                 seed_key = f"{dataset.dataset_name}:{task_name}:{seed}"
                 seed_offset = _stable_random_state(seed_key)
                 X_train_ds, y_train_ds = downsample_split(
@@ -214,6 +215,13 @@ def _evaluate_datasets(
                     )
                     continue
 
+                # Extract FK values for FK attention bias
+                fk_vals_train = (
+                    X_train_ds[:, fk_indices].astype(np.int64)
+                    if fk_indices
+                    else None
+                )
+
                 classifier = classifier_factory()
                 task_result = _evaluate_task(
                     dataset.dataset_name,
@@ -232,6 +240,7 @@ def _evaluate_datasets(
                             else cfg.dataset.eval_chunk_size
                         )
                     ),
+                    fk_values_train=fk_vals_train,
                 )
                 task_result["seed"] = seed
                 per_seed_results.append(task_result)
