@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -377,8 +378,9 @@ def _prepare_task_sample(
     parent_entity_ids_list = []
     for fk_name in fk_column_names:
         peids = _compute_parent_entity_ids(task, fk_name, dataset)
-        if peids is not None:
-            parent_entity_ids_list.append(peids)
+        if peids is None:
+            peids = np.full(n_total, -1, dtype=np.int64)
+        parent_entity_ids_list.append(peids)
 
     # --- Build per-entity index mapping before sampling ---
     has_entity_col = "entity_id" in task.train_set
