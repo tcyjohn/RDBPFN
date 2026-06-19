@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass
 from typing import List, Sequence
@@ -42,10 +41,10 @@ class InMemoryDataset(Dataset):
             if "feature_is_categorical" in self._file
             else None
         )
-        self.fk_column_indices: list[list[int]] = (
-            json.loads(self._file.attrs["fk_column_indices"])
-            if "fk_column_indices" in self._file.attrs
-            else []
+        self.fk_values_ds = self._file["fk_values"] if "fk_values" in self._file else None
+        self.entity_ids_ds = self._file["entity_ids"] if "entity_ids" in self._file else None
+        self.parent_entity_ids_ds = (
+            self._file["parent_entity_ids"] if "parent_entity_ids" in self._file else None
         )
 
         self.dataset_size = self.X.shape[0]
@@ -84,16 +83,23 @@ class InMemoryDataset(Dataset):
         num_feat = int(self.num_features[idx])
         num_rows = int(self.num_datapoints[idx])
 
-        fk_indices = (
-            self.fk_column_indices[idx]
-            if idx < len(self.fk_column_indices)
-            else []
-        )
-        if fk_indices:
-            fk_vals_np = self.X[idx, :num_rows, fk_indices].astype(np.int64)
-            fk_values = torch.from_numpy(fk_vals_np)
+        if self.fk_values_ds is not None:
+            fk_vals_np = self.fk_values_ds[idx, :num_rows, :]
+            fk_values = torch.from_numpy(fk_vals_np.astype(np.int64))
         else:
             fk_values = torch.zeros(num_rows, 0, dtype=torch.long)
+
+        if self.entity_ids_ds is not None:
+            eid_np = self.entity_ids_ds[idx, :num_rows]
+            entity_ids = torch.from_numpy(eid_np.astype(np.int64))
+        else:
+            entity_ids = torch.full((num_rows,), -1, dtype=torch.long)
+
+        if self.parent_entity_ids_ds is not None:
+            peids_np = self.parent_entity_ids_ds[idx, :num_rows, :]
+            parent_entity_ids = torch.from_numpy(peids_np.astype(np.int64))
+        else:
+            parent_entity_ids = torch.zeros(num_rows, 0, dtype=torch.long)
 
         sample = {
             "x": torch.from_numpy(self.X[idx, :num_rows, :num_feat]),
@@ -108,8 +114,9 @@ class InMemoryDataset(Dataset):
                 ),
                 dtype=torch.long,
             ),
-            "fk_column_indices": fk_indices,
             "fk_values": fk_values,
+            "entity_ids": entity_ids,
+            "parent_entity_ids": parent_entity_ids,
         }
 
         # if self.feature_is_categorical is not None:
@@ -157,6 +164,21 @@ def collate_batch(batch: List[dict]) -> dict:
             (batch_size, max_rows, max_fk_cols), -1, dtype=torch.long,
         )
 
+    entity_out = torch.full((batch_size, max_rows), -1, dtype=torch.long)
+
+    has_peids = any(
+        s.get("parent_entity_ids") is not None and s["parent_entity_ids"].shape[-1] > 0
+        for s in batch
+    )
+    if has_peids:
+        max_peid_cols = max(
+            s.get("parent_entity_ids", torch.zeros(0, 0)).shape[-1]
+            for s in batch
+        )
+        peid_out = torch.full(
+            (batch_size, max_rows, max_peid_cols), -1, dtype=torch.long,
+        )
+
     for idx, sample in enumerate(batch):
         rows, feats = sample["x"].shape
         x_out[idx, :rows, :feats] = sample["x"]
@@ -170,6 +192,16 @@ def collate_batch(batch: List[dict]) -> dict:
                 fk_rows, fk_cols = fk.shape
                 fk_out[idx, :fk_rows, :fk_cols] = fk
 
+        eid = sample.get("entity_ids")
+        if eid is not None:
+            entity_out[idx, :eid.shape[0]] = eid
+
+        if has_peids:
+            peid = sample.get("parent_entity_ids")
+            if peid is not None and peid.shape[-1] > 0:
+                peid_rows, peid_cols = peid.shape
+                peid_out[idx, :peid_rows, :peid_cols] = peid
+
     collated = {
         "x": x_out,
         "y": y_out,
@@ -179,6 +211,9 @@ def collate_batch(batch: List[dict]) -> dict:
     }
     if has_fk_values:
         collated["fk_values"] = fk_out
+    collated["entity_ids"] = entity_out
+    if has_peids:
+        collated["parent_entity_ids"] = peid_out
 
     # if has_category_mask and category_mask_out is not None:
     #     collated["category_mask"] = category_mask_out
