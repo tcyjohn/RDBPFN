@@ -49,11 +49,11 @@ class DBBRDBDataset:
 
     def _load_data(self):
         # Load tables.
-        # self._tables = {}
-        # for table_schema in self.metadata.tables:
-        #     table_path = self.path / table_schema.source
-        #     loader = get_table_data_loader(table_schema.format)
-        #     self._tables[table_schema.name] = loader(table_path)
+        self._tables = {}
+        for table_schema in self.metadata.tables:
+            table_path = self.path / table_schema.source
+            loader = get_table_data_loader(table_schema.format)
+            self._tables[table_schema.name] = loader(table_path)
 
         # Load tasks.
         self._tasks = []

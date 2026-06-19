@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -124,16 +123,21 @@ def _select_feature_names(
     importance_lookup: Dict[tuple[str, str], List[str]] | None,
     top_k: int | None,
     dataset_name: str,
-) -> tuple[list[str], int, list[int]]:
+) -> tuple[list[str], int, list[str]]:
     target = task.metadata.target_column
+    fk_column_names = [
+        col.name
+        for col in task.metadata.columns
+        if col.name != target and col.dtype == DBBColumnDType.foreign_key
+    ]
     base_features = [
         col.name
         for col in task.metadata.columns
         if col.name != target
+        and col.name != "entity_id"
         and (
             col.dtype == DBBColumnDType.float_t
             or col.dtype == DBBColumnDType.category_t
-            or col.dtype == DBBColumnDType.foreign_key
         )
     ]
     key = (dataset_name, task.metadata.name)
@@ -151,14 +155,7 @@ def _select_feature_names(
             feature_names = [feature_names[i] for i in indices]
 
     feature_names = feature_names[:max_columns]
-    # Track which selected features are FK columns
-    fk_set = {
-        col.name
-        for col in task.metadata.columns
-        if col.dtype == DBBColumnDType.foreign_key
-    }
-    fk_indices = [i for i, name in enumerate(feature_names) if name in fk_set]
-    return feature_names, len(base_features), fk_indices
+    return feature_names, len(base_features), fk_column_names
 
 
 def _build_encoders(task: DBBRDBTask, feature_names: list[str]) -> Dict[str, tuple[str, object]]:
@@ -236,9 +233,105 @@ def _binarize_labels(
     return encode(y_train), encode(y_test)
 
 
+def _sample_entity_stratified(
+    entity_combined: np.ndarray,
+    total_rows: int,
+    rng: np.random.Generator,
+) -> np.ndarray | None:
+    """Sample row indices grouped by entity, so same-entity snapshots co-occur.
+
+    Returns None when there aren't enough multi-row entities to form clusters
+    (caller should fall back to uniform sampling).
+    """
+    # Build entity → row-count mapping
+    unique_entities, counts = np.unique(entity_combined, return_counts=True)
+    # Only entities with ≥2 rows can form same-entity pairs
+    multi_row_mask = counts >= 2
+    multi_row_entities = unique_entities[multi_row_mask]
+    multi_row_counts = counts[multi_row_mask]
+    if len(multi_row_entities) == 0:
+        return None
+
+    avg_snaps = max(2, int(np.median(multi_row_counts)))
+    K = max(1, min(total_rows // avg_snaps, len(multi_row_entities)))
+    selected = rng.choice(multi_row_entities, size=K, replace=False)
+
+    # Collect all rows belonging to selected entities
+    mask = np.isin(entity_combined, selected)
+    indices = np.where(mask)[0]
+
+    if len(indices) > total_rows:
+        indices = rng.choice(indices, size=total_rows, replace=False)
+    elif len(indices) < total_rows:
+        # Pad with rows from non-selected entities
+        other = np.where(~mask)[0]
+        n_pad = total_rows - len(indices)
+        if len(other) > 0:
+            extra = rng.choice(other, size=min(n_pad, len(other)), replace=False)
+            indices = np.concatenate([indices, extra])
+        # If still short (very small table), duplicate
+        if len(indices) < total_rows:
+            extra = rng.choice(indices, size=total_rows - len(indices), replace=True)
+            indices = np.concatenate([indices, extra])
+
+    rng.shuffle(indices)
+    return indices
+
+
+def _compute_parent_entity_ids(
+    task: DBBRDBTask,
+    fk_column_name: str,
+    dataset: DBBRDBDataset,
+) -> np.ndarray | None:
+    """Map FK row-index values to parent entity_id values.
+
+    Loads the parent table's preloaded parquet data from the dataset to
+    extract the entity_id column, then maps::
+
+        parent_entity_ids[i] = parent.entity_ids[fk_value[i]]
+
+    Returns None when parent table has no entity_id (non-entity or not found).
+    """
+    # Resolve parent table name from FK column metadata
+    parent_table_name = None
+    for col_meta in task.metadata.columns:
+        if col_meta.name == fk_column_name and getattr(col_meta, "link_to", None):
+            parent_table_name = col_meta.link_to.split(".")[0]
+            break
+
+    if parent_table_name is None:
+        return None
+
+    # DBBRDBDataset already loaded all table data
+    parent_table_data = dataset.tables.get(parent_table_name)
+    if parent_table_data is None:
+        return None
+    if "entity_id" not in parent_table_data:
+        return None
+
+    parent_eids = parent_table_data["entity_id"].astype(np.int64)
+
+    # Map train FK values
+    fk_train = task.train_set[fk_column_name].astype(np.float64)
+    fk_train = np.nan_to_num(fk_train, nan=-1).astype(np.int64)
+    peids_train = np.full(len(fk_train), -1, dtype=np.int64)
+    valid_train = (fk_train >= 0) & (fk_train < len(parent_eids))
+    peids_train[valid_train] = parent_eids[fk_train[valid_train]]
+
+    # Map test FK values
+    fk_test = task.test_set[fk_column_name].astype(np.float64)
+    fk_test = np.nan_to_num(fk_test, nan=-1).astype(np.int64)
+    peids_test = np.full(len(fk_test), -1, dtype=np.int64)
+    valid_test = (fk_test >= 0) & (fk_test < len(parent_eids))
+    peids_test[valid_test] = parent_eids[fk_test[valid_test]]
+
+    return np.concatenate([peids_train, peids_test], axis=0)
+
+
 def _prepare_task_sample(
     dataset_name: str,
     task: DBBRDBTask,
+    dataset: DBBRDBDataset,
     total_rows: int,
     min_ratio: float,
     max_ratio: float,
@@ -251,7 +344,7 @@ def _prepare_task_sample(
         return None
     if total_rows < 2:
         raise ValueError("total_rows must be at least 2.")
-    feature_names, total_available_features, fk_column_indices = _select_feature_names(
+    feature_names, total_available_features, fk_column_names = _select_feature_names(
         task, max_columns, importance_lookup, top_k, dataset_name
     )
     if not feature_names:
@@ -268,10 +361,66 @@ def _prepare_task_sample(
     if y_train_bin is None:
         return None
 
-    X_combined = np.concatenate([X_train, X_test], axis=0)
+    X_combined_arr = np.concatenate([X_train, X_test], axis=0)
+    n_total = X_combined_arr.shape[0]
+
+    # --- Extract raw FK values ---
+    fk_values_list = []
+    for fk_name in fk_column_names:
+        fk_train = task.train_set[fk_name].astype(np.float64)
+        fk_test = task.test_set[fk_name].astype(np.float64)
+        fk_combined = np.concatenate([fk_train, fk_test], axis=0)
+        fk_combined = np.nan_to_num(fk_combined, nan=-1).astype(np.int64)
+        fk_values_list.append(fk_combined)
+
+    # --- Compute parent_entity_ids (entity-level FK for attention bias) ---
+    parent_entity_ids_list = []
+    for fk_name in fk_column_names:
+        peids = _compute_parent_entity_ids(task, fk_name, dataset)
+        if peids is not None:
+            parent_entity_ids_list.append(peids)
+
+    # --- Build per-entity index mapping before sampling ---
+    has_entity_col = "entity_id" in task.train_set
+    entity_combined: np.ndarray | None = None
+    if has_entity_col:
+        entity_train = task.train_set["entity_id"].astype(np.float64)
+        entity_test = task.test_set["entity_id"].astype(np.float64)
+        entity_combined = np.concatenate([entity_train, entity_test], axis=0)
+        entity_combined = np.nan_to_num(entity_combined, nan=-1).astype(np.int64)
+
+    # --- Stratified entity sampling ---
+    # When entity_id is available, sample entity-clusters rather than
+    # individual rows so that temporal snapshots of the same entity
+    # co-occur in the same H5 sample (→ non-zero same-entity pair
+    # ratio → trainable entity attention bias).
+    if has_entity_col and entity_combined is not None:
+        indices = _sample_entity_stratified(
+            entity_combined, total_rows, rng,
+        )
+    if not has_entity_col or indices is None:
+        replace = n_total < total_rows
+        indices = rng.choice(n_total, size=total_rows, replace=replace)
+
+    # --- FK values (same indices as X / y / entity_ids) ---
+    fk_values_sampled = None
+    if fk_values_list:
+        fk_combined_all = np.stack(fk_values_list, axis=1)
+        fk_values_sampled = fk_combined_all[indices]
+
+    # --- Parent entity IDs (same indices as FK values) ---
+    parent_entity_ids_sampled = None
+    if parent_entity_ids_list:
+        peids_combined = np.stack(parent_entity_ids_list, axis=1)
+        parent_entity_ids_sampled = peids_combined[indices]
+
+    # --- Entity IDs ---
+    entity_ids_sampled = None
+    if has_entity_col and entity_combined is not None:
+        entity_ids_sampled = entity_combined[indices]
+
+    X_combined = X_combined_arr
     y_combined = np.concatenate([y_train_bin, y_test_bin], axis=0)
-    replace = X_combined.shape[0] < total_rows
-    indices = rng.choice(X_combined.shape[0], size=total_rows, replace=replace)
     X_sampled = X_combined[indices]
     y_sampled = y_combined[indices]
 
@@ -298,7 +447,10 @@ def _prepare_task_sample(
         "num_available_features": total_available_features,
         "split_idx": train_rows,
         "category_mask": category_mask,
-        "fk_column_indices": fk_column_indices,
+        "fk_column_names": fk_column_names,
+        "fk_values": fk_values_sampled,
+        "entity_ids": entity_ids_sampled,
+        "parent_entity_ids": parent_entity_ids_sampled,
     }
 
 
@@ -324,6 +476,7 @@ def _load_all_samples(
             sample = _prepare_task_sample(
                 dataset.dataset_name,
                 task,
+                dataset,
                 total_rows,
                 min_ratio,
                 max_ratio,
@@ -343,6 +496,13 @@ def _write_hdf5(samples: list[dict], output: Path, total_rows: int, max_columns:
     output.parent.mkdir(parents=True, exist_ok=True)
     total = len(samples)
     chunk_rows = min(4, total)
+
+    # Determine max FK columns across all samples
+    max_fk_cols = max(
+        (s["fk_values"].shape[1] for s in samples if s.get("fk_values") is not None),
+        default=0,
+    )
+
     with h5py.File(output, "w") as h5:
         dset_X = h5.create_dataset(
             "X",
@@ -376,11 +536,44 @@ def _write_hdf5(samples: list[dict], output: Path, total_rows: int, max_columns:
         )
         h5.create_dataset("max_num_classes", data=np.array([1], dtype="int32"))
 
+        if max_fk_cols > 0:
+            dset_fk = h5.create_dataset(
+                "fk_values",
+                shape=(total, total_rows, max_fk_cols),
+                dtype="int64",
+                compression="lzf",
+                chunks=(chunk_rows, total_rows, max_fk_cols),
+                fillvalue=-1,
+            )
+
+        dset_entity = h5.create_dataset(
+            "entity_ids",
+            shape=(total, total_rows),
+            dtype="int64",
+            compression="lzf",
+            chunks=(chunk_rows, total_rows),
+            fillvalue=-1,
+        )
+
+        # Determine max parent_entity_ids columns across all samples
+        max_peids_cols = max(
+            (s["parent_entity_ids"].shape[1] for s in samples if s.get("parent_entity_ids") is not None),
+            default=0,
+        )
+        if max_peids_cols > 0:
+            dset_peids = h5.create_dataset(
+                "parent_entity_ids",
+                shape=(total, total_rows, max_peids_cols),
+                dtype="int64",
+                compression="lzf",
+                chunks=(chunk_rows, total_rows, max_peids_cols),
+                fillvalue=-1,
+            )
+
         num_datapoints_buffer = np.full(total, total_rows, dtype=np.int32)
         num_features_buffer = np.zeros(total, dtype=np.int32)
         num_available_buffer = np.zeros(total, dtype=np.int32)
         split_idx_buffer = np.zeros(total, dtype=np.int32)
-        fk_indices_all = []
         for idx, sample in enumerate(samples):
             cols = sample["num_features"]
             dset_X[idx, :, :cols] = sample["X"]
@@ -389,15 +582,22 @@ def _write_hdf5(samples: list[dict], output: Path, total_rows: int, max_columns:
             num_available_buffer[idx] = sample["num_available_features"]
             split_idx_buffer[idx] = sample["split_idx"]
             dset_category_mask[idx, :cols] = sample["category_mask"]
-            fk_indices_all.append(sample.get("fk_column_indices", []))
+            if max_fk_cols > 0 and sample.get("fk_values") is not None:
+                fk_cols = sample["fk_values"].shape[1]
+                dset_fk[idx, :, :fk_cols] = sample["fk_values"]
+            if sample.get("entity_ids") is not None:
+                dset_entity[idx, :] = sample["entity_ids"]
+            if max_peids_cols > 0 and sample.get("parent_entity_ids") is not None:
+                peids_cols = sample["parent_entity_ids"].shape[1]
+                dset_peids[idx, :, :peids_cols] = sample["parent_entity_ids"]
             if (idx + 1) % 50 == 0 or idx + 1 == total:
                 print(f"Written {idx + 1}/{total} tasks", end="\r", flush=True)
         dset_num_features[...] = num_features_buffer
         dset_num_available_features[...] = num_available_buffer
         dset_num_datapoints[...] = num_datapoints_buffer
         dset_single_eval_pos[...] = split_idx_buffer
-        # Store FK column indices as JSON attribute for FK attention bias
-        h5.attrs["fk_column_indices"] = json.dumps(fk_indices_all)
+        # Store FK column count as attribute (FK values in separate dataset)
+        h5.attrs["num_fk_columns"] = max_fk_cols
     print(f"\nSuccessfully wrote {total} tasks to {output}")
 
 
