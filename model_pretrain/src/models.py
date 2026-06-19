@@ -649,6 +649,7 @@ class NanoTabPFNClassifier:
         self.device = device
         self.fk_values: torch.Tensor | None = None
         self.entity_ids: torch.Tensor | None = None
+        self.parent_entity_ids: torch.Tensor | None = None
 
     def fit(
         self,
@@ -656,6 +657,7 @@ class NanoTabPFNClassifier:
         y_train: np.ndarray,
         fk_values: np.ndarray | None = None,
         entity_ids: np.ndarray | None = None,
+        parent_entity_ids: np.ndarray | None = None,
     ):
         self.X_train = X_train
         self.y_train = y_train
@@ -668,12 +670,17 @@ class NanoTabPFNClassifier:
             self.entity_ids = torch.from_numpy(entity_ids).long().to(self.device)
         else:
             self.entity_ids = None
+        if parent_entity_ids is not None:
+            self.parent_entity_ids = torch.from_numpy(parent_entity_ids).long().to(self.device)
+        else:
+            self.parent_entity_ids = None
 
     def predict_proba(
         self,
         X_test: np.ndarray,
         fk_values_test: np.ndarray | None = None,
         entity_ids_test: np.ndarray | None = None,
+        parent_entity_ids_test: np.ndarray | None = None,
     ) -> np.ndarray:
         x = np.concatenate((self.X_train, X_test))
         y = self.y_train
@@ -712,11 +719,27 @@ class NanoTabPFNClassifier:
             else:
                 eid = None
 
+            if self.parent_entity_ids is not None:
+                if parent_entity_ids_test is not None:
+                    peid_test = torch.from_numpy(parent_entity_ids_test).long().to(self.device)
+                    peid = torch.cat([self.parent_entity_ids, peid_test], dim=0).unsqueeze(0)
+                else:
+                    pad = torch.full(
+                        (len(X_test), self.parent_entity_ids.shape[1]),
+                        -1,
+                        dtype=torch.long,
+                        device=self.device,
+                    )
+                    peid = torch.cat([self.parent_entity_ids, pad], dim=0).unsqueeze(0)
+            else:
+                peid = None
+
             out = self.model(
                 (x, y),
                 train_test_split_index=len(self.X_train),
                 fk_values=fk,
                 entity_ids=eid,
+                parent_entity_ids=peid,
             ).squeeze(0)
             out = out[:, : self.num_classes]
             probabilities = F.softmax(out, dim=1)
@@ -743,8 +766,9 @@ class NanoTabPFNClassifierCategorical(NanoTabPFNClassifier):
         y_train: np.ndarray,
         fk_values: np.ndarray | None = None,
         entity_ids: np.ndarray | None = None,
+        parent_entity_ids: np.ndarray | None = None,
     ):
-        super().fit(X_train, y_train, fk_values, entity_ids)
+        super().fit(X_train, y_train, fk_values, entity_ids, parent_entity_ids)
         num_features = X_train.shape[1]
         mask = np.zeros(num_features, dtype=np.uint8)
         for idx in range(num_features):
@@ -758,12 +782,14 @@ class NanoTabPFNClassifierCategorical(NanoTabPFNClassifier):
         X_test: np.ndarray,
         fk_values_test: np.ndarray | None = None,
         entity_ids_test: np.ndarray | None = None,
+        parent_entity_ids_test: np.ndarray | None = None,
     ) -> np.ndarray:
         if not getattr(self.model, "use_category_mask", False):
             return super().predict_proba(
                 X_test,
                 fk_values_test=fk_values_test,
                 entity_ids_test=entity_ids_test,
+                parent_entity_ids_test=parent_entity_ids_test,
             )
         if self.category_mask is None:
             raise RuntimeError("Category mask not set; call fit first.")
@@ -811,11 +837,27 @@ class NanoTabPFNClassifierCategorical(NanoTabPFNClassifier):
             else:
                 eid = None
 
+            if self.parent_entity_ids is not None:
+                if parent_entity_ids_test is not None:
+                    peid_test = torch.from_numpy(parent_entity_ids_test).long().to(self.device)
+                    peid = torch.cat([self.parent_entity_ids, peid_test], dim=0).unsqueeze(0)
+                else:
+                    pad = torch.full(
+                        (len(X_test), self.parent_entity_ids.shape[1]),
+                        -1,
+                        dtype=torch.long,
+                        device=self.device,
+                    )
+                    peid = torch.cat([self.parent_entity_ids, pad], dim=0).unsqueeze(0)
+            else:
+                peid = None
+
             out = self.model(
                 (x_tensor, y_tensor, category_mask.to(self.device)),
                 train_test_split_index=len(self.X_train),
                 fk_values=fk,
                 entity_ids=eid,
+                parent_entity_ids=peid,
             ).squeeze(0)
             out = out[:, : self.num_classes]
             probabilities = F.softmax(out, dim=1)

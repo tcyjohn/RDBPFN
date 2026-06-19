@@ -208,7 +208,7 @@ def evaluate_classifier(classifier, splits_by_dir: dict[str, list]):
     return scores
 
 
-def load_task_split(task: DBBRDBTask, split: str) -> Tuple[np.ndarray, np.ndarray, list[int]]:
+def load_task_split(task: DBBRDBTask, split: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
     if split == "train":
         source = task.train_set
     elif split in {"val", "validation"}:
@@ -220,29 +220,51 @@ def load_task_split(task: DBBRDBTask, split: str) -> Tuple[np.ndarray, np.ndarra
     if source is None:
         raise ValueError(f"Task {task.metadata.name} has no {split} data")
     target_col = task.metadata.target_column
+    fk_cols = [
+        col.name
+        for col in task.metadata.columns
+        if col.dtype == DBBColumnDType.foreign_key and col.name != target_col
+    ]
     feature_cols = [
         col.name
         for col in task.metadata.columns
         if (
             col.dtype == DBBColumnDType.float_t
             or col.dtype == DBBColumnDType.category_t
-            or col.dtype == DBBColumnDType.foreign_key
         )
         and col.name != target_col
     ]
     if not feature_cols:
         raise ValueError(f"Task {task.metadata.name} has no feature columns")
     feature_cols.sort()
-    # Track which selected features are FK columns
-    fk_set = {
-        col.name
-        for col in task.metadata.columns
-        if col.dtype == DBBColumnDType.foreign_key
-    }
-    fk_column_indices = [i for i, name in enumerate(feature_cols) if name in fk_set]
     X = np.column_stack([source[col] for col in feature_cols]).astype(np.float32)
     y = np.asarray(source[target_col])
-    return X, y, fk_column_indices
+
+    # Extract raw FK values for attention bias (not in X)
+    fk_values = None
+    if fk_cols:
+        fk_parts = []
+        for fk_name in fk_cols:
+            fk_raw = source[fk_name].astype(np.float64)
+            fk_raw = np.nan_to_num(fk_raw, nan=-1).astype(np.int64)
+            fk_parts.append(fk_raw)
+        fk_values = np.column_stack(fk_parts)
+
+    # Extract entity_ids for same-entity attention bias (not in X)
+    entity_ids = None
+    if "entity_id" in source:
+        entity_raw = source["entity_id"].astype(np.float64)
+        entity_ids = np.nan_to_num(entity_raw, nan=-1).astype(np.int64)
+
+    # Extract parent_entity_ids for entity-level FK matching (not in X)
+    # Shape: (total_rows, K) where K is number of FK relations, -1 for null.
+    # These may not exist in eval datasets (only in H5 training data).
+    parent_entity_ids = None
+    if "parent_entity_ids" in source:
+        peids_raw = source["parent_entity_ids"].astype(np.float64)
+        parent_entity_ids = np.nan_to_num(peids_raw, nan=-1).astype(np.int64)
+
+    return X, y, fk_values, entity_ids, parent_entity_ids
 
 
 def downsample_split(

@@ -750,6 +750,7 @@ def _run_full_eval(
     dataset_dir: str,
     classifier_factory: Callable,
     max_test_samples: int = 128,
+    max_train_samples: int = 1024,
     seed: int = 0,
 ) -> dict:
     """Run full relational eval on all DBBRDBDatasets in a directory.
@@ -803,29 +804,58 @@ def _run_full_eval(
             if task.metadata.task_type != DBBTaskType.classification:
                 continue
             try:
-                X_train, y_train, fk_indices = load_task_split(task, "train")
-                X_test, y_test, _ = load_task_split(task, "test")
+                X_train, y_train, fk_values_train, entity_ids_train, parent_entity_ids_train = load_task_split(task, "train")
+                X_test, y_test, fk_values_test, entity_ids_test, parent_entity_ids_test = load_task_split(task, "test")
             except ValueError:
                 continue
 
+            train_seed = _stable_random_state(
+                f"{dataset.dataset_name}:{task.metadata.name}:{seed}:train"
+            )
             test_seed = _stable_random_state(
                 f"{dataset.dataset_name}:{task.metadata.name}:{seed}:test"
             )
-            X_test, y_test = downsample_split(
-                X_test, y_test, max_test_samples, test_seed
-            )
+            idx_train = np.arange(len(X_train))
+            if len(idx_train) > max_train_samples:
+                rng = np.random.default_rng(train_seed)
+                idx_train = rng.choice(idx_train, size=max_train_samples, replace=False)
+                idx_train.sort()
+                X_train = X_train[idx_train]
+                y_train = y_train[idx_train]
+                if fk_values_train is not None:
+                    fk_values_train = fk_values_train[idx_train]
+                if entity_ids_train is not None:
+                    entity_ids_train = entity_ids_train[idx_train]
+                if parent_entity_ids_train is not None:
+                    parent_entity_ids_train = parent_entity_ids_train[idx_train]
+            idx_test = np.arange(len(X_test))
+            if len(idx_test) > max_test_samples:
+                rng = np.random.default_rng(test_seed)
+                idx_test = rng.choice(idx_test, size=max_test_samples, replace=False)
+                idx_test.sort()
+                X_test = X_test[idx_test]
+                y_test = y_test[idx_test]
+                if fk_values_test is not None:
+                    fk_values_test = fk_values_test[idx_test]
+                if entity_ids_test is not None:
+                    entity_ids_test = entity_ids_test[idx_test]
+                if parent_entity_ids_test is not None:
+                    parent_entity_ids_test = parent_entity_ids_test[idx_test]
             X_train, X_test = fill_nans(X_train, X_test)
 
             if len(np.unique(y_train)) < 2:
                 continue
 
-            fk_vals = (
-                X_train[:, fk_indices].astype(np.int64) if fk_indices else None
-            )
-
             try:
-                classifier.fit(X_train, y_train, fk_values=fk_vals)
-                prob = classifier.predict_proba(X_test)
+                classifier.fit(X_train, y_train, fk_values=fk_values_train,
+                               entity_ids=entity_ids_train,
+                               parent_entity_ids=parent_entity_ids_train)
+                prob = classifier.predict_proba(
+                    X_test,
+                    fk_values_test=fk_values_test,
+                    entity_ids_test=entity_ids_test,
+                    parent_entity_ids_test=parent_entity_ids_test,
+                )
             except Exception as exc:
                 _log.warning(
                     "Eval failed %s/%s: %s",
@@ -858,6 +888,8 @@ def _compute_batch_loss(
     category_mask: torch.Tensor | None,
     train_test_split_index: int,
     fk_values: torch.Tensor | None = None,
+    entity_ids: torch.Tensor | None = None,
+    parent_entity_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
     data = (
         x_batch,
@@ -875,6 +907,8 @@ def _compute_batch_loss(
         data,
         train_test_split_index=train_test_split_index,
         fk_values=fk_values,
+        entity_ids=entity_ids,
+        parent_entity_ids=parent_entity_ids,
     )
     targets = targets[:, train_test_split_index:]
 
@@ -1037,6 +1071,8 @@ def train(
                 )
 
                 fk_values_batch = full_data.get("fk_values")
+                entity_ids_batch = full_data.get("entity_ids")
+                parent_entity_ids_batch = full_data.get("parent_entity_ids")
 
                 with accelerator.accumulate(model):
                     (
@@ -1057,11 +1093,9 @@ def train(
                         dataset_column_modify_config,
                         accelerator,
                         fk_values=fk_values_batch,
+                        entity_ids=entity_ids_batch,
+                        parent_entity_ids=parent_entity_ids_batch,
                     )
-                    original_loss_sum += base_loss_value
-                    original_loss_count += 1
-                    total_loss_sum += base_loss_value + aug_loss_sum
-                    total_loss_count += 1 + aug_loss_count
 
                     if accelerator.sync_gradients:
                         accelerator.clip_grad_norm_(model.parameters(), 1.0)
@@ -1191,6 +1225,8 @@ def _compute_losses_with_augmentations(
     column_modify_config: ColumnModificationConfig,
     accelerator: Accelerator,
     fk_values: torch.Tensor | None = None,
+    entity_ids: torch.Tensor | None = None,
+    parent_entity_ids: torch.Tensor | None = None,
 ) -> tuple[float, float, int]:
     # Preserve original feature counts so target sampling ignores added columns.
     base_x, category_mask = _augment_feature_columns(
@@ -1207,6 +1243,8 @@ def _compute_losses_with_augmentations(
         category_mask,
         train_test_split_index,
         fk_values=fk_values,
+        entity_ids=entity_ids,
+        parent_entity_ids=parent_entity_ids,
     )
     accelerator.backward(original_loss_tensor)
     original_loss = original_loss_tensor.detach().item()
@@ -1239,6 +1277,8 @@ def _compute_losses_with_augmentations(
                 aug_mask,
                 aug_split_index,
                 fk_values=fk_values,
+                entity_ids=entity_ids,
+                parent_entity_ids=parent_entity_ids,
             )
             accelerator.backward(aug_loss_tensor)
             aug_loss = aug_loss_tensor.detach().item()
@@ -1271,6 +1311,8 @@ def _compute_losses_with_augmentations(
             concat_mask,
             split_override,
             fk_values=fk_values,
+            entity_ids=entity_ids,
+            parent_entity_ids=parent_entity_ids,
         )
         scaled_loss = group_loss * current_group
         accelerator.backward(scaled_loss)
