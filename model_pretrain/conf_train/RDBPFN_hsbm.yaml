@@ -24,6 +24,7 @@ train:
   save_model_path: checkpoints/RDBPFN_hsbm/model.pt
   full_eval_steps: 16000
   full_eval_dataset_dir: rdb_datasets
+  full_eval_seeds: [0]
 
 model:
   type: base

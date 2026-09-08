@@ -1,6 +1,6 @@
 # RDB_PFN
 
-This is the official repository for the paper [Relational In-Context Learning via Synthetic Pre-training with Structural Prior](https://arxiv.org/abs/2603.03805). It presents a synthetic pre-training framework for relational-database foundation models.
+This is a modified research fork of the code for the paper [Relational In-Context Learning via Synthetic Pre-training with Structural Prior](https://arxiv.org/abs/2603.03805). It presents a synthetic pre-training framework for relational-database foundation models.
 
 The repository is organized as a staged pipeline:
 
@@ -8,6 +8,30 @@ The repository is organized as a staged pipeline:
 2. Preprocess generated datasets into training formats.
 3. Pretrain the foundation model and evaluate it on downstream benchmark datasets.
 4. Provide a simple inference interface for applying the model to arbitrary user datasets when needed.
+
+## Setup and Current Workflow
+
+The shared environment is defined in [pixi.toml](pixi.toml) and pinned by `pixi.lock` (Linux x86-64, Python 3.10):
+
+```bash
+pixi install
+# Optional for Hugging Face access from mainland China:
+export HF_ENDPOINT=https://hf-mirror.com
+```
+
+This fork adds hierarchical stochastic block model (HSBM) foreign-key sampling, signal-group feature generation, entity temporal snapshots, task quality filtering, and optional FK/entity attention biases. Preprocessing preserves structural metadata through HDF5 loading, training, and evaluation.
+
+From the repository root:
+
+```bash
+bash scripts/run_pipeline.sh 4 0 my_run
+```
+
+This runs generation, pre-DFS/DFS/post-DFS preprocessing, HDF5 merging, evaluation CSV preparation, and training. It needs `data_generation/RDB/datasets/rdb_v1.pth` and the initialization checkpoint configured in `model_pretrain/conf_train/RDBPFN_hsbm.yaml`. Read the positional arguments in [scripts/run_pipeline.sh](scripts/run_pipeline.sh) before launching: its CSV preparation stage replaces `model_pretrain/datasets/clf/` contents. Set GPU visibility explicitly for your machine.
+
+See the stage READMEs below for generation-only commands, HDF5 metadata, and row-aligned evaluation. [Generation details](docs/data_generation_pipeline.md) and [evaluation notes](docs/evaluation.md) contain implementation and historical experiment details; current code/configs define defaults. Scripts for individual experiments may contain machine-specific paths and checkpoint names; inspect them before reuse.
+
+Generated datasets, checkpoints, and local experiment outputs are not installed by `pixi install`.
 
 ## Project Structure
 
@@ -77,80 +101,3 @@ Currently available:
 - model pretraining
 - model evaluation
 - standalone inference
-
-## Behavioral guidelines
-
-## 0. Precision in Communication
-
-**Code first. No conversational filter. Academic rigor.**
-
-- Show the code or direct answer immediately. Append brief, high level explainations or notes only if neccessary.
-- Default to explain in simplified Chinese, but stick to English for code, variable names, technical terms and academic citations.
-- Omit apologies, "I understand" statements, and pleasantries. Provide the most direct path to  solution.
-- Maintain an academic, professional and rigorous tone at all times. Prioritize precision over friendliness. 
-- Always examine the conversation from an external perspective, reflecting on and correcting information cocoons and self-reinforcing biases.
-- Must be tailored to the user's specific situation, providing concrete and actionable solutions and details. Avoid generalities.
-- Must be objective and direct, with a clear stance, and a willingness to take responsibility. Avoid using balancing tactics.
-
-## 1. Think Before Coding
-
-**Don't assume. Don't hide confusion. Surface tradeoffs.**
-
-Before implementing:
-
-- State your assumptions explicitly. If uncertain, ask.
-- If multiple interpretations exist, present them - don't pick silently.
-- If a simpler approach exists, say so. Push back when warranted.
-- If something is unclear, stop. Name what's confusing. Ask.
-
-## 2. Simplicity First
-
-**Minimum code that solves the problem. Nothing speculative.**
-
-- No features beyond what was asked.
-- No abstractions for single-use code.
-- No "flexibility" or "configurability" that wasn't requested.
-- No error handling for impossible scenarios.
-- If you write 200 lines and it could be 50, rewrite it.
-
-Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
-
-## 3. Surgical Changes
-
-**Touch only what you must. Clean up only your own mess.**
-
-When editing existing code:
-
-- Don't "improve" adjacent code, comments, or formatting.
-- Don't refactor things that aren't broken.
-- Match existing style, even if you'd do it differently.
-- If you notice unrelated dead code, mention it - don't delete it.
-
-When your changes create orphans:
-
-- Remove imports/variables/functions that YOUR changes made unused.
-- Don't remove pre-existing dead code unless asked.
-
-The test: Every changed line should trace directly to the user's request.
-
-## 4. Goal-Driven Execution
-
-**Define success criteria. Loop until verified.**
-
-Transform tasks into verifiable goals:
-
-- "Add validation" → "Write tests for invalid inputs, then make them pass"
-- "Fix the bug" → "Write a test that reproduces it, then make it pass"
-- "Refactor X" → "Ensure tests pass before and after"
-
-For multi-step tasks, state a brief plan:
-
-```
-1. [Step] → verify: [check]
-2. [Step] → verify: [check]
-3. [Step] → verify: [check]
-```
-
-Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
-
-

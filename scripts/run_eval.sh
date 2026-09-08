@@ -1,12 +1,13 @@
 #!/bin/bash
 # Eval wrapper script
 #
-# Usage: bash scripts/run_eval.sh <checkpoint_path> [dataset_config] [gpu_id]
+# Usage: bash scripts/run_eval.sh <checkpoint_path> [dataset_config] [gpu_id] [extra_args]
 #
 # Arguments:
 #   checkpoint_path  Path to .pt checkpoint file (required)
 #   dataset_config   Hydra dataset config name under conf_eval/dataset/ (default: full-512)
 #   gpu_id           Which GPU to use (default: 1)
+#   extra_args       Extra Hydra CLI overrides (e.g. "model.nanopfn.use_fk_bias=true")
 #
 # Available dataset configs:
 #   clf_rel_npz      Relbench classification tasks (19 datasets, uses clf_rel_subsamples/ cache)
@@ -19,6 +20,7 @@
 #   bash scripts/run_eval.sh checkpoints/RDBPFN/model_eval00528.pt clf_rel_npz 0
 #   bash scripts/run_eval.sh checkpoints/v5.1_relmode/model.pt clf_npz 1
 #   bash scripts/run_eval.sh checkpoints/RDBPFN_single/model_eval00360.pt full-512 0
+#   bash scripts/run_eval.sh checkpoints/fk_bias_run/model.pt clf_rel_npz 0 "model.nanopfn.use_fk_bias=true"
 
 set -euo pipefail
 
@@ -27,7 +29,8 @@ ROOT="$(dirname "$SCRIPT_DIR")"
 
 CKPT="${1:?Error: checkpoint path required}"
 DATASET="${2:-full-512}"
-GPU="${3:-${CUDA_VISIBLE_DEVICES:-0}}"
+GPU="${3:-${CUDA_VISIBLE_DEVICES:-2}}"
+EXTRA_EVAL_ARGS="${4:-}"  # optional extra Hydra overrides
 
 # Choose config name: CSV datasets (clf_*) use eval_csv, RDB datasets (full-*) use eval
 if [[ "${DATASET}" == clf_* ]]; then
@@ -54,10 +57,18 @@ echo ""
 
 cd "${ROOT}/model_pretrain"
 
-/data/caijunyu/RDBPFN/.pixi/envs/default/bin/python3 -m src.eval \
-    --config-name="${CONFIG_NAME}" \
-    "dataset=${DATASET}" \
+EVAL_ARGS=(
+    --config-name="${CONFIG_NAME}"
+    "dataset=${DATASET}"
     "model.checkpoint_path=${CKPT}"
+)
+if [ -n "${EXTRA_EVAL_ARGS}" ]; then
+    for arg in ${EXTRA_EVAL_ARGS}; do
+        EVAL_ARGS+=("${arg}")
+    done
+fi
+
+/data/caijunyu/RDBPFN/.pixi/envs/default/bin/python3 -m src.eval "${EVAL_ARGS[@]}"
 
 echo ""
 echo "Eval complete."

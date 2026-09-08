@@ -28,15 +28,13 @@ class FKAttentionBias(nn.Module):
 
     def __init__(self, init_lambda: float = 0.1):
         super().__init__()
-        raw_init = float(np.log(np.exp(init_lambda) - 1))  # invert softplus
         self.raw_lambdas = nn.Parameter(torch.empty(0))
 
     def _lambdas_for(self, K: int) -> torch.Tensor:
-        """Return softplus lambdas for K FK columns, expanding the parameter if needed."""
+        """Return softplus lambdas for K FK columns, expanding if needed."""
         current = self.raw_lambdas.shape[0]
         if K <= current:
             return F.softplus(self.raw_lambdas[:K])
-        # Expand and replace the parameter to accommodate more FK columns
         raw_init = float(np.log(np.exp(0.1) - 1))
         pad = torch.full((K - current,), raw_init, device=self.raw_lambdas.device)
         self.raw_lambdas = nn.Parameter(torch.cat([self.raw_lambdas.data, pad]))
@@ -73,7 +71,6 @@ class FKAttentionBias(nn.Module):
         keys_train = match_keys[:, :train_rows, :]  # (B, tr, K)
         keys_test = match_keys[:, train_rows:, :]    # (B, te, K)
 
-        # Mask: only match VALID (non-negative) keys
         valid_train = (keys_train >= 0)  # (B, tr, K)
         valid_test = (keys_test >= 0)    # (B, te, K)
 
@@ -142,7 +139,6 @@ class EntityAttentionBias(nn.Module):
         valid_train = (eid_train >= 0)  # (B, tr)
         valid_test = (eid_test >= 0)    # (B, te)
 
-        # bias_left: (B, tr, tr) — support↔support
         match_left = (eid_train.unsqueeze(2) == eid_train.unsqueeze(1)).float()
         both_valid_left = (
             valid_train.unsqueeze(2) & valid_train.unsqueeze(1)

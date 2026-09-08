@@ -73,6 +73,8 @@ class TrainConfig:
     gradient_accumulation_steps: int = 1
     full_eval_steps: int = 0  # Run full relational eval every N steps (0=disabled)
     full_eval_dataset_dir: str = ""  # Dir of DBBRDBDataset subdirs (e.g. rdb_datasets)
+    full_eval_seeds: list[int] = field(default_factory=lambda: [0])
+    run_final_eval: bool = True
 
 
 @dataclass
@@ -100,6 +102,19 @@ def _resolve_path(path_str: str | None) -> Path | None:
     if path_str in (None, ""):
         return None
     return Path(to_absolute_path(path_str))
+
+
+def _optimizer_steps_to_data_steps(
+    optimizer_steps: int,
+    num_processes: int,
+    gradient_accumulation_steps: int,
+) -> int:
+    """Expand optimizer updates into the global dataloader iteration budget."""
+    return (
+        int(optimizer_steps)
+        * max(1, num_processes)
+        * max(1, gradient_accumulation_steps)
+    )
 
 
 def _validate_model_config(model_cfg: ModelConfig):
@@ -294,6 +309,12 @@ def main(cfg: Config):
     joint_seed = cfg.seed
     world_size = accelerator.num_processes
     shard_id = accelerator.process_index
+    grad_accum_steps = max(
+        1, int(getattr(cfg.train, "gradient_accumulation_steps", 1))
+    )
+    training_data_steps = _optimizer_steps_to_data_steps(
+        cfg.train.num_steps, world_size, grad_accum_steps
+    )
     weights = [entry["weight"] for entry in dataset_entries]
     if any(weight is not None for weight in weights):
         if not all(weight is not None for weight in weights):
@@ -318,7 +339,7 @@ def main(cfg: Config):
         ]
         joint_dataset = JointDataset(
             datasets=datasets,
-            steps_per_epoch=cfg.train.num_steps,
+            steps_per_epoch=training_data_steps,
             batch_size=cfg.train.batch_size,
             weights=loader_weights,
             seed=joint_seed,
@@ -355,7 +376,7 @@ def main(cfg: Config):
         ]
         prior = JointPriorLoader(
             prior_loaders,
-            steps_per_epoch=cfg.train.num_steps,
+            steps_per_epoch=training_data_steps,
             weights=loader_weights,
             seed=cfg.seed,
         )
@@ -400,13 +421,15 @@ def main(cfg: Config):
         accelerator=accelerator,
         full_eval_steps=cfg.train.full_eval_steps,
         full_eval_dataset_dir=cfg.train.full_eval_dataset_dir,
+        full_eval_seeds=cfg.train.full_eval_seeds,
     )
-    if accelerator.is_main_process:
+    if accelerator.is_main_process and cfg.train.run_final_eval:
         final_metrics = eval_fn(build_classifier(model, device, cfg.model))
         logger.info("Final evaluation: %s", final_metrics)
         if cfg.wandb.enabled:
             wandb.log({f"final/{k}": v for k, v in final_metrics.items()})
-            wandb.finish()
+    if accelerator.is_main_process and cfg.wandb.enabled:
+        wandb.finish()
 
 
 if __name__ == "__main__":

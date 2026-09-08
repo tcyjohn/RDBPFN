@@ -24,3 +24,18 @@ model_pretrain/wandb/
 # pixi environments
 .pixi/*
 !.pixi/config.toml
+
+# Local execution artifacts and downloaded archives
+*.log
+*.aux
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.tar.gz
+/AuthorKit27*.zip
+/index.html*
+/outputs/
+/model_pretrain/logs/
+/model_pretrain/nohup.out
+/.superpowers/
+/aaai2027_submission/local_texlive/

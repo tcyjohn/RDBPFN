@@ -35,6 +35,7 @@ Current synthetic generation:
 
 **New parameters**:
 - `snapshots_per_entity_range`: random integer range (e.g., [5, 20]), sampled per entity table
+  - Entity table total rows = `num_entities (DAG) × snapshots_per_entity`
 - `entity_timestamp_prob`: float (default 1.0), probability an entity table gets a timestamp column
 - Entity PK column: deterministic, shared across all snapshots of same entity
 

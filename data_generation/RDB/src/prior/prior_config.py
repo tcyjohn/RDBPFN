@@ -392,13 +392,13 @@ DEFAULT_HSBM_HP = {
     },
     "hsbm_fk_sparsity_min": {
         "distribution": "uniform",
-        "min": 0.0,
-        "max": 0.15,
+        "min": 0.0,  # Disabled: FK sparsity was preventing FK sibling formation
+        "max": 0.0,
     },
     "hsbm_fk_sparsity_max": {
         "distribution": "uniform",
-        "min": 0.05,
-        "max": 0.35,
+        "min": 0.0,  # Disabled: FK sparsity was preventing FK sibling formation
+        "max": 0.0,
     },
 }
 

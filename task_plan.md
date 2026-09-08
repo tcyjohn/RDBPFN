@@ -1,42 +1,112 @@
-# Task Plan: Entity-Level Aggregation Task Bias
+# Task Plan
 
-## Goal
+## Completed: AAAI manuscript — RQ2 two-by-two sensitivity-grid revision
 
-Bias focal table selection toward entity/parent tables, so more synthetic tasks match the RelBench pattern (entity-level prediction with aggregated child features). This naturally produces richer cross-source feature correlation in DFS output without modifying the data generation pipeline.
+### Goal
 
-## Background
+Integrate the low-temporal-history-density + grouped-sources-disabled result into
+the paper without presenting the four independently materialized corpora as a
+factorial causal experiment. Keep aggregate, task-level, and mechanism evidence
+non-overlapping, and make the seven-page main body visually full before
+references begin on page 8.
 
-Current `generate_random_focal_table_and_schema()` selects focal tables uniformly at random, producing ~50% entity-focused (RelBench-style) and ~50% child-focused tasks. RelBench has 100% entity-level tasks. The previous cross-parent correlation efforts (FK propensity, struct_sig, matching latent) targeted the child-focused case where the fundamental bottleneck is independent parent SCM generation. Entity-focused tasks with aggregation naturally have higher cross-source correlation (aggregation functions on same columns are mathematically linked; different child tables share the entity as information channel).
+### Work plan
 
-## Phases
+1. **Analysis pipeline** — add the joint-removal checkpoint, compute all aligned
+   task/seed contrasts, and regenerate Figure 2 with R3-vs-R2 and
+   R3-vs-joint-removal panels.
+2. **Main manuscript** — replace RQ2 and Table 3 with the four-cell sensitivity
+   grid; update Figure 2 caption, setup, discussion, and limitations.
+3. **Technical supplement** — add aggregate provenance, the 10-by-4 per-seed
+   table, conditional intervals, and the descriptive interaction with an
+   explicit non-causal boundary.
+4. **Verification and layout** — compile both PDFs, audit numbers and
+   terminology, render pages, and adjust floats/text so main content fills seven
+   pages and references start on page 8.
 
-### Phase 1 — Entity table classification and focal bias
-Status: **complete**
+### Locked decisions
 
-- [x] 1.1 Add `_classify_tables()` method: classify tables as entity (has ≥1 children, i.e., referenced by FK from other tables) vs non-entity
-- [x] 1.2 Modify `generate_random_focal_table_and_schema()`: weighted sampling, entity tables at `entity_task_ratio` probability (default 0.75)
-- [x] 1.3 When focal is entity, prefer child tables as neighbors in schema graph construction (ensures entity→child structure for aggregation tasks)
-- [x] 1.4 Add `entity_task_ratio` HP to `prior_config.py` — set as default in constructor (0.75), threaded through `initialize_tasks_with_complex_tasks()`
+- SA-RDB-PFN means R3.
+- Public prose uses temporal-history density, never snapshot language.
+- Main Table 3 owns aggregate AUROCs and scale; Figure 2 owns per-task
+  heterogeneity; Figures 3–4 retain mechanism diagnostics.
+- The fourth setting is “Low density, no grouped sources” in the table and the
+  “joint-removal operating point” in prose/captions.
+- Conditional gains are sensitivity evidence, not causal main effects or a
+  factorial interaction.
 
-### Phase 2 — 64-RDB eval (new task distribution)
-Status: pending
+## Active: `parent_entity_ids` — Entity-Level FK Bias
 
-- [ ] 2.1 Generate 64 RDBs (seeds 0-63) with entity-biased task generation
-- [ ] 2.2 Run preprocessing (DFS via run_pipeline.sh, skip training)
-- [ ] 2.3 Evaluate: task type distribution, native_corr, native-joined_corr, joined_corr, cross_corr, cross_agg_corr
-- [ ] 2.4 Compare against baseline (random focal selection) and log to findings.md
+### Context
 
-## Target Metrics
+FK bias λ stuck at init (0.1) because FK column stores parent ROW INDEX.
+For entity tables with snapshots (S rows per entity), different child rows
+connecting to the same parent entity but different snapshots get different
+FK values → FK bias sees zero signal (0.015% pair ratio in v6.2).
 
-| Metric | Current (random focal) | Target (entity bias) |
-|--------|:---:|:---:|
-| Entity-focused task % | ~50% | [70%, 85%] |
-| cross_agg_corr (DFS) | ~0.05 | [0.10, 0.18] |
-| native_corr | ~0.34 | keep ≥ 0.30 |
+Root cause: `process_data()` line 888 stores `FK_id` (parent row index) as-is.
 
-## Non-goals
+### Design
 
-- NOT modifying data generation pipeline (SCMs, HSBM, signal-group features)
-- NOT modifying DFS feature engineering
-- NOT modifying timestamp table assignment (deferred)
-- NOT modifying model training or H5 merge
+Add `parent_entity_ids` column (shape: `num_rows × num_fk_cols`, int64):
+- For entity parents: `parent_entity_ids[i] = parent.entity_ids[fk_value[i]]`
+- For non-entity parents: `parent_entity_ids[i] = fk_value[i]` (fallback)
+- Stored alongside FK columns, not in feature X
+- FK bias uses `parent_entity_ids` for matching instead of raw FK values
+
+Effect: FK pair ratio increases from ~0.015% to ~S× (where S = avg snapshots).
+
+### Files to change
+
+1. **Data generation** (`table_generation.py`):
+   - `_materialize_tables_from_pending`: compute `parent_entity_ids` per FK col
+   - Store as new column type `PARENT_ENTITY_ID` at end of table data
+   - Save metadata for downstream consumption
+
+2. **Metadata** (`table_generation.py`, `dag_to_rdb_generator.py`):
+   - Track `parent_entity_cols: List[int]` per table (column indices)
+   - Expose through RDB metadata/serialization
+
+3. **H5 merge** (`merge_dbinfer_to_h5.py`):
+   - Read `parent_entity_ids` from RDB data (separate from X features)
+   - Store in H5 as `parent_entity_ids` dataset (shape: tasks × 600 × max_fk_cols)
+
+4. **Model** (`models.py`):
+   - `FKAttentionBias`: optionally use `parent_entity_ids` instead of raw FK
+   - Or: rename/refactor to accept entity-level FK grouping keys
+
+5. **Dataloader** (`inmemory_dataloader.py`, `dataloaders.py`):
+   - Load `parent_entity_ids` from H5
+   - Thread through collate_batch → model
+
+6. **Training/Eval** (`training.py`, `eval.py`, `eval_utils.py`):
+   - Thread `parent_entity_ids` through batch and eval
+
+### Validation
+
+1. Generate 32 RDBs, verify `parent_entity_ids` correctness
+2. H5 merge, verify FK pair ratio > 5%
+3. Train smoke run, verify FK bias λ moves from init
+
+---
+
+## Completed
+
+### v6.2: Child Entity Preference + FK Bias Attempt
+- `task_generation.py`: `_has_parent()` + child entity 70% preference in relbench mode
+- FK bias still frozen at init (0.015% pair ratio)
+- Root cause identified: FK = parent row index, not entity ID
+
+### v6.1: Entity ID Corruption Fix
+- `task_generation.py`: exclude entity_id from homophily + task targets
+- Entity pair ratio dropped to 0.06% after fix
+- Entity bias λ learned in layer 5 only
+
+### Entity Temporal Snapshots
+- Entity tables: `num_rows = num_entities × snapshots_per_entity`
+- entity_id column: `[0,0,...,0, 1,1,...,1, ...]` per entity
+- Same-entity attention bias (EntityAttentionBias)
+
+### Homophily-Controlled Labels
+- `homophily.py`: HomophilyLabelGenerator from OPENRFM Appendix G
+- Block assignments via HSBM block paths → parent blocks → pseudo-blocks

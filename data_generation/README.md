@@ -67,49 +67,42 @@ These directories are consumed later by [../data_preprocessing/single_table_proc
 
 ## Subproject 2: RDB Generation
 
-### Purpose
+### Current Generator
 
-This subproject generates synthetic relational databases with multiple variants.
+The main entry point is [RDB/dag_to_rdb_generator.py](RDB/dag_to_rdb_generator.py). Install the shared environment with `pixi install` from the repository root. [RDB/RDB_generate.sh](RDB/RDB_generate.sh) retains the original large-scale schedule; the current combined pipeline lives in [../scripts/run_pipeline.sh](../scripts/run_pipeline.sh).
 
-### Installation
-
-From the repository root:
+Generate a small raw corpus from the repository root:
 
 ```bash
-cd data_generation/RDB
-pip install -e .
+pixi run python data_generation/RDB/dag_to_rdb_generator.py \
+  --dag_data_path data_generation/RDB/datasets/rdb_v1.pth \
+  --config_file data_generation/RDB/dag_to_rdb_config_small.yaml \
+  --num_rdbs 4 --start_index 0 --num_processes 1 \
+  --output_base_dir data_generation/RDB_datasets/my_run \
+  --use_complex_tasks true
 ```
 
-Because this codebase does not rely on complex packaging, it is usually straightforward to run it in another environment as long as PyTorch and the required dependencies are installed.
+Each accepted database is saved in 4DBInfer format with parquet tables, task splits, and `metadata.yaml`. Quality filtering can reject databases, so the requested index range does not guarantee that every output exists.
 
+### Changes in This Fork
 
-### Main Entry Points
+- [HSBM](RDB/src/prior/hsbm.py) samples FK connectivity, including correlated multi-parent assignments.
+- [MLP SCM](RDB/src/prior/mlp_scm.py) and [table generation](RDB/src/table_def/table_generation.py) implement signal-group features and entity temporal snapshots.
+- [Task generation](RDB/src/table_def/task_generation.py) supports complex tasks and RelBench-style entity prediction.
+- [Task quality](RDB/src/table_def/task_quality.py) filters tasks; [homophily](RDB/src/prior/homophily.py) provides optional label generation.
 
-- [RDB/RDB_generate.sh](RDB/RDB_generate.sh): launches the default RDB generation schedule.
-- [RDB/dag_to_rdb_generator.py](RDB/dag_to_rdb_generator.py): main generator script.
+| Option | Purpose |
+| --- | --- |
+| `--relbench_mode` | Select entity-focused RelBench-style tasks. |
+| `--snapshots_per_entity_min`, `--snapshots_per_entity_max` | Override the entity snapshot-count range. |
+| `--entity_timestamp_prob` | Override the probability of timestamps on entity tables. |
+| `--no-quality-filter`, `--quality-max-retries` | Disable the quality gate or set its retry budget. |
+| `--snr-threshold` | Set the SNR acceptance threshold; `0` disables it. |
+| `--use_homophily_labels` | Enable optional homophily-controlled labels. |
+| `--no_path_signal` | Disable the path-signal component. |
+| `--use_row_gnn`, `--gnn_device` | Enable optional row GNN refinement and select its device. |
 
-### Default Usage
-
-Run the provided generation script:
-
-```bash
-cd data_generation/RDB
-bash RDB_generate.sh
-```
-
-The current script creates multiple raw synthetic datasets under `RDB_datasets/`, including:
-
-- small and large prior configurations
-- variants with and without GNN-based generation
-- pre-split parts for later preprocessing with different DFS hop settings
-
-These outputs are consumed later by [../data_preprocessing/RDB_processing.sh](../data_preprocessing/RDB_processing.sh).
-
-### Notes
-
-- Output directories and dataset counts are currently hard-coded in the shell script.
-- The `--use_row_gnn` flag controls whether row-level graph structure is used during generation.
-- The current default script is large-scale and may require substantial runtime (could take days) and storage. You can modify the script to generate smaller datasets or more aggressive parallelization for testing.
+Sizing is configured in [RDB/dag_to_rdb_config_small.yaml](RDB/dag_to_rdb_config_small.yaml); prior hyperparameters are in [RDB/src/prior/prior_config.py](RDB/src/prior/prior_config.py). See [../docs/data_generation_pipeline.md](../docs/data_generation_pipeline.md) for implementation details.
 
 ## Handoff to Preprocessing
 

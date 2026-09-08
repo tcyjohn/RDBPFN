@@ -1,0 +1,3 @@
+# Complete prior includes source-row cardinality
+
+The complete SA-RDB-PFN relational prior has four design dimensions: hierarchical foreign-key connectivity, calendar-aware temporal structure, grouped latent feature sources, and source-row cardinality. The first three are semantic structural mechanisms aligned with reachability, availability, and content dependence; cardinality changes the generated row-count distribution and is empirically important while remaining separate from the PFN support-row budget. This supersedes the earlier treatment of density as external to the prior or as guaranteed temporal-history exposure.

@@ -791,7 +791,10 @@ def _run_full_eval(
 
     classifier = classifier_factory(model, device)
     task_aurocs: list[float] = []
-    n_tasks = 0
+    skipped_train_single_class = 0
+    skipped_test_single_class = 0
+    failed_tasks = 0
+    nonfinite_tasks = 0
 
     for ds_path in ds_paths:
         try:
@@ -844,6 +847,22 @@ def _run_full_eval(
             X_train, X_test = fill_nans(X_train, X_test)
 
             if len(np.unique(y_train)) < 2:
+                skipped_train_single_class += 1
+                _log.warning(
+                    "Skipping full eval %s/%s seed=%s: train split has one class",
+                    dataset.dataset_name,
+                    task.metadata.name,
+                    seed,
+                )
+                continue
+            if len(np.unique(y_test)) < 2:
+                skipped_test_single_class += 1
+                _log.warning(
+                    "Skipping full eval %s/%s seed=%s: test split has one class",
+                    dataset.dataset_name,
+                    task.metadata.name,
+                    seed,
+                )
                 continue
 
             try:
@@ -857,9 +876,10 @@ def _run_full_eval(
                     parent_entity_ids_test=parent_entity_ids_test,
                 )
             except Exception as exc:
+                failed_tasks += 1
                 _log.warning(
-                    "Eval failed %s/%s: %s",
-                    dataset.dataset_name, task.metadata.name, exc,
+                    "Eval failed %s/%s seed=%s: %s",
+                    dataset.dataset_name, task.metadata.name, seed, exc,
                 )
                 continue
 
@@ -867,8 +887,17 @@ def _run_full_eval(
                 auroc = float(roc_auc_score(y_test, prob[:, 1]))
             else:
                 auroc = float(roc_auc_score(y_test, prob, multi_class="ovr"))
+            if not np.isfinite(auroc):
+                nonfinite_tasks += 1
+                _log.warning(
+                    "Skipping full eval %s/%s seed=%s: non-finite AUROC %s",
+                    dataset.dataset_name,
+                    task.metadata.name,
+                    seed,
+                    auroc,
+                )
+                continue
             task_aurocs.append(auroc)
-            n_tasks += 1
 
     if not task_aurocs:
         return {}
@@ -876,7 +905,11 @@ def _run_full_eval(
     avg_auroc = float(np.mean(task_aurocs))
     return {
         "full128/avg_auroc": avg_auroc,
-        "full128/num_tasks": float(n_tasks),
+        "full128/num_tasks": float(len(task_aurocs)),
+        "full128/skipped_train_single_class": float(skipped_train_single_class),
+        "full128/skipped_test_single_class": float(skipped_test_single_class),
+        "full128/failed_tasks": float(failed_tasks),
+        "full128/nonfinite_tasks": float(nonfinite_tasks),
     }
 
 
@@ -966,6 +999,7 @@ def train(
     accelerator: Accelerator | None = None,
     full_eval_steps: int = 0,
     full_eval_dataset_dir: str = "",
+    full_eval_seeds: Sequence[int] | None = None,
 ):
     device = accelerator.device
 
@@ -984,6 +1018,7 @@ def train(
     )
     eval_checkpoint_template = None
     eval_checkpoint_parent = None
+    full_eval_seeds = list(full_eval_seeds or [0])
     if checkpoint_path and eval_save_interval:
         eval_checkpoint_template = (
             f"{checkpoint_path.stem}_eval{{:05d}}{checkpoint_path.suffix}"
@@ -1102,6 +1137,11 @@ def train(
                     optimizer.step()
                     optimizer.zero_grad()
 
+                    original_loss_sum += base_loss_value
+                    original_loss_count += 1
+                    total_loss_sum += base_loss_value + aug_loss_sum
+                    total_loss_count += 1 + aug_loss_count
+
                 step_train_duration = time.time() - step_start_time
                 train_time += step_train_duration
 
@@ -1157,12 +1197,24 @@ def train(
                             and accelerator.is_main_process
                         ):
                             model_to_eval = accelerator.unwrap_model(model)
-                            full_scores = _run_full_eval(
-                                model_to_eval,
-                                device,
-                                full_eval_dataset_dir,
-                                classifier_factory,
-                            )
+                            full_scores = {}
+                            seed_avgs = []
+                            for seed in full_eval_seeds:
+                                seed_scores = _run_full_eval(
+                                    model_to_eval,
+                                    device,
+                                    full_eval_dataset_dir,
+                                    classifier_factory,
+                                    seed=seed,
+                                )
+                                for key, value in seed_scores.items():
+                                    full_scores[f"{key}/seed{seed}"] = value
+                                if "full128/avg_auroc" in seed_scores:
+                                    seed_avgs.append(seed_scores["full128/avg_auroc"])
+                            if seed_avgs:
+                                full_scores["full128/avg_auroc"] = float(
+                                    np.mean(seed_avgs)
+                                )
                             if full_scores and log_callback:
                                 log_callback(
                                     time.time() - total_start_time,
@@ -1203,7 +1255,10 @@ def train(
 
     if checkpoint_path and best_score == float("-inf") and accelerator.is_main_process:
         torch.save(
-            {"model_state_dict": accelerator.unwrap_model(model).state_dict()},
+            {
+                "model_state_dict": accelerator.unwrap_model(model).state_dict(),
+                "step": global_step,
+            },
             checkpoint_path,
         )
         logger.info("Saved final model checkpoint to %s", checkpoint_path)

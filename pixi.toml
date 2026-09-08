@@ -25,6 +25,10 @@ huggingface_hub = ">=1.15.0,<2"
 sql-formatter = ">=0.2"
 tqdm = ">=4.67.3,<5"
 duckdb = ">=1.5.2,<2"
+texlive-core = ">=20260301,<20260302"
+latexmk = ">=4.88,<5"
+tectonic = ">=0.16.9,<0.17"
+pytest = ">=9.1.1,<10"
 
 
 [pypi-dependencies]

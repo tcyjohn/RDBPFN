@@ -213,8 +213,8 @@ for table_name in topological_sort(graph):
             ├── XSampler 采样 root causes (seq_len, num_causes)
             ├── MLP layers 前向传播 → CAUSAL_OUTPUT, Y
             ├── [可选] _prepare_time_features() (time_dim=0 → 跳过)
-            ├── _build_intrinsic_signal(): causes_raw → Linear → (seq_len, 8)
-            └── [Signal-Group]: _construct_features() 覆盖 X (α=[0,0,0,1])
+            ├── _build_intrinsic_signal(): CAUSAL_OUTPUT → Linear(num_outputs, 8) → (seq_len, 8)
+            └── [Signal-Group]: _construct_features() 覆盖 X (α=[0,0,0,1], 100% intrinsic)
 
     else (有父表):
         _compute_hsbm_fk_ids(): HSBM 采样 FK 连接
@@ -240,7 +240,7 @@ _materialize_tables_from_pending() → Table.process_data()
 | time_dim | 0 | >0 | 0 |
 | Signal-Group α (4维) | `[0, 0, 0, 1]` (仅 intrinsic) | `[~0.5, ~0.25, ~0.25, 0]` (time+parent+path) | `[0, ~0.6, ~0.4, 0]` (parent+path only) |
 
-**关键架构分离**: MLP 负责生成 Y (预测目标) 和 CAUSAL_OUTPUT (传给子表的隐层表示)；Signal-Group 负责构造 X (特征列)。两者通过 `causes_raw` 共享随机种子，但计算路径独立。Intrinsic signal 使 source 表在无 timestamp 的情况下仍能产生结构化特征。
+**关键架构**: MLP 负责生成 Y (预测目标) 和 CAUSAL_OUTPUT (传给子表的隐层表示)；Signal-Group 负责构造 X (特征列)。Source 表通过 `CAUSAL_OUTPUT → intrinsic_projector → intrinsic_sig` 使 X 和 Y 共享 MLP 中间表示。Non-ts child 通过 parent CAUSAL_OUTPUT → parent_sig 间接获得 MLP 输出，形成级联耦合效应。
 
 ### 5.3 数据后处理: ColumnDataProcessor
 
@@ -391,7 +391,7 @@ Step 5c: Post-DFS Transform
 | **time** | 11 | 时间信号 | basis(8) + gates(3), 来自 TemporalVocab |
 | **parent** | 12 | 父表特征信号 | 每个 FK 边: parent CAUSAL_OUTPUT → Linear → mean-pool |
 | **path** | 8 | HSBM 块路径信号 | 每个 FK 边: Block indices → Embedding → PathEncoder → mean-pool |
-| **intrinsic** | 8 | 内在信号 (v2 新增) | `causes_raw → Linear(num_causes, 8)`; 计划改为 `CAUSAL_OUTPUT → Linear(num_outputs, 8)` |
+| **intrinsic** | 8 | 内在信号 | `CAUSAL_OUTPUT → Linear(num_outputs, 8)` — 本表 MLP 中间输出经 Linear 投影 |
 
 信号产生流程:
 ```
@@ -409,11 +409,8 @@ path_sig:
   block_paths[:, :n_levels] → Embedding per level → concat → Linear → mean over edges
     → (seq_len, 8)
 
-intrinsic_sig (当前):
-  causes_raw → Linear(num_causes → 8) → (seq_len, 8)
-
-intrinsic_sig (计划, MLP-integrated):
-  MLP(causes_raw) → CAUSAL_OUTPUT → Linear(num_outputs → 8) → (seq_len, 8)
+intrinsic_sig:
+  CAUSAL_OUTPUT (MLP 中间层输出) → Linear(num_outputs → 8) → (seq_len, 8)
 ```
 
 ### 8.2 原型 (Archetype) 驱动的 α 分配
@@ -426,7 +423,7 @@ intrinsic_sig (计划, MLP-integrated):
 |---|---|---|
 | Source table | `num_parents == 0` | `[0, 0, 0, 1.0]` |
 | Timestamp child | `is_timestamp=True` | `[~0.5, ~0.25, ~0.25, 0]` |
-| Dependent non-ts | 其他子表 | `[0, ~0.6, ~0.4, 0]` (计划改为 `[0, ~0.5, ~0.35, ~0.15]`) |
+| Dependent non-ts | 其他子表 (无时间戳, 有父表) | `[0, ~0.6, ~0.4, 0]` (仅 parent+path, 无 intrinsic) |
 
 多父表情况下, parent 份额上调 (最多 0.6)。不可用组 (如 source 表的 parent/path, non-ts 表的 time) 被 mask 为零后重新归一化。
 
@@ -442,11 +439,11 @@ MLP 和 Signal-Group 是两个解耦的机制:
 
 | Archetype | X 信号来源 | MLP 输入共享 | 耦合强度 |
 |-----------|-----------|-------------|---------|
-| Source | intrinsic (当前: Linear(causes_raw)) | causes_raw | 弱 |
+| Source | intrinsic = Linear(CAUSAL_OUTPUT) | CAUSAL_OUTPUT (MLP 中间层) | 中强 |
 | Timestamp child | time + parent + path | time_features + parent_causes | 强 |
 | Non-ts child | parent + path | parent_causes | 中 |
 
-**改进方向**: 将 intrinsic signal 的输入从 `causes_raw` 改为 `CAUSAL_OUTPUT` (MLP 中间层输出)，使 intrinsic signal 建立在 MLP 计算之上，增强 source 表和非 ts child 表的 X-Y 耦合。
+Source 表的 intrinsic signal 和 Y 都来自同一 MLP 中间层 (CAUSAL_OUTPUT)，共享了 MLP 的非线性变换。Non-ts child 表通过 parent_sig (parent CAUSAL_OUTPUT → projector) 间接获得 MLP 输出，形成级联耦合。
 
 ### 8.3 特征分配
 

@@ -764,6 +764,7 @@ class Table:
         self.column_names = column_names
         self.data_type_configs = data_type_configs
         self.time_column = time_column
+        self.entity_column: int | None = None
         self.device = device
 
         # Initialize column data processors with preprocessing options
@@ -842,7 +843,8 @@ class Table:
         return self.dataframe
 
     def process_data(
-        self, raw_data: torch.Tensor, FK_ids=None, parent_tables: List[str] = None
+        self, raw_data: torch.Tensor, FK_ids=None, parent_tables: List[str] = None,
+        entity_ids: torch.Tensor = None,
     ) -> torch.Tensor:
         """
         Generate table data by converting raw data according to specified data type configurations.
@@ -895,12 +897,21 @@ class Table:
                 timestamp_values.squeeze(), self.data_type_configs[self.time_column]
             )
 
+        # Set entity_id column if this is an entity table
+        if self.entity_column is not None and entity_ids is not None:
+            self.data[:, self.entity_column] = entity_ids.to(
+                device=self.device, dtype=self.data.dtype,
+            )
+
         # Process remaining features (skip timestamp column if already set)
         for i in range(self.num_features):
             processer_idx = i + self.num_cols - self.num_features
 
             # Skip if this is the timestamp column (already processed)
             if self.time_column is not None and processer_idx == self.time_column:
+                continue
+            # Skip if this is the entity_id column (already set)
+            if self.entity_column is not None and processer_idx == self.entity_column:
                 continue
 
             data_type_config = self.data_type_configs[processer_idx]
@@ -1087,6 +1098,12 @@ class TableGenerator:
         self.hsbm_clusters_per_level: Dict[str, int] = {}
         # HSBM block paths — stored after generate_data() for downstream use
         self.hsbm_block_paths: torch.Tensor | None = None
+        # HSBM parent-side blocks — stored from child FK generation (for homophily labels)
+        self.hsbm_parent_blocks: torch.Tensor | None = None
+        # Entity table metadata (for temporal snapshots + same-entity bias)
+        self.is_entity_table: bool = False
+        self.num_entities: int = 0
+        self.snapshots_per_entity: int = 1
         # FK Propensity params (table-level, used for single-parent)
         self.propensity_rho: float = 0.0
         self.propensity_beta: float = 0.0
@@ -1126,7 +1143,12 @@ class TableGenerator:
         parent_rows: int,
         child_rows: int,
     ) -> tuple[int, list[int]]:
-        """Row-count-aware clipping: max leaf blocks must fit in both sides."""
+        """Row-count-aware clipping: max leaf blocks must fit in both sides.
+
+        Prefers reducing *clusters_per_level* over *num_levels* so that
+        multi-level block structure is preserved for FK sibling formation.
+        At minimum tries to keep cpl ≥ 2 (unless min_rows < 2).
+        """
         import logging
 
         logger = logging.getLogger(__name__)
@@ -1134,13 +1156,19 @@ class TableGenerator:
         original_cpl = clusters_per_level
         original_nlv = num_levels
 
-        max_leaf = clusters_per_level ** num_levels
-        if max_leaf > min_rows:
-            while num_levels > 0 and clusters_per_level ** num_levels > min_rows:
+        # Floor: keep at least 2 clusters when possible (non-trivial HSBM)
+        min_cpl = 2 if min_rows >= 2 else 1
+
+        # Reduce cpl first, then num_levels
+        while num_levels > 0 and clusters_per_level ** num_levels > min_rows:
+            if clusters_per_level > min_cpl:
+                clusters_per_level -= 1
+            else:
                 num_levels -= 1
-            if num_levels == 0:
-                num_levels = 1
-                clusters_per_level = min(clusters_per_level, min_rows)
+
+        if num_levels == 0:
+            num_levels = 1
+            clusters_per_level = max(min_cpl, min(clusters_per_level, min_rows))
 
         if clusters_per_level != original_cpl or num_levels != original_nlv:
             logger.warning(
@@ -1163,16 +1191,17 @@ class TableGenerator:
         fk_seed: int,
         parent_data_list: list,
         parent_names: list[str] | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, dict[str, np.ndarray]]:
         """Compute FK connections via HSBM.
 
         Single parent: uses ``compute_hsbm_fk_ids`` directly.
         Multiple parents: uses ``compute_hsbm_fk_ids_multi`` with a shared
         latent cluster path for joint tuple sampling.
 
-        Returns ``(fk_ids, block_paths)`` where fk_ids shape is
-        ``(child_rows, num_parents)`` and block_paths is the hierarchical
-        cluster path per child row (or None for source tables).
+        Returns ``(fk_ids, block_paths, cluster_a_dict)`` where fk_ids shape is
+        ``(child_rows, num_parents)``, block_paths is the hierarchical
+        cluster path per child row (or None for source tables), and
+        cluster_a_dict maps parent_name → parent-side cluster assignment.
         """
         from src.prior.hsbm import (  # noqa: PLC0415
             compute_hsbm_fk_ids,
@@ -1202,7 +1231,7 @@ class TableGenerator:
                 parent_causal = (
                     parent_data_list[0][MASK_TYPE.CAUSAL_OUTPUT].cpu().numpy()
                 )
-                fk_ids_np, block_paths_np = compute_hsbm_fk_ids_with_propensity(
+                fk_ids_np, block_paths_np, cluster_a_np = compute_hsbm_fk_ids_with_propensity(
                     size_a=parent_sizes[0],
                     size_b=child_rows,
                     hierarchy_a=hierarchies_parent[0],
@@ -1213,7 +1242,7 @@ class TableGenerator:
                     seed=fk_seed,
                 )
             else:
-                fk_ids_np, block_paths_np = compute_hsbm_fk_ids(
+                fk_ids_np, block_paths_np, cluster_a_np = compute_hsbm_fk_ids(
                     size_a=parent_sizes[0],
                     size_b=child_rows,
                     hierarchy_a=hierarchies_parent[0],
@@ -1222,7 +1251,9 @@ class TableGenerator:
                 )
             fk_ids = torch.tensor(fk_ids_np, device=self.device).long().unsqueeze(-1)
             block_paths = torch.tensor(block_paths_np, device=self.device).long()
-            return fk_ids, block_paths
+            pname = parent_names[0] if parent_names else "0"
+            cluster_a_dict = {pname: cluster_a_np}
+            return fk_ids, block_paths, cluster_a_dict
 
         # Multi-parent joint sampling with shared latent cluster path.
         # Child-side cluster is sampled at max depth; each parent reads its prefix.
@@ -1234,7 +1265,7 @@ class TableGenerator:
                 parent_data_list[i][MASK_TYPE.CAUSAL_OUTPUT].cpu().numpy()
                 for i in range(num_parents)
             ]
-            fk_ids_np, block_paths_np = compute_hsbm_fk_ids_multi_with_matching(
+            fk_ids_np, block_paths_np, cluster_per_parent = compute_hsbm_fk_ids_multi_with_matching(
                 parent_sizes=parent_sizes,
                 child_size=child_rows,
                 hierarchies_parent=hierarchies_parent,
@@ -1245,7 +1276,7 @@ class TableGenerator:
                 seed=fk_seed,
             )
         else:
-            fk_ids_np, block_paths_np = compute_hsbm_fk_ids_multi(
+            fk_ids_np, block_paths_np, cluster_per_parent = compute_hsbm_fk_ids_multi(
                 parent_sizes=parent_sizes,
                 child_size=child_rows,
                 hierarchies_parent=hierarchies_parent,
@@ -1254,7 +1285,10 @@ class TableGenerator:
             )
         fk_ids = torch.tensor(fk_ids_np, device=self.device).long()
         block_paths = torch.tensor(block_paths_np, device=self.device).long()
-        return fk_ids, block_paths
+        cluster_a_dict = {}
+        for i, pname in enumerate(parent_names if parent_names else range(num_parents)):
+            cluster_a_dict[pname] = cluster_per_parent[i]
+        return fk_ids, block_paths, cluster_a_dict
 
     def _compute_t_min_for_child(
         self,
@@ -1354,7 +1388,7 @@ class TableGenerator:
             if "parent_data_list" in kwargs:
                 parent_data_list = kwargs["parent_data_list"]
                 parent_names = kwargs.get("parent_names", None)
-                fk_ids, block_paths = self._compute_hsbm_fk_ids(
+                fk_ids, block_paths, cluster_a_dict = self._compute_hsbm_fk_ids(
                     fk_seed=kwargs.get("fk_seed", 0),
                     parent_data_list=parent_data_list,
                     parent_names=parent_names,
@@ -1380,13 +1414,13 @@ class TableGenerator:
                 self.hsbm_block_paths = block_paths
                 self.all_scm_outputs = X.copy()
 
-                return X, FK_ids
+                return X, FK_ids, cluster_a_dict
             else:
                 X, outputs_flat = self.table_SCM.forward_without_input()
 
                 self.all_scm_outputs = X.copy()
 
-                return X
+                return X, None, {}
 
     def cache_pending_outputs(
         self,
@@ -1890,15 +1924,22 @@ class RDB:
                 parent_data = self.table_generators[parent_table].all_scm_outputs
                 parent_data_list.append(parent_data)
             fk_seed = hash((self._seed, table_name)) & 0x7FFFFFFF
-            X_dict, FK_ids = table_generator.generate_data(
+            X_dict, FK_ids, cluster_a_dict = table_generator.generate_data(
                 parent_data_list=parent_data_list,
                 fk_seed=fk_seed,
                 parent_names=parent_tables,
             )
+            # Store cluster_a on parent table generators (for homophily labels)
+            for pname, cluster_a_np in cluster_a_dict.items():
+                if pname in self.table_generators:
+                    parent_gen = self.table_generators[pname]
+                    if parent_gen.hsbm_parent_blocks is None:
+                        parent_gen.hsbm_parent_blocks = torch.tensor(
+                            cluster_a_np, device=self.device,
+                        ).long()
         else:
-            # Returns X_dict (dict)
-            X_dict = table_generator.generate_data()
-            FK_ids = None
+            # Returns X_dict (dict), FK_ids (None), cluster_a_dict ({})
+            X_dict, FK_ids, _ = table_generator.generate_data()
 
         table_generator.cache_pending_outputs(X_dict, FK_ids, parent_tables)
 
@@ -1928,9 +1969,12 @@ class RDB:
 
         # Collect HSBM block paths for downstream homophily label generation
         self.hsbm_block_paths: Dict[str, torch.Tensor] = {}
+        self.hsbm_parent_blocks: Dict[str, torch.Tensor] = {}
         for tname, gen in self.table_generators.items():
             if gen.hsbm_block_paths is not None:
                 self.hsbm_block_paths[tname] = gen.hsbm_block_paths
+            if gen.hsbm_parent_blocks is not None:
+                self.hsbm_parent_blocks[tname] = gen.hsbm_parent_blocks
 
         return
 
@@ -1970,8 +2014,17 @@ class RDB:
                 key: value.detach() if isinstance(value, torch.Tensor) else value
                 for key, value in outputs.items()
             }
+
+            # Entity tables: compute per-entity IDs (same across temporal snapshots)
+            entity_ids = None
+            if generator.is_entity_table and generator.snapshots_per_entity > 1:
+                entity_ids = torch.repeat_interleave(
+                    torch.arange(generator.num_entities, device=self.device),
+                    generator.snapshots_per_entity,
+                )[:self.tables[table_name].num_rows]
+
             self.tables[table_name].process_data(
-                detached_outputs, fk_ids, parent_tables
+                detached_outputs, fk_ids, parent_tables, entity_ids=entity_ids,
             )
 
             # Clear caches for next generation

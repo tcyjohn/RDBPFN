@@ -60,6 +60,11 @@ class DAGToRDBGenerator:
         "timestamp": {
             "prob": 0.7,
         },
+        "entity_table": {
+            "snapshots_per_entity_min": 5,
+            "snapshots_per_entity_max": 20,
+            "timestamp_prob": 1.0,
+        },
     }
 
     def __init__(
@@ -282,11 +287,9 @@ class DAGToRDBGenerator:
             # Fluctuate num_rows by 20%
             parents = dag_structure["in_degree"].get(node, [])
             num_parents = len(parents)
+            out_degree_nodes = dag_structure["out_degree"].get(node, [])
 
             # Calculate num_cols and num_features based on new logic
-            num_rows = self._apply_fluctuation(
-                node_dims["num_rows"], self.dimension_config["num_rows"]
-            )
             original_num_cols = self._apply_fluctuation(
                 node_dims["num_cols"], self.dimension_config["num_cols"]
             )
@@ -295,19 +298,44 @@ class DAGToRDBGenerator:
                 original_num_cols + 1 + num_parents
             )  # num_col from DAG + 1 + parent's tables num
 
-            # Timestamp column: source tables (num_parents=0) never get timestamps;
-            # entity tables (out_degree>=1) never get timestamps;
-            # activity/leaf tables (out_degree=0) always get timestamps.
+            # Determine table type
+            is_entity_table = bool(out_degree_nodes)
+            is_source_table = (num_parents == 0)
+
+            # Entity table: num_rows = num_entities × snapshots_per_entity
+            ecfg = self.dimension_config.get("entity_table", {})
+            if is_entity_table:
+                num_entities = self._apply_fluctuation(
+                    node_dims["num_rows"], self.dimension_config["num_rows"]
+                )
+                snap_min = ecfg.get("snapshots_per_entity_min", 5)
+                snap_max = ecfg.get("snapshots_per_entity_max", 20)
+                snapshots_per_entity = random.randint(snap_min, snap_max)
+                num_rows = num_entities * snapshots_per_entity
+            else:
+                num_entities = 0
+                snapshots_per_entity = 1
+                num_rows = self._apply_fluctuation(
+                    node_dims["num_rows"], self.dimension_config["num_rows"]
+                )
+
+            # Timestamp column logic: entity tables always get timestamps (configurable).
+            # Source tables that are NOT entity tables never get timestamps.
             ts_cfg = self.dimension_config.get("timestamp", {})
-            if num_parents == 0:
-                timestamp_prob = 0.0  # source table: never timestamp
-            elif dag_structure["out_degree"].get(node, []):
-                timestamp_prob = float(ts_cfg.get("entity_prob", 0.0))
+            if is_entity_table:
+                timestamp_prob = float(ecfg.get("timestamp_prob", 1.0))
+            elif is_source_table:
+                timestamp_prob = 0.0
             else:
                 timestamp_prob = float(ts_cfg.get("activity_prob", 1.0))
             is_timestamp_table = random.random() < timestamp_prob
             if is_timestamp_table:
                 num_cols += 1  # Add one more column for timestamp
+
+            # Entity tables get an entity_id column (for same-entity bias)
+            has_entity_id_column = is_entity_table and snapshots_per_entity > 1
+            if has_entity_id_column:
+                num_cols += 1
 
             # Create table config
             table_config = {
@@ -319,6 +347,10 @@ class DAGToRDBGenerator:
                 "parent_nodes": parents,
                 "num_parents": num_parents,
                 "is_timestamp_table": is_timestamp_table,
+                "is_entity_table": is_entity_table,
+                "num_entities": num_entities,
+                "snapshots_per_entity": snapshots_per_entity,
+                "has_entity_id_column": has_entity_id_column,
             }
 
             table_configs.append(table_config)
@@ -413,6 +445,10 @@ class DAGToRDBGenerator:
             if config.get("is_timestamp_table", False):
                 column_names.append("timestamp")
 
+            # Add entity_id column for entity tables (for same-entity bias)
+            if config.get("has_entity_id_column", False):
+                column_names.append("entity_id")
+
             # Add feature columns
             for i in range(config["num_features"]):
                 column_names.append(f"feature_{i}")
@@ -432,6 +468,15 @@ class DAGToRDBGenerator:
             # Add timestamp data type if it's a timestamp table
             if config.get("is_timestamp_table", False):
                 data_type_configs.append(DataTypeConfig.timestamp_config())
+
+            # Add entity_id data type (categorical int, one per entity)
+            if config.get("has_entity_id_column", False):
+                data_type_configs.append(
+                    DataTypeConfig.categorical_config(
+                        num_categories=config["num_entities"],
+                        balanced=False,
+                    )
+                )
 
             # Add feature data types
             for i in range(config["num_features"]):
@@ -455,22 +500,42 @@ class DAGToRDBGenerator:
                 # Time column is after PK and FKs but before features
                 time_column = 1 + config["num_parents"]  # PK + FKs
 
+            # Determine entity_id column index
+            entity_column = None
+            if config.get("has_entity_id_column", False):
+                # After PK, FKs, (timestamp) — before features
+                entity_column = 1 + config["num_parents"]
+                if config.get("is_timestamp_table", False):
+                    entity_column += 1
+
+            # Compute num_features (non-PK, non-FK columns for SCM generation)
+            _nf = config["num_features"]
+            if config.get("is_timestamp_table", False):
+                _nf += 1
+            if config.get("has_entity_id_column", False):
+                _nf += 1
+
             # Create table
             table = Table(
                 num_rows=config["num_rows"],
                 num_cols=config["num_cols"],
-                num_features=(
-                    config["num_features"] + 1
-                    if config.get("is_timestamp_table", False)
-                    else config["num_features"]
-                ),
+                num_features=_nf,
                 column_names=column_names,
                 data_type_configs=data_type_configs,
                 time_column=time_column,
                 device="cpu",
             )
+            if entity_column is not None:
+                table.entity_column = entity_column
 
             rdb.add_table(config["name"], table)
+
+            # Set entity table metadata on the TableGenerator
+            if config.get("is_entity_table", False):
+                gen = rdb.table_generators[config["name"]]
+                gen.is_entity_table = True
+                gen.num_entities = config["num_entities"]
+                gen.snapshots_per_entity = config["snapshots_per_entity"]
 
         # Add relationships
         for from_node, from_col, to_node, to_col in relationships:
@@ -1021,11 +1086,17 @@ class DAGToRDBGenerator:
                 print(f"  {parent_count} parents: {count} tables")
 
             ts_cfg = self.dimension_config.get("timestamp", {})
-            entity_prob = ts_cfg.get("entity_prob", 0.0)
+            ecfg = self.dimension_config.get("entity_table", {})
+            entity_prob = ecfg.get("timestamp_prob", 1.0)
             activity_prob = ts_cfg.get("activity_prob", 1.0)
+            snap_min = ecfg.get("snapshots_per_entity_min", 5)
+            snap_max = ecfg.get("snapshots_per_entity_max", 20)
             print(
                 f"\nTables in corpus ({sum(total_table_counts)} total): "
                 f"source→never ts, entity→prob={entity_prob}, leaf→prob={activity_prob}"
+            )
+            print(
+                f"Entity snapshots: [{snap_min}, {snap_max}] per entity"
             )
 
 
@@ -1162,6 +1233,24 @@ if __name__ == "__main__":
         help="Disable path signal in SG feature construction (use with explicit FK block_id columns)",
     )
     parser.add_argument(
+        "--snapshots_per_entity_min",
+        type=int,
+        default=None,
+        help="Minimum temporal snapshots per entity (overrides config, default: 5)",
+    )
+    parser.add_argument(
+        "--snapshots_per_entity_max",
+        type=int,
+        default=None,
+        help="Maximum temporal snapshots per entity (overrides config, default: 20)",
+    )
+    parser.add_argument(
+        "--entity_timestamp_prob",
+        type=float,
+        default=None,
+        help="Probability entity tables get timestamps (overrides config, default: 1.0)",
+    )
+    parser.add_argument(
         "--random_seed",
         type=int,
         default=42,
@@ -1229,5 +1318,14 @@ if __name__ == "__main__":
     np.random.seed(random_seed)
     torch.manual_seed(random_seed)
     dimension_config = DAGToRDBGenerator.load_dimension_config(config_file)
+
+    # Apply CLI overrides for entity table config
+    entity_cfg = dimension_config.setdefault("entity_table", {})
+    if args.snapshots_per_entity_min is not None:
+        entity_cfg["snapshots_per_entity_min"] = args.snapshots_per_entity_min
+    if args.snapshots_per_entity_max is not None:
+        entity_cfg["snapshots_per_entity_max"] = args.snapshots_per_entity_max
+    if args.entity_timestamp_prob is not None:
+        entity_cfg["timestamp_prob"] = args.entity_timestamp_prob
 
     main()

@@ -114,10 +114,14 @@ def _maybe_apply_homophily_label(
     if n_rows < 4:
         return None
 
-    # Get block assignments (HSBM first, pseudo-block fallback)
+    # Get block assignments (HSBM first, parent-block, pseudo-block fallback)
     hsbm_paths = getattr(rdb, "hsbm_block_paths", {})
+    hsbm_parent = getattr(rdb, "hsbm_parent_blocks", {})
     block_assignments = get_block_assignments(
-        target_table_name, rdb, hsbm_block_paths=hsbm_paths, seed=rdb_index,
+        target_table_name, rdb,
+        hsbm_block_paths=hsbm_paths,
+        hsbm_parent_blocks=hsbm_parent,
+        seed=rdb_index,
     )
     if block_assignments is None or block_assignments.shape[0] != n_rows:
         return None
@@ -139,8 +143,12 @@ def _maybe_apply_homophily_label(
     )
     y_new, meta = gen.generate_label()
 
-    # Replace column data in-place
+    # Refuse to overwrite entity_id column (used for same-entity attention bias).
     target_col_idx = table.column_names.index(target_column_name)
+    if table.entity_column is not None and target_col_idx == table.entity_column:
+        return None
+
+    # Replace column data in-place
     table.data[:, target_col_idx] = y_new.float()
 
     # Update dataframe if it exists
@@ -1343,6 +1351,13 @@ class TaskGenerator:
                 return True
         return False
 
+    def _has_parent(self, table_name: str) -> bool:
+        """Check if a table has an FK referencing another table."""
+        for rel in self.rdb.relationships:
+            if rel.from_table == table_name:
+                return True
+        return False
+
     def _get_children(self, table_name: str) -> List[str]:
         """Get tables that reference this table via FK."""
         children = []
@@ -1396,6 +1411,9 @@ class TaskGenerator:
             if exclude_timestamp_columns:
                 if data_type_config.data_type == DataType.TIMESTAMP:
                     continue
+            # entity_id is metadata used for same-entity attention bias, not a feature.
+            if col_name == "entity_id":
+                continue
             candidate_columns.append((i, col_name, data_type_config))
 
         if len(candidate_columns) == 0:
@@ -1578,7 +1596,7 @@ class TaskGenerator:
                 print(f"Skipping schema graph with {len(schema_graph.nodes)} nodes")
                 continue
             target_table_name = schema_graph.generate_target_table_name(
-                root_p=1.0 if self.relbench_mode else 0.0,
+                root_p=1.0,  # Always target = focal → DIRECT_ATTR → FK bias signal
             )
             # RelBench mode: entity table is target, predict its own column
             is_entity_target = (
@@ -1592,18 +1610,16 @@ class TaskGenerator:
                 print(f"Skipping schema graph with {len(schema_graph.nodes)} nodes (needs 3 for RELATIONAL_AGGREGATION_PREDICTION)")
                 continue
             if task_type == TaskType.DIRECT_ATTRIBUTE_PREDICTION:
-                if is_entity_target:
-                    target_column_name = random.choice(
-                        rdb.tables[target_table_name].get_feature_columns(
-                            only_categorical=True
-                        )
-                    )
-                else:
-                    target_column_name = random.choice(
-                        rdb.tables[target_table_name].get_feature_columns(
-                            only_categorical=True
-                        )
-                    )
+                # Exclude entity_id from target candidates (it is a metadata
+                # column used for same-entity attention bias, not a feature).
+                target_table = rdb.tables[target_table_name]
+                categorical_cols = [
+                    c for c in target_table.get_feature_columns(only_categorical=True)
+                    if c != "entity_id"
+                ]
+                if not categorical_cols:
+                    continue
+                target_column_name = random.choice(categorical_cols)
             elif task_type == TaskType.RELATIONAL_AGGREGATION_PREDICTION:
                 target_column_name = random.choice(
                     rdb.tables[target_table_name].get_feature_columns(only_float=True)
@@ -1631,7 +1647,6 @@ class TaskGenerator:
             # Determine evaluation metric and DBB task type based on target computation
             if isinstance(target_computation, DirectAttributeTarget):
                 # For direct attribute, we need to check the column type
-                target_table = rdb.tables[target_table_name]
                 target_col_idx = target_table.column_names.index(target_column_name)
                 target_data_type = target_table.data_type_configs[
                     target_col_idx
@@ -1826,20 +1841,50 @@ class TaskGenerator:
                 if rdb.tables[t].num_rows >= min_table_size
             ]
 
-        # Weighted sampling: bias toward entity tables
-        if entity_tables and (
-            random.random() < self.entity_task_ratio or not non_entity_tables
-        ):
-            focal_table_name = random.choice(entity_tables)
-        elif non_entity_tables:
-            focal_table_name = random.choice(non_entity_tables)
+        # Build candidate pools: filter to tables with FK parents for FK bias signal.
+        # In relbench mode: 70% child entity preference within entity tables.
+        # In non-relbench mode: strictly only tables with FK parents.
+        entity_with_parents = [t for t in entity_tables if self._has_parent(t)]
+        leaf_with_parents = [t for t in non_entity_tables if self._has_parent(t)]
+
+        if self.relbench_mode:
+            # Relbench: entity focal, target=root, DIRECT_ATTR.
+            # Prefer child entities (has FK parents) so FK bias gets signal.
+            child_entities = entity_with_parents
+            root_entities = [t for t in entity_tables if t not in child_entities]
+            if child_entities and (random.random() < 0.7 or not root_entities):
+                candidates = child_entities
+            elif root_entities:
+                candidates = root_entities
+            else:
+                candidates = entity_tables
         else:
+            # Non-relbench: focal=target, DIRECT_ATTR, FK bias must work.
+            # 75% biased toward entity (if any entity has FK parents),
+            # remaining toward non-entity with FK parents.
+            if entity_with_parents and (
+                random.random() < self.entity_task_ratio or not leaf_with_parents
+            ):
+                candidates = entity_with_parents
+            elif leaf_with_parents:
+                candidates = leaf_with_parents
+            elif entity_tables:
+                # Fallback: no tables with FK parents → pick any entity
+                candidates = entity_tables
+            elif non_entity_tables:
+                candidates = non_entity_tables
+            else:
+                candidates = []
+
+        if not candidates:
             print(
                 f"Warning: No suitable tables found for focal entity selection "
                 f"(min_size={min_table_size}, exclude_small={exclude_small_tables}). "
                 f"All {len(rdb.tables)} tables have < {min_table_size} rows. Skipping."
             )
             return None, None
+
+        focal_table_name = random.choice(candidates)
 
         # Build schema graph: when focal is entity, bias first-hop neighbors toward children
         schema_graph = rdb.create_multi_hop_schema_graph_biased(

@@ -1,6 +1,16 @@
 #!/bin/bash
 # Full pipeline: data generation → preprocessing → merge to h5 → training
-# Usage: bash scripts/run_pipeline.sh [num_rdbs] [start_index] [run_name] [skip_gen] [skip_preprocess] [skip_merge] [no_quality_filter] [quality_max_retries] [num_processes] [skip_train] [use_complex_tasks] [cuda_devices] [relbench_mode]
+# Usage: bash scripts/run_pipeline.sh [num_rdbs] [start_index] [run_name] [skip_gen] [skip_preprocess] [skip_merge] [no_quality_filter]\
+#                                       [quality_max_retries] [num_processes] [skip_train] [use_complex_tasks] [cuda_devices] [relbench_mode] [load_ckpt]\
+#                                       [extra_train_args] [use_homophily_labels] [no_path_signal] [use_fk_bias] [snapshots_per_entity_min]\
+#                                       [snapshots_per_entity_max] [entity_timestamp_prob] [use_entity_bias]
+# e.g. bash scripts/run_pipeline.sh 1024 0 v5_relmode true true true true\
+#       3 16 false true "0,1" true "model_pretrain/checkpoints/v5_relmode/model_eval00296.pt" \
+#       "train.load_optimizer_state=true" false false true
+# skip train only cmd: bash scripts/run_pipeline.sh 20000 0 v5.1_relmode_20000 false false false false 3 16 true true "0,1" true
+# gen only cmd(for checking quality of generated data):
+#    bash scripts/run_pipeline.sh 64 0 test false true true false 3 16 true true "0" true
+
 #   num_rdbs: number of RDBs to generate (default: 4)
 #   start_index: starting index (default: 0)
 #   run_name: output subdirectory name (default: auto-generated with timestamp, e.g. "run_20260515_003000")
@@ -14,8 +24,15 @@
 #   use_complex_tasks: "true" for complex tasks, "false" for simple tasks (default: true)
 #   cuda_devices: comma-separated GPU indices, e.g. "0,1" or "1" (default: auto-detect free GPUs)
 #   relbench_mode: "true" to enable RelBench mode (entity focal+target, entity-level prediction) (default: false)
-#   load_ckpt: path to checkpoint .pt to resume from (default: "" = train from scratch)
-#   note: if need to continue from last training ckpt, you should also pass "train.load_optimizer_state=true"s
+#   load_ckpt: path to checkpoint .pt to resume/load from (default: "" = train from scratch)
+#   extra_train_args: extra Hydra CLI overrides for training (e.g. "train.load_optimizer_state=true train.dataset_start_index=50000") (default: "")
+#   use_homophily_labels: "true" for OPENRFM-style homophily-controlled label diversity (default: false)
+#   no_path_signal: "true" to skip path signal (default: false; keep true for FK bias experiment)
+#   use_fk_bias: "true" to enable FK attention bias in training (default: false)
+#   snapshots_per_entity_min: min temporal snapshots per entity table (default: 5)
+#   snapshots_per_entity_max: max temporal snapshots per entity table (default: 20)
+#   entity_timestamp_prob: probability entity tables get timestamps (default: 1.0)
+#   use_entity_bias: "true" to enable same-entity attention bias in training (default: false)
 # Output layout:
 #   data_generation/RDB_datasets/<run_name>/          raw 4DBInfer data
 #   data_generation/RDB_datasets/<run_name>-processed/  DFS-preprocessed data
@@ -46,6 +63,14 @@ USE_COMPLEX_TASKS="${11:-true}"
 CUDA_DEVICES="${12:-}"
 RELBENCH_MODE="${13:-false}"
 LOAD_CKPT="${14:-}"  # optional: path to checkpoint .pt to resume/load from
+EXTRA_TRAIN_ARGS="${15:-}"  # optional: extra Hydra overrides for training (e.g. "train.load_optimizer_state=true")
+USE_HOMOPHILY_LABELS="${16:-false}"  # optional: enable OPENRFM-style homophily-controlled label diversity
+NO_PATH_SIGNAL="${17:-false}"  # optional: disable path signal in SG (use with explicit FK block_id columns)
+USE_FK_BIAS="${18:-true}"  # optional: enable FK attention bias in training
+SNAPSHOTS_PER_ENTITY_MIN="${19:-5}"  # optional: min temporal snapshots per entity table
+SNAPSHOTS_PER_ENTITY_MAX="${20:-20}"  # optional: max temporal snapshots per entity table
+ENTITY_TIMESTAMP_PROB="${21:-1.0}"  # optional: entity timestamp probability
+USE_ENTITY_BIAS="${22:-true}"  # optional: enable same-entity attention bias in training
 END_INDEX=$((START_INDEX + NUM_RDBS))
 
 RDB_GEN_DIR="${ROOT}/data_generation/RDB"
@@ -120,6 +145,8 @@ echo "║ Raw : ${RAW_OUTPUT_DIR}"
 echo "║ H5  : ${H5_OUTPUT}"
 echo "║ QC  : enabled=$([ "${NO_QUALITY_FILTER}" != "true" ] && echo "yes" || echo "no")  max_retries=${QUALITY_MAX_RETRIES}"
 echo "║ RelBench: ${RELBENCH_MODE}"
+echo "║ Homophily: ${USE_HOMOPHILY_LABELS}  NoPathSignal: ${NO_PATH_SIGNAL}  FKbias: ${USE_FK_BIAS}  EntBias: ${USE_ENTITY_BIAS}"
+echo "║ Snapshots: [${SNAPSHOTS_PER_ENTITY_MIN}, ${SNAPSHOTS_PER_ENTITY_MAX}]  EntTsProb: ${ENTITY_TIMESTAMP_PROB}"
 echo "║ Proc: ${NUM_PROCESSES}"
 echo "╚══════════════════════════════════════════════════╝"
 echo ""
@@ -142,6 +169,18 @@ if [ "${SKIP_GEN}" != "true" ]; then
     if [ "${RELBENCH_MODE}" = "true" ]; then
         QUALITY_FLAGS+=(--relbench_mode)
     fi
+
+    if [ "${USE_HOMOPHILY_LABELS}" = "true" ]; then
+        QUALITY_FLAGS+=(--use_homophily_labels)
+    fi
+
+    if [ "${NO_PATH_SIGNAL}" = "true" ]; then
+        QUALITY_FLAGS+=(--no_path_signal)
+    fi
+
+    QUALITY_FLAGS+=(--snapshots_per_entity_min "${SNAPSHOTS_PER_ENTITY_MIN}")
+    QUALITY_FLAGS+=(--snapshots_per_entity_max "${SNAPSHOTS_PER_ENTITY_MAX}")
+    QUALITY_FLAGS+=(--entity_timestamp_prob "${ENTITY_TIMESTAMP_PROB}")
 
     pixi run python ./data_generation/RDB/dag_to_rdb_generator.py \
         --dag_data_path "${RDB_GEN_DIR}/datasets/rdb_v1.pth" \
@@ -304,10 +343,20 @@ TRAIN_ARGS=(
     "train.datasets.0.path=pretrain_datasets/${RUN_NAME}.h5"
     "train.save_model_path=checkpoints/${RUN_NAME}/model.pt"
     "wandb.run_name=${RUN_NAME}"
+    "model.use_fk_bias=${USE_FK_BIAS}"
+    "model.use_entity_bias=${USE_ENTITY_BIAS}"
+    "train.full_eval_seeds=[0,1,2]"
 )
 if [ -n "${LOAD_CKPT}" ]; then
     TRAIN_ARGS+=("train.load_model_path=${LOAD_CKPT}")
     echo "Loading checkpoint: ${LOAD_CKPT}"
+fi
+if [ -n "${EXTRA_TRAIN_ARGS}" ]; then
+    # Split by whitespace and append each token as a separate argument
+    for arg in ${EXTRA_TRAIN_ARGS}; do
+        TRAIN_ARGS+=("${arg}")
+    done
+    echo "Extra training args: ${EXTRA_TRAIN_ARGS}"
 fi
 
 pixi run torchrun \

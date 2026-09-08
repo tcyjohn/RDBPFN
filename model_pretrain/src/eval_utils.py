@@ -208,7 +208,18 @@ def evaluate_classifier(classifier, splits_by_dir: dict[str, list]):
     return scores
 
 
-def load_task_split(task: DBBRDBTask, split: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+def load_task_split(
+    task: DBBRDBTask,
+    split: str,
+    *,
+    use_primary_key_as_entity_id: bool = False,
+) -> Tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray | None,
+    np.ndarray | None,
+    np.ndarray | None,
+]:
     if split == "train":
         source = task.train_set
     elif split in {"val", "validation"}:
@@ -255,6 +266,15 @@ def load_task_split(task: DBBRDBTask, split: str) -> Tuple[np.ndarray, np.ndarra
     if "entity_id" in source:
         entity_raw = source["entity_id"].astype(np.float64)
         entity_ids = np.nan_to_num(entity_raw, nan=-1).astype(np.int64)
+    elif use_primary_key_as_entity_id:
+        primary_key_cols = [
+            col.name
+            for col in task.metadata.columns
+            if col.dtype == DBBColumnDType.primary_key and col.name in source
+        ]
+        if primary_key_cols:
+            entity_raw = source[primary_key_cols[0]].astype(np.float64)
+            entity_ids = np.nan_to_num(entity_raw, nan=-1).astype(np.int64)
 
     # Extract parent_entity_ids for entity-level FK matching (not in X)
     # Shape: (total_rows, K) where K is number of FK relations, -1 for null.
@@ -278,14 +298,32 @@ def downsample_split(
 
 
 def predict_proba_in_chunks(
-    classifier, X: np.ndarray, chunk_size: int | None
+    classifier,
+    X: np.ndarray,
+    chunk_size: int | None,
+    fk_values_test: np.ndarray | None = None,
+    entity_ids_test: np.ndarray | None = None,
+    parent_entity_ids_test: np.ndarray | None = None,
 ) -> np.ndarray:
     if chunk_size is None or len(X) <= chunk_size:
-        return classifier.predict_proba(X)
+        return classifier.predict_proba(
+            X,
+            fk_values_test=fk_values_test,
+            entity_ids_test=entity_ids_test,
+            parent_entity_ids_test=parent_entity_ids_test,
+        )
     probs = []
     for start in range(0, len(X), chunk_size):
         end = start + chunk_size
-        probs.append(classifier.predict_proba(X[start:end]))
+        fk_chunk = fk_values_test[start:end] if fk_values_test is not None else None
+        eid_chunk = entity_ids_test[start:end] if entity_ids_test is not None else None
+        peid_chunk = parent_entity_ids_test[start:end] if parent_entity_ids_test is not None else None
+        probs.append(classifier.predict_proba(
+            X[start:end],
+            fk_values_test=fk_chunk,
+            entity_ids_test=eid_chunk,
+            parent_entity_ids_test=peid_chunk,
+        ))
     return np.concatenate(probs, axis=0)
 
 
@@ -433,6 +471,78 @@ def save_results_to_csv(
     df = build_results_dataframe(all_model_results, metric_key=metric_key)
     df.to_csv(output_path, index=False)
     logger.info("Results saved to %s", output_path)
+
+
+PER_SEED_RESULT_COLUMNS = [
+    "model",
+    "dataset",
+    "task",
+    "seed",
+    "metric",
+    "metric_value",
+    "accuracy",
+    "balanced_acc",
+]
+
+
+def derive_per_seed_output_path(output_path: Path) -> Path:
+    """Return the detail CSV path alongside an aggregate result CSV."""
+    return output_path.with_name(f"{output_path.stem}_per_seed{output_path.suffix}")
+
+
+def build_per_seed_results_dataframe(
+    all_model_results: dict[str, list[dict]],
+) -> pd.DataFrame:
+    """Build one row per model, task, and evaluation seed."""
+    rows = []
+    for model_label, results in all_model_results.items():
+        for result in results:
+            rows.append(
+                {
+                    "model": simplify_model_label(model_label),
+                    "dataset": result["dataset"],
+                    "task": result["task"],
+                    "seed": result["seed"],
+                    "metric": result["metric"],
+                    "metric_value": result["metric_value"],
+                    "accuracy": result["accuracy"],
+                    "balanced_acc": result["balanced_acc"],
+                }
+            )
+    dataframe = pd.DataFrame(rows, columns=PER_SEED_RESULT_COLUMNS)
+    if not dataframe.empty:
+        dataframe = dataframe.sort_values(
+            ["model", "dataset", "task", "seed"], kind="stable"
+        ).reset_index(drop=True)
+    return dataframe
+
+
+def save_per_seed_results_to_csv(
+    all_model_results: dict[str, list[dict]], output_path: Path
+) -> None:
+    dataframe = build_per_seed_results_dataframe(all_model_results)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    dataframe.to_csv(output_path, index=False)
+    logger.info("Per-seed results saved to %s", output_path)
+
+
+def append_per_seed_results_to_csv(
+    all_model_results: dict[str, list[dict]], output_path: Path
+) -> None:
+    new_dataframe = build_per_seed_results_dataframe(all_model_results)
+    if output_path.exists():
+        existing_dataframe = pd.read_csv(output_path)
+        combined = pd.concat([existing_dataframe, new_dataframe], ignore_index=True)
+        combined = combined.drop_duplicates(
+            subset=["model", "dataset", "task", "seed"], keep="last"
+        )
+        combined = combined.sort_values(
+            ["model", "dataset", "task", "seed"], kind="stable"
+        ).reset_index(drop=True)
+        combined.to_csv(output_path, index=False)
+        logger.info("Appended per-seed results to %s", output_path)
+    else:
+        save_per_seed_results_to_csv(all_model_results, output_path)
 
 
 def build_results_dataframe(

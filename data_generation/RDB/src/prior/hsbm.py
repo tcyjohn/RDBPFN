@@ -79,7 +79,7 @@ def compute_hsbm_fk_ids(
     hierarchy_b: list,
     seed: int | None = None,
     null_prob: float = 0.0,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Compute parent FK indices via HSBM bipartite sampling.
 
     Each of the ``size_b`` child rows samples exactly one parent row from the
@@ -101,14 +101,15 @@ def compute_hsbm_fk_ids(
         RNG seed for reproducibility (applied locally).
     null_prob : float
         Probability a child row gets FK=-1 (no parent connection).
-
     Returns
     -------
     fk_ids : np.ndarray of shape ``(size_b,)``
         ``fk_ids[j]`` is the parent-row index (0-based) that child row ``j``
         connects to, or -1 if no connection.
-    block_paths : np.ndarray of shape ``(size_b, len(hierarchy_b))``
+    cluster_b : np.ndarray of shape ``(size_b, len(hierarchy_b))``
         Cluster path per child row (hierarchical block assignment).
+    cluster_a : np.ndarray of shape ``(size_a, len(hierarchy_a))``
+        Cluster path per parent row. Used for homophily labels on entity tables.
     """
     assert len(hierarchy_a) == len(hierarchy_b), (
         "only equal-length hierarchies are supported"
@@ -129,7 +130,7 @@ def compute_hsbm_fk_ids(
         rng=rng,
         null_prob=null_prob,
     )
-    return fk_ids, cluster_b
+    return fk_ids, cluster_b, cluster_a
 
 
 def _sample_fk_per_parent(
@@ -173,6 +174,7 @@ def _sample_fk_per_parent(
         probs = np.ones(size_a, dtype=np.float64)
         for l in range(num_levels):
             probs *= probs_at_levels[l][cluster_a[:, l], cluster_path[l]]
+
         p_sum = probs.sum()
         if p_sum > 0:
             probs /= p_sum
@@ -226,7 +228,8 @@ def compute_hsbm_fk_ids_with_propensity(
     Returns
     -------
     fk_ids : np.ndarray of shape (size_b,)
-    block_paths : np.ndarray of shape (size_b, len(hierarchy_b))
+    cluster_b : np.ndarray of shape (size_b, len(hierarchy_b))
+    cluster_a : np.ndarray of shape (size_a, len(hierarchy_a))
     """
     assert len(hierarchy_a) == len(hierarchy_b), (
         "only equal-length hierarchies are supported"
@@ -297,7 +300,7 @@ def compute_hsbm_fk_ids_with_propensity(
         null_mask = rng.random(size_b) < null_prob
         fk_ids[null_mask] = -1
 
-    return fk_ids, cluster_b
+    return fk_ids, cluster_b, cluster_a
 
 
 def compute_hsbm_fk_ids_multi(
@@ -340,14 +343,16 @@ def compute_hsbm_fk_ids_multi(
     null_probs : list of float or None
         Per-parent null probability. Child rows with FK=-1 have no connection
         to that parent. Length must match ``num_parents``.
-
     Returns
     -------
     fk_ids : np.ndarray of shape ``(child_size, num_parents)``
         ``fk_ids[j, p]`` is the parent-row index (0-based) that child row ``j``
         connects to for parent ``p``, or -1 if no connection.
-    block_paths : np.ndarray of shape ``(child_size, len(hierarchy_child))``
+    cluster_b : np.ndarray of shape ``(child_size, len(hierarchy_child))``
         Shared child cluster path used for all parents.
+    cluster_per_parent : list of np.ndarray
+        Per-parent parent-side cluster assignments, each of shape
+        ``(parent_sizes[p], len(hierarchies_parent[p]))``.
     """
     rng = np.random.RandomState(seed)
     num_parents = len(parent_sizes)
@@ -397,7 +402,7 @@ def compute_hsbm_fk_ids_multi(
             null_prob=null_probs[p],
         )
 
-    return fk_ids, cluster_b
+    return fk_ids, cluster_b, cluster_per_parent
 
 
 def compute_hsbm_fk_ids_multi_with_matching(
@@ -442,7 +447,9 @@ def compute_hsbm_fk_ids_multi_with_matching(
     Returns
     -------
     fk_ids : np.ndarray of shape (child_size, num_parents)
-    block_paths : np.ndarray of shape (child_size, len(hierarchy_child))
+    cluster_b : np.ndarray of shape (child_size, len(hierarchy_child))
+    cluster_per_parent : list of np.ndarray
+        Per-parent parent-side cluster assignments.
     """
     rng = np.random.RandomState(seed)
     num_parents = len(parent_sizes)
@@ -541,5 +548,4 @@ def compute_hsbm_fk_ids_multi_with_matching(
             null_mask = rng.random(child_size) < null_probs[p]
             fk_ids[null_mask, p] = -1
 
-    return fk_ids, cluster_b
-
+    return fk_ids, cluster_b, cluster_per_parent

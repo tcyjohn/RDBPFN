@@ -1,207 +1,247 @@
 # Findings
 
-## Research: Cross-Parent Correlation — Real Problem or Pseudo-Problem? — 2026-05-25
+## 2026-07-25 — Two-by-two operating-point sensitivity grid
 
-### Other Methods
+Four independently materialized R3 corpora form a descriptive sensitivity grid:
 
-| Method | Architecture | Cross-parent handling |
-|--------|-------------|----------------------|
-| **PluRel** (Stanford, 2025) | Sequential: independent SCM per table, HSBM FK, shared latent projection | Same bottleneck as RDBPFN — parent features independently generated |
-| **RelDiff** (2025) | Joint: heterogeneous graph + graph-conditioned diffusion across ALL tables | Only true joint method — parent features correlated at generation time. Unclear scalability |
-| **SDV/HMA** (DataCebo) | Extended columns: parent encodes child statistics | Indirect only (through shared child summaries) |
-| **REaLTabFormer** (2023) | GPT-2 parent → Seq2Seq child | Single parent-child only, no multi-parent support |
-| **ClavaDDPM** (2024) | GMM cluster → conditional diffusion | Weak cross-parent (GMM latent only) |
-
-### Key Insight: Measurement Artifact
-
-Real data `cross_agg_corr ≈ 0.21` measures aggregation features (MEAN/STD of child cols grouped by parent), NOT direct parent-parent feature correlation. The 0.21 includes:
-- ~0.05-0.08: Collider bias (genuine cross-parent correlation)
-- ~0.10-0.13: Aggregation function artifacts (MEAN and STD of same column mathematically linked)
-- ~0.03-0.05: Shared child table as information channel
-
-Synthetic `cross_corr ≈ 0.03` measures joined-from-parents features, which have genuinely low correlation (parent features independently generated). The 0.03 is actually reasonable for joined features.
-
-### RelBench Task Distribution
-
-All 30 RelBench tasks are entity-level prediction (predict parent table attribute from aggregated child features). No child-as-focal multi-parent tasks exist in the benchmark.
-
-### Conclusion
-
-The cross-parent gap is ~70% measurement artifact (aggregation vs join), ~30% genuine (collider bias). The right fix is to generate more entity-level tasks with aggregated features, not to inject correlation into joined parent features.
-
----
-
-# Findings: Cross-Table Feature Correlation
-
-## Baseline 64-RDB (no struct_sig, no propensity, no matching latent) — 2026-05-25
-
-Post-DFS task-level eval, subsample=30, seeds 0-63:
-
-| Metric | Mean | Std | Count |
-|--------|------|-----|-------|
-| native_corr (single-parent) | 0.3413 | 0.1546 | 50 |
-| native_corr (multi-parent) | 0.3938 | 0.1654 | 24 |
-| native-joined_corr (single-parent) | 0.0471 | 0.0338 | 50 |
-| native-joined_corr (multi-parent) | 0.0431 | 0.0281 | 24 |
-| joined_corr (single-parent) | 0.2866 | 0.1229 | 50 |
-| joined_corr (multi-parent) | 0.2823 | 0.1571 | 76 |
-| cross_corr (multi-parent) | 0.0231 | 0.0100 | 24 |
-
-Note: native_corr and joined_corr are higher than previously reported (~0.07) because this eval uses all task-level float features (per-task, ~6-12 per type), which are heavily correlated due to signal-group feature generation. Previous H5-level measurements mixed native+joined+aggregated columns in the 30-col subsample, diluting the correlation. The key metrics for FK intervention are **native-joined_corr** and **cross_corr** (multi-parent).
-
----
-
-## Entity Bias 64-RDB Eval — 2026-05-25
-
-### Task Distribution
-- 98 total tasks across 63 RDBs
-- **100% `relational_aggregation_prediction`** (vs ~50% in baseline with random focal selection)
-- entity_task_ratio=0.75, first-hop child preference=80%
-
-### Correlation Metrics (eval_corr.py, task-level, subsample=30)
-
-| Metric | Baseline | Entity D1 | Entity D2 | Δ (D2 vs Base) |
-|--------|----------|-----------|-----------|:---:|
-| native_corr (single) | 0.341 | 0.445 | 0.445 | +30% |
-| native_corr (multi) | 0.394 | 0.433 | 0.430 | +9% |
-| native-joined_corr (single) | 0.047 | 0.042 | 0.042 | -11% |
-| native-joined_corr (multi) | 0.043 | 0.053 | 0.057 | +33% |
-| joined_corr (single) | 0.287 | 0.262 | 0.262 | -9% |
-| joined_corr (multi) | 0.282 | 0.245 | 0.248 | -12% |
-| **cross_corr (multi)** | **0.023** | **0.035** | **0.037** | **+61%** |
-
-### Overall Correlation (task-level, all float cols)
-
-| Dataset | overall_corr | n |
-|---------|:---:|:---:|
-| Baseline | 0.108 | 126 |
-| Final (propensity+matching) | 0.115 | 129 |
-| **Entity Bias D1** | 0.118 | 101 |
-| **Entity Bias D2** | **0.133** | 96 |
-| Real non-rel | 0.186 | 19 |
-| Real rel DFS-2 | 0.198 | 19 |
-
-### Full Comparison
-
-| | overall | native | within_src | cross_src |
+| Temporal-history density | Grouped sources | Stored tasks | Raw cells | AUROC |
 |---|---:|---:|---:|---:|
-| Real non-rel | 0.186 | 0.186 | N/A | N/A |
-| Real rel DFS-2 | 0.198 | 0.278 | 0.291 | 0.215 |
-| Syn Baseline | 0.108 | 0.341 | 0.287* | 0.023* |
-| Syn Final | 0.115 | 0.365 | 0.338* | 0.029* |
-| **Syn Entity D1** | **0.118** | **0.445** | **0.262†** | **0.035†** |
-| **Syn Entity D2** | **0.133** | **0.445** | **0.262†** | **0.037†** |
+| Dense | On | 1,600 | 1.010B | 0.7075542321 |
+| Dense | Off | 1,626 | 1.010B | 0.7005588277 |
+| Low | On | 2,656 | 128.40M | 0.6931528116 |
+| Low | Off | 2,667 | 128.40M | 0.6672127449 |
 
-\* = joined_corr (same-parent join) / cross_corr (different-parent join) — not comparable to real data  
-† = now aggregation features from child tables (RDBPFN task-level `_join_related_features`), more comparable to real data
+Aligned-support conditional differences:
 
-### Interpretation
+- Grouped sources at dense history: +0.0069954, 95% paired t interval
+  [0.0034739, 0.0105169].
+- Grouped sources at low history: +0.0259401, interval
+  [0.0196857, 0.0321944].
+- Dense history with grouped sources: +0.0144014, interval
+  [0.0121490, 0.0166539].
+- Dense history without grouped sources: +0.0333461, interval
+  [0.0272207, 0.0394714].
+- Complete SA-RDB-PFN versus the joint-removal operating point: +0.0403415,
+  interval [0.0328286, 0.0478544].
 
-1. **cross_corr +61% (0.023→0.037)**: Entity bias shifts tasks from "join parent features" to "aggregate child features", introducing natural cross-source correlation via shared entity as information channel and mathematical aggregation collinearity. Achieved without modifying data generation pipeline, HSBM, or SCM.
+The descriptive difference-in-differences is -0.0189447, but the four corpora
+were independently generated and contain unequal task counts. It belongs only
+in the supplement and must not be framed as a causal interaction. The larger
+conditional gain from either factor when the other is absent is consistent with
+partial substitution or diminishing marginal returns.
 
-2. **Native_corr inflated (0.445 vs real 0.278)**: Signal-group feature generation creates strong within-table correlation. Entity tables as focal amplify this (entity tables have richer archetype configurations, time+parent+path signals).
+## 2026-06-19 — FK Bias Signal Deficit Root Cause: Row-Level FK Values
 
-3. **Gap to real cross_agg_corr (0.215) is 5.8×**: The remaining gap is dominated by (a) aggregation-function mathematical artifacts in real data (MEAN, STD, MAX, MIN of same column — our eval uses simpler `_join_related_features` with mean/std only), and (b) featuretools DFS in real preprocessing generates 15+ aggregation functions vs our 2 (mean/std).
+### FK column stores parent row index, not entity ID
 
-4. **Depth-2 better than depth-1**: cross_corr 0.037 vs 0.035, overall_corr 0.133 vs 0.118. Deeper DFS introduces more 2-hop aggregated features with richer cross-source structure.
+In `process_data()` (table_generation.py:888), FK values are parent row indices from HSBM.
+For entity parents with S snapshots per entity, rows [k, k+S−1] belong to entity E.
+Child A connecting to parent row k gets FK=k, child B to parent row k+1 gets FK=k+1.
+Both→"same entity" but different FK values → FK bias sees zero match.
 
-5. **The fundamental insight confirmed**: Cross-parent correlation at the joined-from-parent level (~0.03) is naturally low (collider bias only). Real cross-source correlation (~0.21) comes from aggregation-side artifacts. By generating aggregation tasks (entity as focal), we get the right kind of correlation structure without needing to inject it artificially.
+### HSBM within-cluster FK density is invariant to hierarchy
 
-## Final 64-RDB (propensity + matching latent) — 2026-05-25
+Expected children/parent within cluster = child_rows/parent_rows (multinomial allocation).
+Reducing clusters_per_level or num_levels does NOT change this ratio.
+Propensity (ρ ∈ [0.05, 0.20]) already enabled in defaults.
 
-Post-DFS task-level eval, subsample=30, seeds 0-63:
+### FK pair ratio data
 
-| Metric | Mean | Std | Count |
-|--------|------|-----|-------|
-| native_corr (single-parent) | 0.3651 | 0.1514 | 50 |
-| native_corr (multi-parent) | 0.3943 | 0.1788 | 24 |
-| native-joined_corr (single-parent) | 0.0461 | 0.0291 | 50 |
-| native-joined_corr (multi-parent) | 0.0520 | 0.0680 | 24 |
-| joined_corr (single-parent) | 0.3380 | 0.1516 | 50 |
-| joined_corr (multi-parent) | 0.3088 | 0.1922 | 76 |
-| cross_corr (multi-parent) | 0.0289 | 0.0164 | 24 |
+| Dataset | FK pair ratio | Entity pair ratio | FK bias learning |
+|---------|--------------|-------------------|-----------------|
+| v6.1 | 0% (no FK cols) | 0.06% | N/A (disabled) |
+| v6.2 | 0.015% | 1.35% | Frozen at init |
 
-### Baseline → Final Delta
+### v6.2 FK bias check: all layers frozen
 
-| Metric | Baseline | Final | Delta | % |
-|--------|----------|-------|-------|-----|
-| native_corr (single) | 0.3413 | 0.3651 | +0.024 | +7% |
-| native_corr (multi) | 0.3938 | 0.3943 | ~0 | — |
-| native-joined_corr (single) | 0.0471 | 0.0461 | ~0 | — |
-| native-joined_corr (multi) | 0.0431 | 0.0520 | +0.009 | +21% |
-| joined_corr (single) | 0.2866 | 0.3380 | **+0.051** | +18% |
-| joined_corr (multi) | 0.2823 | 0.3088 | +0.027 | +9% |
-| cross_corr (multi) | 0.0231 | 0.0289 | +0.006 | +25% |
+All 6 layers: raw_lambdas = −2.252168 (softplus⁻¹(0.1)), same as init.
+Entity bias: layer 5 softplus(1.33) ≈ 1.57, others near zero.
 
-### Interpretation
-- **FK Propensity (single-parent) works**: joined_corr +18% uplift confirms S12 finding
-- **Matching latent (multi-parent) shows positive signal**: cross_corr +25%, native-joined_corr +21%
-- **Native correlation preserved**: No degradation in native feature structure
+## 2026-06-19 — RelBench Benchmark Task Distribution
+
+Real benchmark metadata (all rel-* datasets): 100% tasks on entity tables as root.
+Root entity = has children (out_degree ≥ 1) but no FK parents → flat table has no FK cols.
+Entity tables in real benchmarks are typically roots of FK graph.
+
+## 2026-06-19 — OpenRFM vs RDBPFN Architecture Comparison
+
+### RT (OpenRFM backbone) FK mechanism
+- BFS walk follows FK edges → cell token sequence
+- M_fk attention MASK: structural constraint, not soft bias
+- FK operates at context construction + attention routing
+- Root entities still get child cells via BFS walk
+
+### RDBPFN FK mechanism
+- DFS precomputes aggregations (featuretools) → flat table
+- FK bias: λ × I[fk_i == fk_j] as additive soft hint
+- Only works when flat table has valid FK columns (task must have FK parents)
+- entity table as root → flat FK cols = −1 → FK bias useless
+
+### Dual-stage ICL (OpenRFM)
+- Relational block + batch-level TabICL cross-attention
+- Second ICL channel independent of FK neighborhood
+- PFN also provides batch-level ICL naturally
+
+## 2026-06-19 — Design: parent_entity_ids for Entity-Level FK Bias
+
+### Problem
+FK = parent row index → entity snapshots create FK value fragmentation.
+S = snapshots per entity → effective FK target space = N×S instead of N.
+
+### Solution
+Compute `parent_entity_ids` column: maps FK row index → parent entity_id.
+- Entity parents: `parent_entity_ids[i] = parent.entity_ids[fk_value[i]]`
+- Non-entity parents: `parent_entity_ids[i] = fk_value[i]` (no snapshots)
+- FK bias uses parent_entity_ids for matching → all children of same entity match
+- Expected FK pair ratio: ~S× current → from 0.015% to 1-2%+
+
+### Previous findings below...
+
+## 2026-06-07 — fk_block_id Experiment: PFN Cannot Leverage Block Structure
+
+### Setup
+- 1024 RDBs, `--no_path_signal` + `--use_homophily_labels`
+- fk_block_id as explicit categorical column (hash of HSBM block path)
+- Path signal removed from SG
+
+### Result
+- **Corruption probe: no improvement** — model could not leverage explicit block_id
+- **Conclusion**: PFN's dense between-datapoints attention fundamentally cannot learn relational structure from features alone, even when given perfectly clean block membership signals
+- Bottleneck is in ARCHITECTURE, not signal strength
+- Need FK-aware attention bias to provide inductive bias
 
 ---
 
-## Real Data vs Synthetic: Native-vs-Joined Correlation Structure (2026-05-24)
+## 2026-06-07 — Homophily Label Diversity: No Improvement
 
-Analysis of 19 real DFS-2 benchmark datasets (clf_rel) vs. our synthetic complex-task H5 data:
+### Corruption probe comparison
 
-| | Real DFS-2 (p50) | Synthetic (p50) |
-|---|---|---|
-| overall_corr | 0.083 | 0.036 |
-| native_corr | 0.049 | 0.073 |
-| agg/joined_corr | **0.186** | **0.053** |
-| cross_corr | 0.036 | 0.026 |
+| Metric | v5.3 | hp2_homophily | Δ |
+|--------|------|---------------|---|
+| Clean acc | 0.8175 | 0.8247 | +0.7% |
+| Δ(shuffle_labels) | +3.01% | +3.52% | +0.5% |
+| Δ(shuffle_features) | +2.80% | +3.52% | +0.7% |
 
-### Key Finding 1: Native correlation is NOT the problem
-Our signal-group feature generation produces HIGHER native-feature correlation (0.073) than real data (0.049). The mechanism works.
+### full-128 downstream
 
-### Key Finding 2: Joined-column correlation is the gap
-Real aggregation columns have STRONG internal correlation (0.186 p50) because multiple aggregation functions (MEAN, STD, MAX, MIN) on the same parent column are mathematically linked.
+| Model | Avg AUROC |
+|-------|-----------|
+| v5.3 | 0.6688 |
+| hp2_homophily | 0.6630 |
 
-### Key Finding 3: Root cause is cross-parent independence
-In complex tasks, parent features are joined directly (not aggregated). Features from DIFFERENT parent tables have ~0 correlation because each uses a separate MLPSCM instance with independent signal-group bases and random seeds. When features from 2+ parent tables are joined, cross-parent pairs pull the median down to ~0.05.
+### Root cause: PFN architecture can't leverage FK-aware label diversity
 
-### Key Finding 4: Real data maintains structure through collider bias
-In real relational data, FK connections are not random — they reflect genuine entity relationships. The FK tuple creates a "collider" that induces correlation between otherwise-independent parent-table features.
+- RT has explicit FK-neighbor attention masks (`M_fk`) → model naturally knows which FK-related rows
+- PFN has dense all-to-all attention → FK relations must be learned from feature similarity
+- Path signal is too weak: 8-dim embedding → projection → diluted by time/parent/intrinsic
+- Homophily diversity needs FK-aware attention to work; PFN lacks this inductive bias
 
-## FK Propensity Matching — FAILED (2026-05-24)
+### Path signal weakness (confirmed)
 
-### Design
-Per-parent row rank score (random linear combo of 2-3 features) → shared latent z(j) → propensity-weighted FK sampling within HSBM blocks.
+Path signal flow: `HSBM block_paths → PathEncoder(embedding) → 8-dim → project → dilute → feature`
 
-### Results
+- 8-dim compression of multi-level block hierarchy
+- Learned embedding (not deterministic) — different blocks may get similar embeddings
+- Diluted: each feature = weighted sum of time + parent + path + intrinsic projections
+- Cross-feature coupling further mixes signals
 
-| Metric | Baseline | Propensity v1 (rho 0.05-0.20) | Propensity v2 (multi rho 0.40-0.70) |
-|--------|:---:|:---:|:---:|
-| joined_corr | 0.053 | 0.076 | 0.060 |
-| joined (single-parent) | — | 0.116 | 0.081 |
-| joined (multi-parent) | — | 0.045 | 0.047 |
-| cross_parent (A vs B) | 0.026 | 0.032 | 0.029 |
+### Decision: explicit FK block ID column + remove path signal
 
-### Root Cause
-**Rank function is per-parent random scalar summary of independent SCM features.** Even when shared z(j) forces all parents to select rows with similar PERCENTILE RANKS, the underlying FEATURE VALUES from different parents remain independent. Aligning rank-0.7 rows across parents doesn't make their feature vectors correlate, because each parent's features are generated by an independent MLPSCM.
+Add `fk_block_id` as categorical column during data generation. PFN sees FK structure directly as a feature value, no need to "discover" it from weak embeddings.
 
-**Fundamental issue:** propensity re-ranks FK within HSBM blocks, but the ranking axis (random feature linear combo) is not shared across parents. Different parents' "0.7 ranked" rows have unrelated feature vectors.
+---
 
-## Structural Signature Injection — NEW APPROACH (2026-05-24)
+## 2026-06-06 — Corruption Probe: v5.3 Borderline Lazy/Feature-Learning Regime
 
-### Design
-1. After ALL FKs are determined (post-topological loop), compute per-parent-row structural signatures from the FK graph
-2. Blend signatures into a small subset (2-4) of random float columns in parent features
-3. Signatures capture: in-degree entropy, (child_table, fk_role) reference distribution, co-parent diversity, temporal density
+### Method
 
-### Why This Should Work
-Unlike propensity, the signature is computed FROM the FK structure itself. When parent A and parent B rows frequently co-occur in multi-parent children:
-- Both get high `co_parent_diversity` scores
-- This score is blended into their feature columns
-- After join, child tasks see correlated feature values
+Context corruption probe (OPENRFM Table 2 methodology) on v5.3 (1024 RDBs, linear SG, relmode+complex+quality gate).
 
-The correlation mechanism: **structural position → signature → feature blend → measured correlation**.
-This is a feed-forward injection, not a sampling-time re-ranking.
+### Results (19 clf_rel tasks)
 
-### Expected Bound
-With sig_dims=3, alpha=0.8, float_cols≈8, and estimated cross-parent struct similarity ~0.3:
-```
-baseline (9 uncorrelated cols) + alpha * (3/12) * struct_sim
-≈ 0.02 + 0.8 * 0.25 * 0.3 ≈ 0.08
-```
-In target [0.08, 0.15] range's low end. Higher if struct similarity exceeds estimate.
+| Condition | Mean Accuracy | Δ |
+|-----------|--------------|---|
+| Clean | 0.8175 | — |
+| Shuffle labels | 0.7874 | +3.01% |
+| Shuffle features | 0.7895 | +2.80% |
+
+- 12/19 tasks: lazy (Δ < 1%)
+- 7/19 tasks: partial feature-learning (Δ 1-16%)
+
+### Comparison with OPENRFM
+
+| Model | Δ(shuffle_labels) | Regime |
+|-------|-------------------|--------|
+| RT-synthetic (PluRel) | ~0.3% | Pure lazy |
+| RT-synth-diverse (+homophily) | ~3-4% | Partial FL |
+| RT-cotrain (real data) | ~5-15% | Strong FL |
+| **RDBPFN v5.3** | **+3.0%** | **Borderline** |
+
+---
+
+## 2026-06-06 — relbench_mode and Entity Table FK Structure
+
+### relbench_mode constraints
+- `entity_task_ratio=1.0`: focal is always entity table (has children FK-referencing it)
+- `root_p=1.0`: target = subgraph root = entity table itself
+- Entity tables are roots of subgraph but may have FK parents in full RDB
+- HSBM block_paths exist for entity tables if they have FK parents in full RDB
+- For ultimate root entities: pseudo-blocks from feature clustering
+
+---
+
+## 2026-06-08 — Entity Table Temporal Snapshots + Same-Entity Bias Design
+
+### Real benchmark entity table structure
+
+Analyzed `model_pretrain/rdb_datasets/` (rel-amazon-dfs-2, rel-stack-dfs-2, amazon-dfs-2):
+
+- **Entity tables have MULTIPLE rows per entity**: user-churn 4.7M rows with `customer_id`, each customer appears at many timestamps
+- **All task tables have time_column**: 100% of tasks across all 3 datasets
+- **Non-root entity tasks exist**: post-votes (rel-stack) targets `posts` which has FK parents; rating/purchase (amazon-dfs-2) target `Review` (child table)
+- Current generation assumption ("entity=1 row, no timestamp") contradicts all real benchmarks
+
+### plurel reference
+
+- Entity tables: multi-row (num_rows range [500, 1000])
+- Entity tables: NO timestamps (min/max_timestamp = None for Entity type)
+- Activity tables: multi-row (num_rows range [2000, 5000]), HAVE timestamps
+
+### HSBM cluster_a vs cluster_b
+
+- `cluster_a`: parent-side block assignments (shape: parent_rows × n_levels)
+- `cluster_b`: child-side block assignments (shape: child_rows × n_levels)
+- Currently `cluster_a` is COMPUTED in `compute_hsbm_fk_ids()` but DISCARDED
+- Only `cluster_b` is returned as `block_paths` (stored on child table)
+- Root entities have no FK parents → never get HSBM block_paths → homophily falls to pseudo-blocks
+- Fix: store `cluster_a` when entity acts as parent → entity gets genuine HSBM blocks → replaces pseudo-blocks
+
+### OPENRFM label determination
+
+- Label = `b_parent % 2` (block-based, NOT FK adjacency based)
+- For non-root entities: blocks from HSBM child-side `cluster_b` (genuine structural signal)
+- For root entities: blocks from pseudo-feature-clustering (NOT HSBM-structured — gap)
+- FK-neighbor attention in RT is parent↔child (bidirectional), works for ALL entities
+- PFN FK bias is sibling-only (child↔child sharing same FK parent) — different mechanism
+
+### PK bias decision: DROPPED
+
+- No OPENRFM precedent, mechanism too complex
+- FK bias + same-entity bias provide sufficient coverage:
+  - FK bias: child sibling clustering (cross-table structure)
+  - Same-entity bias: entity temporal self-connection (within-table temporal)
+- `cluster_a` is still stored for homophily label quality (replaces pseudo-blocks for root entities)
+
+### Three biases (now two)
+
+| Bias | Formula | Purpose | Works on root entity |
+|---|---|---|---|
+| FK bias | I[fk[i]==fk[j]]·λ_fk | Child siblings share attention | NO |
+| Same-entity bias | I[eid[i]==eid[j]]·λ_se | Same entity across time | YES |
+| ~~PK bias~~ | ~~I[cluster_a[i]==cluster_a[j]]~~ | DROPPED | — |
+
+### Relbench_mode and root entities
+
+- relbench_mode: entity_task_ratio=1.0, root_p=1.0 → always targets root entity
+- With same-entity bias, root entities ARE covered (temporal self-connection)
+- No need to change relbench_mode to exclude root entities

@@ -1,0 +1,66 @@
+defaults:
+  - base_train
+  - _self_
+
+seed: 0
+
+train:
+  # Source-level 1:1 sampling. Keep both H5 files separate so their optional
+  # metadata schemas are handled by InMemoryDataset/JointDataset.
+  datasets:
+    - path: pretrain_datasets/v6.2.h5
+      weight: 1.0
+      sampled_columns: 30
+      targets_per_subset: 6
+      group_size_for_augment_data: 2
+    # Corrected R3 source: 1600-task direct merge, without repetitive filtering.
+    - path: pretrain_datasets/ablation_r3_data_prior_1024_direct.h5
+      weight: 1.0
+      sampled_columns: 30
+      targets_per_subset: 6
+      group_size_for_augment_data: 2
+
+  num_gpus: 2
+  num_epochs: 1
+  # Optimizer updates; independent of GPU count and gradient accumulation.
+  num_steps: 2200000
+  batch_size: 1
+  lr: 0.001
+  gradient_accumulation_steps: 2
+  steps_per_eval: 0
+  save_every_evals: null
+  load_model_path: checkpoints/RDBPFN_single/model_eval00360.pt
+  load_optimizer_state: false
+  save_model_path: checkpoints/mix_v62_r3_entitybias/model.pt
+  full_eval_steps: 0
+  full_eval_dataset_dir: rdb_datasets
+  full_eval_seeds: [0, 1, 2]
+  run_final_eval: false
+
+model:
+  type: base
+  embedding_size: 96
+  num_attention_heads: 4
+  mlp_hidden_size: 192
+  num_layers: 6
+  num_outputs: 2
+  num_category_buckets: 10
+  per_column_embeddings: false
+  sort_category_embeddings: false
+  invariant_noise_encoder: false
+  dual_feature_attention: false
+  category_as_numeric: false
+
+  # v6.2.h5 has entity_ids; R3 has none and is padded with -1, making the
+  # entity bias a no-op on R3 batches. FK bias is intentionally disabled:
+  # plain v6.2.h5 has no parent_entity_ids and would fall back to raw FK ids.
+  use_fk_bias: false
+  use_entity_bias: true
+
+eval:
+  csv_dirs: [datasets/clf, datasets/clf_real, datasets/clf_rel]
+
+wandb:
+  enabled: true
+  project: RDBPFN
+  run_name: mix_v62_r3_entitybias

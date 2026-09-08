@@ -29,6 +29,9 @@ from .eval_utils import (
     derive_output_name,
     save_results_to_csv,
     append_results_to_csv,
+    save_per_seed_results_to_csv,
+    append_per_seed_results_to_csv,
+    derive_per_seed_output_path,
     fill_nans,
     prepare_eval_splits,
 )
@@ -117,11 +120,19 @@ def _evaluate_task(
     fk_values_train: np.ndarray | None = None,
     entity_ids_train: np.ndarray | None = None,
     parent_entity_ids_train: np.ndarray | None = None,
+    fk_values_test: np.ndarray | None = None,
+    entity_ids_test: np.ndarray | None = None,
+    parent_entity_ids_test: np.ndarray | None = None,
 ):
     classifier.fit(X_train, y_train, fk_values=fk_values_train,
                    entity_ids=entity_ids_train,
                    parent_entity_ids=parent_entity_ids_train)
-    prob = predict_proba_in_chunks(classifier, X_test, chunk_size)
+    prob = predict_proba_in_chunks(
+        classifier, X_test, chunk_size,
+        fk_values_test=fk_values_test,
+        entity_ids_test=entity_ids_test,
+        parent_entity_ids_test=parent_entity_ids_test,
+    )
     pred = prob.argmax(axis=1)
     metric = task.metadata.evaluation_metric
     metric_value = compute_metric(metric, y_test, prob, pred)
@@ -179,7 +190,9 @@ def _evaluate_datasets(
                 )
                 continue
             task_entries.append(
-                (X_train, y_train, X_test, y_test, task, task.metadata.name, fk_values_train, entity_ids_train, parent_entity_ids_train, parent_entity_ids_test)
+                (X_train, y_train, X_test, y_test, task, task.metadata.name,
+                 fk_values_train, entity_ids_train, parent_entity_ids_train,
+                 fk_values_test, entity_ids_test, parent_entity_ids_test)
             )
             logger.info(
                 "Task %s/%s: #train=%d, #test=%d, #cols=%d",
@@ -195,12 +208,19 @@ def _evaluate_datasets(
 
         # ── Evaluate all seeds for this dataset's tasks ──
         for seed in cfg.dataset.seeds:
-            for X_train, y_train, X_test, y_test, task, task_name, fk_values_train, entity_ids_train, parent_entity_ids_train, parent_entity_ids_test in task_entries:
+            for X_train, y_train, X_test, y_test, task, task_name, fk_values_train, entity_ids_train, parent_entity_ids_train, fk_values_test, entity_ids_test, parent_entity_ids_test in task_entries:
                 seed_key = f"{dataset.dataset_name}:{task_name}:{seed}"
                 seed_offset = _stable_random_state(seed_key)
-                X_train_ds, y_train_ds = downsample_split(
-                    X_train, y_train, cfg.dataset.max_train_samples, seed_offset
-                )
+                idx_train = np.arange(len(X_train))
+                if cfg.dataset.max_train_samples and len(idx_train) > cfg.dataset.max_train_samples:
+                    rng = np.random.default_rng(seed_offset)
+                    idx_train = rng.choice(idx_train, size=cfg.dataset.max_train_samples, replace=False)
+                    idx_train.sort()
+                X_train_ds = X_train[idx_train]
+                y_train_ds = y_train[idx_train]
+                fk_values_train_ds = fk_values_train[idx_train] if fk_values_train is not None else None
+                entity_ids_train_ds = entity_ids_train[idx_train] if entity_ids_train is not None else None
+                parent_entity_ids_train_ds = parent_entity_ids_train[idx_train] if parent_entity_ids_train is not None else None
 
                 test_seed_key = f"{dataset.dataset_name}:{task_name}:{seed}:test"
                 test_seed_offset = _stable_random_state(test_seed_key)
@@ -237,9 +257,12 @@ def _evaluate_datasets(
                             else cfg.dataset.eval_chunk_size
                         )
                     ),
-                    fk_values_train=fk_values_train,
-                    entity_ids_train=entity_ids_train,
-                    parent_entity_ids_train=parent_entity_ids_train,
+                    fk_values_train=fk_values_train_ds,
+                    entity_ids_train=entity_ids_train_ds,
+                    parent_entity_ids_train=parent_entity_ids_train_ds,
+                    fk_values_test=fk_values_test,
+                    entity_ids_test=entity_ids_test,
+                    parent_entity_ids_test=parent_entity_ids_test,
                 )
                 task_result["seed"] = seed
                 per_seed_results.append(task_result)
@@ -419,6 +442,7 @@ def main(cfg: EvaluationConfig):
 
     # Collect results from all models/checkpoints for CSV output
     all_model_results: dict[str, list[dict]] = {}
+    all_model_per_seed_results: dict[str, list[dict]] = {}
 
     for checkpoint_path in checkpoint_targets:
         label = str(checkpoint_path) if checkpoint_path else cfg.model.name
@@ -460,6 +484,7 @@ def main(cfg: EvaluationConfig):
 
         # Store results for CSV output
         all_model_results[label] = aggregated_results
+        all_model_per_seed_results[label] = per_seed_results
 
         if aggregated_results:
             mean_metric = float(
@@ -506,13 +531,19 @@ def main(cfg: EvaluationConfig):
         else OmegaConf.select(cfg, "output_path", default=default_output)
     )
     print(f"Saving results to {output_path}")
+    per_seed_output_path = derive_per_seed_output_path(output_path)
+    print(f"Saving per-seed results to {per_seed_output_path}")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if append_output:
         lock_path = output_path.with_suffix(output_path.suffix + ".lock")
         with _file_lock(lock_path):
             append_results_to_csv(all_model_results, output_path)
+            append_per_seed_results_to_csv(
+                all_model_per_seed_results, per_seed_output_path
+            )
     else:
         save_results_to_csv(all_model_results, output_path)
+        save_per_seed_results_to_csv(all_model_per_seed_results, per_seed_output_path)
 
 
 if __name__ == "__main__":
