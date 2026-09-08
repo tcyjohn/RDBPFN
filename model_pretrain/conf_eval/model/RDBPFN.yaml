@@ -17,3 +17,5 @@ nanopfn:
   invariant_noise_encoder: false
   dual_feature_attention: false
   category_as_numeric: false
+  use_fk_bias: false
+  use_entity_bias: false

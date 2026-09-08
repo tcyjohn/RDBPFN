@@ -39,12 +39,131 @@ from .task_generation_utils import (
     DirectAttributeTarget,
     RelationalAggregationTarget,
     SchemaEdge,
+    SchemaEdgeDirection,
     SchemaGraph,
-    InstanceGraph,
-    FocalEntity,
     AggregationFunctionList,
     PredicateFunctionList,
 )
+
+# ---------------------------------------------------------------------------
+# Homophily-controlled label generation helpers
+# ---------------------------------------------------------------------------
+
+_HOMOPHILY_GRID = None  # lazily initialized per RDB generation
+
+
+def _get_homophily_grid(k: int = 20, seed: int = 0) -> list[float]:
+    """Return K evenly-spaced homophily targets on [-1, +1] excluding 0."""
+    rng = np.random.RandomState(seed)
+    # Slightly asymmetric to avoid exact ±1 boundary (well-defined XOR logic)
+    epsilon = 0.02
+    values = np.linspace(-1 + epsilon, 1 - epsilon, k + 1)
+    values = values[values != 0]  # exclude exact 0
+    if len(values) > k:
+        values = values[:k]
+    rng.shuffle(values)
+    return [float(v) for v in values]
+
+
+def _sample_homophily_target(rdb_index: int, grid_size: int = 20) -> float:
+    """Sample a homophily target h for an RDB from the global grid."""
+    global _HOMOPHILY_GRID
+    if _HOMOPHILY_GRID is None or len(_HOMOPHILY_GRID) != grid_size:
+        _HOMOPHILY_GRID = _get_homophily_grid(k=grid_size, seed=42)
+    return _HOMOPHILY_GRID[rdb_index % grid_size]
+
+
+def _maybe_apply_homophily_label(
+    rdb,
+    target_table_name: str,
+    target_column_name: str,
+    prob_use: float = 0.5,
+    rdb_index: int = 0,
+) -> dict | None:
+    """Conditionally replace a target column with a homophily-controlled label.
+
+    Args:
+        rdb: The RDB object.
+        target_table_name: Name of the target table.
+        target_column_name: Name of the original target column (used for feature pool).
+        prob_use: Probability of applying homophily (rest keep original column).
+        rdb_index: Index for deterministic h-target sampling.
+
+    Returns:
+        meta dict if homophily was applied, None otherwise.
+    """
+    from ..prior.homophily import (
+        HomophilyLabelGenerator,
+        get_block_assignments,
+    )
+
+    rng = np.random.RandomState(rdb_index + hash(target_table_name) % 10007)
+    if rng.random() > prob_use:
+        return None
+
+    # Guard against re-modification during quality gate retries
+    modified_key = f"{target_table_name}.{target_column_name}"
+    if not hasattr(rdb, "_homophily_modified"):
+        rdb._homophily_modified = set()
+    if modified_key in rdb._homophily_modified:
+        return None  # already modified; deterministic repeat
+    rdb._homophily_modified.add(modified_key)
+
+    table = rdb.tables[target_table_name]
+    n_rows = table.num_rows
+    if n_rows < 4:
+        return None
+
+    # Get block assignments (HSBM first, parent-block, pseudo-block fallback)
+    hsbm_paths = getattr(rdb, "hsbm_block_paths", {})
+    hsbm_parent = getattr(rdb, "hsbm_parent_blocks", {})
+    block_assignments = get_block_assignments(
+        target_table_name, rdb,
+        hsbm_block_paths=hsbm_paths,
+        hsbm_parent_blocks=hsbm_parent,
+        seed=rdb_index,
+    )
+    if block_assignments is None or block_assignments.shape[0] != n_rows:
+        return None
+
+    # Feature pool for feature-driven label channel
+    feature_cols = table.get_feature_columns(only_categorical=False)
+    col_idx = [table.column_names.index(c) for c in feature_cols[:5]]
+    features = table.data[:, col_idx]
+
+    # Sample h_target
+    h_target = _sample_homophily_target(rdb_index)
+
+    # Generate homophily-controlled label
+    gen = HomophilyLabelGenerator(
+        h_target=h_target,
+        block_assignments=block_assignments,
+        features=features,
+        seed=rdb_index,
+    )
+    y_new, meta = gen.generate_label()
+
+    # Refuse to overwrite entity_id column (used for same-entity attention bias).
+    target_col_idx = table.column_names.index(target_column_name)
+    if table.entity_column is not None and target_col_idx == table.entity_column:
+        return None
+
+    # Replace column data in-place
+    table.data[:, target_col_idx] = y_new.float()
+
+    # Update dataframe if it exists
+    if table.dataframe is not None:
+        table.dataframe[target_column_name] = y_new.numpy()
+
+    # Ensure data_type_config reflects binary categorical
+    from .table_generation import DataTypeConfig, DataType as DType
+    table.data_type_configs[target_col_idx] = DataTypeConfig(
+        DType.CATEGORICAL,
+        num_categories=2,
+        balanced=True,
+    )
+
+    return meta
 
 
 class Task:
@@ -292,9 +411,10 @@ class TaskDataGenerator:
         """
         self.rdb = rdb
         self.random_seed = random_seed
-        random.seed(random_seed)
-        np.random.seed(random_seed)
-        torch.manual_seed(random_seed)
+        if random_seed is not None:
+            random.seed(random_seed)
+            np.random.seed(random_seed)
+            torch.manual_seed(random_seed)
 
     def _compute_column_metadata(
         self,
@@ -374,7 +494,10 @@ class TaskDataGenerator:
             task.task_type == TaskType.DIRECT_ATTRIBUTE_PREDICTION
             or task.task_type == TaskType.RELATIONAL_AGGREGATION_PREDICTION
         ):
-            # TODO: Handle multiple key tables
+            # For complex tasks, joined columns are not known until
+            # _join_related_features runs.  Compute metadata from the focal
+            # table's own columns here; joined columns are patched in by
+            # generate_task_data after combine_features_and_labels.
             key_table_name = task.key_tables[0]
             if key_table_name not in key_tables:
                 raise ValueError(f"Key table '{key_table_name}' not found")
@@ -394,63 +517,573 @@ class TaskDataGenerator:
                 "feature_columns": feature_columns,
                 "label_column": label_column,
                 "column_metadata": column_metadata,
+                # Filled by generate_task_data after joins.
+                "_joined_cols_pending": True,
             }
 
             return task_column_metadata
 
-    def generate_instance_graphs_and_compute_labels(
+    def _get_joined_feature_columns(
+        self,
+        focal_table_name: str,
+        schema_graph: "SchemaGraph",
+    ) -> List[Tuple[str, "DataType"]]:
+        """Return ``(column_name, DataType)`` for columns ``_join_related_features`` adds."""
+        if schema_graph is None or len(schema_graph.nodes) <= 1:
+            return []
+
+        topo_order = schema_graph.get_topological_order()
+        remaining = [t for t in topo_order if t != focal_table_name]
+        if not remaining:
+            return []
+
+        joined_cols: List[Tuple[str, DataType]] = []
+        joined_tables = {focal_table_name}
+
+        for table_name in remaining:
+            # Find any already-joined table that has an edge with table_name
+            # (same BFS logic as _join_related_features).
+            linked_name = None
+            for neighbor in schema_graph.adjacency.get(table_name, []):
+                if neighbor in joined_tables:
+                    linked_name = neighbor
+                    break
+            if linked_name is None:
+                for t, neighbors in schema_graph.adjacency.items():
+                    if t in joined_tables and table_name in neighbors:
+                        linked_name = t
+                        break
+
+            other_table = self.rdb.tables[table_name]
+            feat_cols = other_table.get_feature_columns()
+
+            if linked_name is not None:
+                edge = schema_graph.get_edge(linked_name, table_name)
+                if edge is None:
+                    edge = schema_graph.get_edge(table_name, linked_name)
+
+                if edge is not None:
+                    if edge.direction == SchemaEdgeDirection.FK_TO_PK:
+                        col_name_to_idx = {
+                            name: i for i, name in enumerate(other_table.column_names)
+                        }
+                        for c in feat_cols:
+                            idx = col_name_to_idx.get(c)
+                            col_dtype = (
+                                other_table.data_type_configs[idx].data_type
+                                if idx is not None
+                                else DataType.FLOAT
+                            )
+                            joined_cols.append((f"{table_name}_{c}", col_dtype))
+
+                    elif edge.direction == SchemaEdgeDirection.PK_TO_FK:
+                        for c in feat_cols:
+                            joined_cols.append(
+                                (f"{table_name}_{c}_mean", DataType.FLOAT)
+                            )
+                            joined_cols.append(
+                                (f"{table_name}_{c}_std", DataType.FLOAT)
+                            )
+
+                    joined_tables.add(table_name)
+                    continue
+
+            # ── multi-hop bridge (mirrors _join_related_features) ──────────
+            if not feat_cols:
+                continue
+
+            for mid_name, mid_table in self.rdb.tables.items():
+                if mid_name == table_name or mid_name == focal_table_name:
+                    continue
+
+                # T FK → M PK?
+                t_fk_col, _, _ = self._find_fk_to(other_table, mid_name)
+                if t_fk_col is None:
+                    continue
+
+                # M FK → J (any already-joined table)?
+                bridge_found = False
+                for j_name in joined_tables:
+                    m_fk, _, _ = self._find_fk_to(mid_table, j_name)
+                    if m_fk is not None:
+                        bridge_found = True
+                        break
+                if not bridge_found:
+                    continue
+
+                # Bridge join always aggregates (mean/std).
+                for c in feat_cols:
+                    joined_cols.append(
+                        (f"{table_name}_{c}_mean", DataType.FLOAT)
+                    )
+                    joined_cols.append(
+                        (f"{table_name}_{c}_std", DataType.FLOAT)
+                    )
+                break
+            joined_tables.add(table_name)
+
+        return joined_cols
+
+    def _join_related_features(
+        self,
+        combined_df: pd.DataFrame,
+        focal_table_name: str,
+        schema_graph: "SchemaGraph",
+    ) -> pd.DataFrame:
+        """Join feature columns from related tables via FK relationships.
+
+        Traverses the schema graph from the focal table outward, joining
+        feature columns (float + categorical) from each non-focal table.
+        Column names are prefixed with ``{table_name}_`` to avoid collisions.
+        """
+        if schema_graph is None or len(schema_graph.nodes) <= 1:
+            return combined_df
+
+        topo_order = schema_graph.get_topological_order()
+        remaining = [t for t in topo_order if t != focal_table_name]
+        if not remaining:
+            return combined_df
+
+        orig_index = combined_df.index
+        joined_tables = {focal_table_name}
+
+        for table_name in remaining:
+            # Find any already-joined table that has an edge with table_name.
+            linked_name = None
+            for neighbor in schema_graph.adjacency.get(table_name, []):
+                if neighbor in joined_tables:
+                    linked_name = neighbor
+                    break
+            if linked_name is None:
+                # Also check reverse adjacency
+                for t, neighbors in schema_graph.adjacency.items():
+                    if t in joined_tables and table_name in neighbors:
+                        linked_name = t
+                        break
+            other_table = self.rdb.tables[table_name]
+            if other_table.dataframe is None:
+                other_table.generate_dataframe()
+
+            feat_cols = other_table.get_feature_columns()
+            # Also pull FK columns so they are available for subsequent joins.
+            fk_cols = [
+                other_table.column_names[i]
+                for i, dtc in enumerate(other_table.data_type_configs)
+                if dtc.data_type == DataType.FOREIGN_KEY
+            ]
+            extra_cols = [c for c in fk_cols if c not in feat_cols]
+
+            # ── direct edge join ──────────────────────────────────────────
+            if linked_name is not None:
+                edge = schema_graph.get_edge(linked_name, table_name)
+                if edge is None:
+                    edge = schema_graph.get_edge(table_name, linked_name)
+                if edge is not None and (feat_cols or extra_cols):
+                    t_linked = self.rdb.tables[linked_name]
+                    t_other = other_table
+
+                    # Case 1: linked_name FK → table_name PK (direct merge)
+                    fk_col, pk_table, _ = self._find_fk_to(t_linked, table_name)
+                    if fk_col is not None and pk_table is not None:
+                        fk_col_name = t_linked.column_names[fk_col]
+                        pk_col_name = t_other.column_names[0]
+                        if fk_col_name in combined_df.columns:
+                            keep_cols = [pk_col_name] + feat_cols + extra_cols
+                            other_feat_df = t_other.dataframe[keep_cols].copy()
+                            rename_map = {c: f"{table_name}_{c}" for c in feat_cols}
+                            other_feat_df = other_feat_df.rename(columns=rename_map)
+                            if other_feat_df[pk_col_name].duplicated().any():
+                                other_feat_df = other_feat_df.drop_duplicates(
+                                    subset=[pk_col_name], keep="first"
+                                )
+                            combined_df = combined_df.merge(
+                                other_feat_df,
+                                left_on=fk_col_name,
+                                right_on=pk_col_name,
+                                how="left",
+                            )
+                            combined_df.index = orig_index
+                            joined_tables.add(table_name)
+                            continue
+
+                    # Case 2: table_name FK → linked_name PK (aggregate)
+                    fk_col2, pk_table2, _ = self._find_fk_to(t_other, linked_name)
+                    if fk_col2 is not None and pk_table2 is not None:
+                        fk_col_name2 = t_other.column_names[fk_col2]
+                        pk_col_name2 = t_linked.column_names[0]
+                        if pk_col_name2 in combined_df.columns:
+                            child_df = t_other.dataframe[[fk_col_name2] + feat_cols].copy()
+                            agg_funcs = {
+                                c: ["mean", lambda x: x.std(ddof=0) if len(x) >= 1 else 0.0]
+                                for c in feat_cols
+                            }
+                            agg_df = child_df.groupby(fk_col_name2, as_index=False).agg(agg_funcs)
+                            agg_df.columns = [
+                                fk_col_name2
+                                if col[0] == fk_col_name2
+                                else f"{table_name}_{col[0]}_{col[1]}"
+                                for col in agg_df.columns
+                            ]
+                            combined_df = combined_df.merge(
+                                agg_df,
+                                left_on=pk_col_name2,
+                                right_on=fk_col_name2,
+                                how="left",
+                            )
+                            combined_df.index = orig_index
+                            joined_tables.add(table_name)
+                            continue
+
+            # ── multi-hop bridge join ─────────────────────────────────────
+            # When linked_name is None (no direct edge to a joined table),
+            # try a 2-hop path: table T has FK→M, and M has FK→J (J already
+            # joined).  Needed because Case 2 aggregation drops M's PK from
+            # combined_df, blocking direct FK joins from grandchild tables.
+            if not feat_cols:
+                continue
+
+            t_other = other_table
+            for mid_name, mid_table in self.rdb.tables.items():
+                if mid_name == table_name or mid_name == focal_table_name:
+                    continue
+                if mid_table.dataframe is None:
+                    mid_table.generate_dataframe()
+
+                # T FK → M PK?
+                t_fk_col, _, _ = self._find_fk_to(t_other, mid_name)
+                if t_fk_col is None:
+                    continue
+
+                # M FK → J (any already-joined table)?
+                bridge_linked = None
+                bridge_fk_col = None
+                for j_name in joined_tables:
+                    m_fk, _, _ = self._find_fk_to(mid_table, j_name)
+                    if m_fk is not None:
+                        bridge_linked = j_name
+                        bridge_fk_col = m_fk
+                        break
+                if bridge_linked is None:
+                    continue
+
+                t_fk_col_name = t_other.column_names[t_fk_col]
+                bridge_fk_col_name = mid_table.column_names[bridge_fk_col]
+                bridge_pk_col_name = mid_table.column_names[0]
+                t_linked2 = self.rdb.tables[bridge_linked]
+                pk_col_name2 = t_linked2.column_names[0]
+                if pk_col_name2 not in combined_df.columns:
+                    continue
+
+                # 1. Merge T with bridge M to propagate bridge FK.
+                t_df = t_other.dataframe[[t_fk_col_name] + feat_cols].copy()
+                bridge_df = mid_table.dataframe[
+                    [bridge_pk_col_name, bridge_fk_col_name]
+                ].copy()
+                bridge_df = bridge_df.rename(
+                    columns={bridge_pk_col_name: "_bridge_pk"}
+                )
+                merged = t_df.merge(
+                    bridge_df,
+                    left_on=t_fk_col_name,
+                    right_on="_bridge_pk",
+                    how="left",
+                )
+
+                # 2. Aggregate T features by bridge FK.
+                agg_funcs = {c: ["mean", "std"] for c in feat_cols}
+                agg_df = merged.groupby(
+                    bridge_fk_col_name, as_index=False
+                ).agg(agg_funcs)
+                agg_df.columns = [
+                    bridge_fk_col_name
+                    if col[0] == bridge_fk_col_name
+                    else f"{table_name}_{col[0]}_{col[1]}"
+                    for col in agg_df.columns
+                ]
+
+                # 3. Join via J.PK = bridge FK.
+                combined_df = combined_df.merge(
+                    agg_df,
+                    left_on=pk_col_name2,
+                    right_on=bridge_fk_col_name,
+                    how="left",
+                )
+                combined_df.index = orig_index
+                joined_tables.add(table_name)
+                break
+            else:
+                # No bridge found either — add to joined set anyway so
+                # subsequent tables can still try to link through it.
+                joined_tables.add(table_name)
+
+        return combined_df
+
+    @staticmethod
+    def _find_fk_to(
+        table: "Table", target_table_name: str
+    ) -> Tuple[int | None, str | None, int | None]:
+        """Return ``(fk_col_idx, pk_table_name, pk_col_idx)`` if *table* has
+        an FK pointing to *target_table_name*, else ``(None, None, None)``."""
+        for i, dtc in enumerate(table.data_type_configs):
+            if dtc.data_type == DataType.FOREIGN_KEY:
+                parent = dtc.config.get("parent_table")
+                if parent == target_table_name:
+                    return (i, target_table_name, 0)
+        return (None, None, None)
+
+    def _walk_and_merge(
+        self,
+        df: pd.DataFrame,
+        start_table: str,
+        path: List[str],
+        schema_graph: "SchemaGraph",
+    ) -> pd.DataFrame:
+        """Walk FK edges along *path*, merging only PK and FK columns.
+
+        Returns a DataFrame that maps the start table's PK to the terminal
+        table's PK (plus intermediate FK columns).  No feature columns are
+        carried — the caller merges those separately.
+        """
+        current_df = df
+        current_table = start_table
+        active_pk = self.rdb.tables[start_table].column_names[0]
+
+        for i, next_table in enumerate(path):
+            is_terminal = (i == len(path) - 1)
+            edge = schema_graph.get_edge(current_table, next_table)
+            if edge is None:
+                edge = schema_graph.get_edge(next_table, current_table)
+            if edge is None:
+                raise ValueError(
+                    f"No edge between {current_table} and {next_table}"
+                )
+
+            next_tbl = self.rdb.tables[next_table]
+            if next_tbl.dataframe is None:
+                next_tbl.generate_dataframe()
+
+            pk_tag = f"_pk_{next_table}"
+
+            # FK columns of *next_table* needed when it becomes the current
+            # table in a subsequent PK_TO_FK step.
+            next_fk_indices: list[int] = []
+            if not is_terminal:
+                for j, dtc in enumerate(next_tbl.data_type_configs):
+                    if dtc.data_type == DataType.FOREIGN_KEY and j != 0:
+                        next_fk_indices.append(j)
+
+            if edge.direction == SchemaEdgeDirection.PK_TO_FK:
+                # current.FK  =  next.PK
+                cur_fk_idx = edge.from_column
+                cur_fk_name = self.rdb.tables[current_table].column_names[
+                    cur_fk_idx
+                ]
+                col_idxs = [0] + next_fk_indices
+                next_df = next_tbl.dataframe.iloc[:, col_idxs].copy()
+                next_names = [pk_tag] + [
+                    next_tbl.column_names[j] for j in next_fk_indices
+                ]
+                next_df.columns = next_names
+                current_df = current_df.merge(
+                    next_df, left_on=cur_fk_name, right_on=pk_tag,
+                    how="left",
+                )
+            else:  # FK_TO_PK
+                # current.PK  =  next.FK
+                next_fk_idx = edge.to_column
+                next_fk_tag = f"_fk_{next_table}"
+                col_idxs = [0, next_fk_idx] + [
+                    j for j in next_fk_indices if j != next_fk_idx
+                ]
+                next_df = next_tbl.dataframe.iloc[:, col_idxs].copy()
+                next_names = [pk_tag, next_fk_tag] + [
+                    next_tbl.column_names[j]
+                    for j in next_fk_indices if j != next_fk_idx
+                ]
+                next_df.columns = next_names
+                current_df = current_df.merge(
+                    next_df, left_on=active_pk, right_on=next_fk_tag,
+                    how="left",
+                )
+
+            current_table = next_table
+            active_pk = pk_tag
+
+        return current_df
+
+    def _lookup_terminal_column(
+        self,
+        merged: pd.DataFrame,
+        focal_pk: str,
+        target_table_name: str,
+        column_name: str,
+    ) -> pd.Series:
+        """Merge terminal-table column into *merged* via the terminal PK."""
+        target_tbl = self.rdb.tables[target_table_name]
+        if target_tbl.dataframe is None:
+            target_tbl.generate_dataframe()
+        target_pk_tag = f"_pk_{target_table_name}"
+        target_pk = target_tbl.column_names[0]
+
+        target_df = target_tbl.dataframe[[target_pk, column_name]].copy()
+        target_df = target_df.rename(columns={target_pk: target_pk_tag})
+        return merged.merge(target_df, on=target_pk_tag, how="left")
+
+    def _compute_direct_attribute_labels_bulk(
         self,
         task: Task,
         key_table_name: str,
         key_table: Table,
-        num_samples: int = 10,
-    ) -> Dict:
-        """
-        Generate instance graphs and compute labels for a task.
-        """
-        # random select some idx from key_table
-        assert num_samples <= key_table.dataframe.shape[0]
-        idx = random.sample(range(key_table.dataframe.shape[0]), num_samples)
-        combined_df = key_table.dataframe.iloc[idx]
-        removed_idx = []
-        labels = []
-        for i in idx:
-            instance_graph = InstanceGraph(
-                FocalEntity(key_table_name, i), task.schema_graph
+    ) -> pd.DataFrame:
+        """Bulk DirectAttribute label computation — no per-row InstanceGraph."""
+        target_comp = task.target_computation
+        target_table_name = target_comp.table_name
+
+        focal_df = key_table.dataframe.copy()
+        focal_pk = key_table.column_names[0]
+
+        result = self._join_related_features(
+            focal_df, key_table_name, task.schema_graph,
+        )
+
+        if target_table_name == key_table_name:
+            labels = key_table.dataframe[target_comp.column_name].values
+        else:
+            path = task.schema_graph.find_path(key_table_name, target_table_name)
+            if path is None:
+                return None
+            init_cols = self._initial_walk_cols(
+                key_table_name, path[0], task.schema_graph, focal_pk,
             )
-            instance_graph.generate(self.rdb)
-            label = task.target_computation.compute_label(instance_graph)
-            if label is None:
-                removed_idx.append(i)
+            merged = self._walk_and_merge(
+                focal_df[init_cols], key_table_name, path, task.schema_graph,
+            )
+            merged = self._lookup_terminal_column(
+                merged, focal_pk, target_table_name, target_comp.column_name,
+            )
+            labels = (
+                merged.groupby(focal_pk)[target_comp.column_name]
+                .first()
+                .reindex(focal_df[focal_pk])
+                .values
+            )
+
+        result[task.real_name_for_target_column] = labels
+        return result
+
+    def _compute_aggregation_labels_bulk(
+        self,
+        task: Task,
+        key_table_name: str,
+        key_table: Table,
+        max_retries: int = 5,
+    ) -> Optional[pd.DataFrame]:
+        """Bulk RelationalAggregation label computation via merge + groupby."""
+        target_comp = task.target_computation
+        target_node_set = target_comp.target_node_set
+        target_table_name = target_node_set.table_name
+
+        focal_df = key_table.dataframe.copy()
+        focal_pk = key_table.column_names[0]
+
+        result = self._join_related_features(
+            focal_df, key_table_name, task.schema_graph,
+        )
+
+        if target_table_name == key_table_name:
+            lookup_df = focal_df[[focal_pk, target_comp.aggregation_column]].copy()
+        else:
+            path = task.schema_graph.find_path(key_table_name, target_table_name)
+            if path is None:
+                return None
+            init_cols = self._initial_walk_cols(
+                key_table_name, path[0], task.schema_graph, focal_pk,
+            )
+            merged = self._walk_and_merge(
+                focal_df[init_cols], key_table_name, path, task.schema_graph,
+            )
+
+        for attempt in range(max_retries + 1):
+            agg_col = target_comp.aggregation_column
+            agg_func = target_comp.aggregation_func
+
+            if target_table_name != key_table_name:
+                lookup_df = self._lookup_terminal_column(
+                    merged, focal_pk, target_table_name, agg_col,
+                )
+
+            if agg_col not in lookup_df.columns:
+                return None
+
+            # Map AggregationFunction to a pandas groupby operation.
+            _agg_name_map = {
+                "COUNT": "count", "SUM": "sum", "AVG": "mean",
+                "MAX": "max", "MIN": "min", "STD": "std",
+            }
+            _agg_name = _agg_name_map.get(agg_func.name, "mean")
+            grouped = lookup_df.groupby(focal_pk)[agg_col].agg(_agg_name)
+            valid = grouped.dropna()
+            valid = valid[~np.isinf(valid.values)]
+
+            if len(valid) < 2 or len(set(valid.values)) <= 1:
+                if attempt == max_retries:
+                    return None
+                target_table = self.rdb.tables[target_table_name]
+                float_cols = target_table.get_feature_columns(only_float=True)
+                if not float_cols:
+                    return None
+                target_comp.aggregation_column = random.choice(float_cols)
+                target_comp.aggregation_func = random.choice(
+                    AggregationFunctionList,
+                )
+                template = random.choice(PredicateFunctionList)
+                target_comp.predicate_func = PredicateFunction(
+                    template.operator, template.threshold,
+                )
                 continue
-            labels.append(label)
-        # check if all labels are the same
-        if len(set(labels)) == 1:
+
+            threshold = float(np.median(valid.values))
+            target_comp.predicate_func = PredicateFunction(
+                target_comp.predicate_func.operator, threshold,
+            )
+            labels = valid.apply(
+                lambda v: int(target_comp.predicate_func.apply(v))
+            )
+
+            if len(labels) > 0 and len(set(labels.values)) > 1:
+                break
+        else:
             return None
-        combined_df = combined_df.drop(removed_idx)
-        combined_df[task.real_name_for_target_column] = labels
-        return combined_df
+
+        result[task.real_name_for_target_column] = (
+            labels.reindex(focal_df[focal_pk]).fillna(0).astype(int).values
+        )
+        return result
+
+    def _initial_walk_cols(
+        self,
+        start_table: str,
+        first_next: str,
+        schema_graph: "SchemaGraph",
+        pk_col: str,
+    ) -> list[str]:
+        """Columns needed in the initial DataFrame for ``_walk_and_merge``."""
+        edge = schema_graph.get_edge(start_table, first_next)
+        if edge is None:
+            edge = schema_graph.get_edge(first_next, start_table)
+        if edge is not None and edge.direction == SchemaEdgeDirection.PK_TO_FK:
+            fk_col = self.rdb.tables[start_table].column_names[
+                edge.from_column
+            ]
+            return [pk_col, fk_col]
+        return [pk_col]
 
     def combine_features_and_labels(
         self,
         task: Task,
         key_tables: Dict[str, Table],
     ) -> pd.DataFrame:
-        """
-        Combine required features and labels into a unified dataframe.
-
-        Parameters
-        ----------
-        task : Task
-            Task object with metadata
-        key_tables : Dict[str, Table]
-            Dictionary mapping table names to Table objects
-
-        Returns
-        -------
-        pd.DataFrame
-            Unified dataframe with features and labels
-        """
+        """Combine required features and labels into a unified dataframe."""
         if task.task_metadata is None:
             raise ValueError(
                 "Task metadata not generated. Call generate_task_metadata first."
@@ -459,25 +1092,23 @@ class TaskDataGenerator:
         key_table_name = task.task_metadata["key_table"]
         key_table = key_tables[key_table_name]
 
-        # Ensure table has dataframe
         if key_table.dataframe is None:
             key_table.generate_dataframe()
 
-        # Get required columns
         if task.task_type == TaskType.SINGLE_TABLE_PREDICTION:
             required_columns = task.task_metadata["feature_columns"] + [
                 task.task_metadata["label_column"]
             ]
-            # Create unified dataframe with only required columns
             unified_df = key_table.dataframe[required_columns].copy()
 
-        elif (
-            task.task_type == TaskType.DIRECT_ATTRIBUTE_PREDICTION
-            or task.task_type == TaskType.RELATIONAL_AGGREGATION_PREDICTION
-        ):
-            # Randomly generate instance graphs and compute labels
-            unified_df = self.generate_instance_graphs_and_compute_labels(
-                task, key_table_name, key_table, key_table.num_rows
+        elif task.task_type == TaskType.DIRECT_ATTRIBUTE_PREDICTION:
+            unified_df = self._compute_direct_attribute_labels_bulk(
+                task, key_table_name, key_table,
+            )
+
+        elif task.task_type == TaskType.RELATIONAL_AGGREGATION_PREDICTION:
+            unified_df = self._compute_aggregation_labels_bulk(
+                task, key_table_name, key_table,
             )
 
         return unified_df
@@ -602,6 +1233,24 @@ class TaskDataGenerator:
             return None
         task.set_unified_dataframe(unified_df)
 
+        # If joined columns were added, patch the metadata.
+        if task_column_metadata.get("_joined_cols_pending"):
+            del task_column_metadata["_joined_cols_pending"]
+            all_cols = list(unified_df.columns)
+            focal_cols = task_column_metadata["all_columns"]
+            joined_cols = [c for c in all_cols if c not in focal_cols and c != task.real_name_for_target_column]
+            for col_name in joined_cols:
+                task_column_metadata["all_columns"].append(col_name)
+                task_column_metadata["feature_columns"].append(col_name)
+                task_column_metadata["column_metadata"][col_name] = {
+                    "name": col_name,
+                    "data_type": DataType.FLOAT,
+                    "is_feature": True,
+                    "is_label": False,
+                    "column_index": -1,
+                }
+            task.set_task_column_metadata(task_column_metadata)
+
         # Step 3: Split the unified dataframe
         task_data = self.split_task_data(task, train_ratio, valid_ratio)
 
@@ -641,7 +1290,13 @@ class TaskGenerator:
     Uses TaskDataGenerator internally for data generation.
     """
 
-    def __init__(self, rdb, random_seed: int = 42):
+    def __init__(
+        self,
+        rdb,
+        random_seed: int = 42,
+        entity_task_ratio: float = 0.75,
+        relbench_mode: bool = False,
+    ):
         """
         Initialize TaskGenerator.
 
@@ -651,15 +1306,65 @@ class TaskGenerator:
             RDB object
         random_seed : int
             Random seed for reproducible task generation
+        entity_task_ratio : float
+            Probability of selecting an entity (parent) table as the focal table.
+            Default 0.75 means ~75% of tasks use entity tables as focal.
+        relbench_mode : bool
+            If True, use RelBench-style tasks: entity as focal AND target,
+            DIRECT_ATTRIBUTE_PREDICTION with child-aggregated features.
+            Overrides entity_task_ratio to 1.0 when True.
         """
         self.rdb = rdb
         self.random_seed = random_seed
-        random.seed(random_seed)
-        np.random.seed(random_seed)
-        torch.manual_seed(random_seed)
+        self.entity_task_ratio = 1.0 if relbench_mode else entity_task_ratio
+        self.relbench_mode = relbench_mode
+        if random_seed is not None:
+            random.seed(random_seed)
+            np.random.seed(random_seed)
+            torch.manual_seed(random_seed)
 
         # Initialize data generator
         self.data_generator = TaskDataGenerator(rdb=rdb, random_seed=random_seed)
+
+    def _classify_tables(self) -> Tuple[List[str], List[str]]:
+        """Classify tables into entity (has children) and non-entity (no children).
+
+        An entity table is referenced by at least one other table's FK.
+        """
+        referenced = set()
+        for rel in self.rdb.relationships:
+            referenced.add(rel.to_table)
+
+        entity_tables = []
+        non_entity_tables = []
+        for table_name in self.rdb.tables:
+            if table_name in referenced:
+                entity_tables.append(table_name)
+            else:
+                non_entity_tables.append(table_name)
+        return entity_tables, non_entity_tables
+
+    def _has_children(self, table_name: str) -> bool:
+        """Check if a table is referenced by any FK from another table."""
+        for rel in self.rdb.relationships:
+            if rel.to_table == table_name:
+                return True
+        return False
+
+    def _has_parent(self, table_name: str) -> bool:
+        """Check if a table has an FK referencing another table."""
+        for rel in self.rdb.relationships:
+            if rel.from_table == table_name:
+                return True
+        return False
+
+    def _get_children(self, table_name: str) -> List[str]:
+        """Get tables that reference this table via FK."""
+        children = []
+        for rel in self.rdb.relationships:
+            if rel.to_table == table_name:
+                children.append(rel.from_table)
+        return children
 
     def generate_single_table_prediction_tasks(
         self,
@@ -706,6 +1411,9 @@ class TaskGenerator:
             if exclude_timestamp_columns:
                 if data_type_config.data_type == DataType.TIMESTAMP:
                     continue
+            # entity_id is metadata used for same-entity attention bias, not a feature.
+            if col_name == "entity_id":
+                continue
             candidate_columns.append((i, col_name, data_type_config))
 
         if len(candidate_columns) == 0:
@@ -854,6 +1562,7 @@ class TaskGenerator:
         tasks_per_rdb: int = 3,
         exclude_small_tables: bool = True,
         min_table_size: int = 10,
+        use_homophily_labels: bool = False,
     ) -> List[Task]:
         """Generate tasks for an RDB with complex tasks.
 
@@ -862,6 +1571,8 @@ class TaskGenerator:
             tasks_per_rdb (int, optional): Number of tasks to generate per RDB. Defaults to 3.
             exclude_small_tables (bool, optional): Whether to exclude small tables. Defaults to True.
             min_table_size (int, optional): Minimum table size to consider for task generation. Defaults to 10.
+            use_homophily_labels (bool, optional): If True, conditionally replace target
+                columns with homophily-controlled labels. Defaults to False.
 
         Returns:
             List[Task]: List of generated tasks
@@ -879,20 +1590,36 @@ class TaskGenerator:
                     min_table_size=min_table_size,
                 )
             )
-            # ! Currently, we only accept one type of schema graph including 3 nodes, otherwise, we skip it.
-            if len(schema_graph.nodes) != 3:
+            if focal_table_name is None:
+                continue
+            if len(schema_graph.nodes) < 2:
                 print(f"Skipping schema graph with {len(schema_graph.nodes)} nodes")
                 continue
-            target_table_name = schema_graph.generate_target_table_name()
-            # print(f"Selected target table: {target_table_name}")
-            # TODO: Implement the compute_possible_task_types method in SchemaGraph
+            target_table_name = schema_graph.generate_target_table_name(
+                root_p=1.0,  # Always target = focal → DIRECT_ATTR → FK bias signal
+            )
+            # RelBench mode: entity table is target, predict its own column
+            is_entity_target = (
+                self.relbench_mode
+                and target_table_name == list(schema_graph.nodes.keys())[0]
+            )
             task_type = schema_graph.compute_possible_task_types(target_table_name)
+            # DIRECT_ATTRIBUTE_PREDICTION (root target) only needs 2 nodes;
+            # RELATIONAL_AGGREGATION_PREDICTION still requires 3 for multi-hop joins
+            if task_type != TaskType.DIRECT_ATTRIBUTE_PREDICTION and len(schema_graph.nodes) < 3:
+                print(f"Skipping schema graph with {len(schema_graph.nodes)} nodes (needs 3 for RELATIONAL_AGGREGATION_PREDICTION)")
+                continue
             if task_type == TaskType.DIRECT_ATTRIBUTE_PREDICTION:
-                target_column_name = random.choice(
-                    rdb.tables[target_table_name].get_feature_columns(
-                        only_categorical=True
-                    )
-                )
+                # Exclude entity_id from target candidates (it is a metadata
+                # column used for same-entity attention bias, not a feature).
+                target_table = rdb.tables[target_table_name]
+                categorical_cols = [
+                    c for c in target_table.get_feature_columns(only_categorical=True)
+                    if c != "entity_id"
+                ]
+                if not categorical_cols:
+                    continue
+                target_column_name = random.choice(categorical_cols)
             elif task_type == TaskType.RELATIONAL_AGGREGATION_PREDICTION:
                 target_column_name = random.choice(
                     rdb.tables[target_table_name].get_feature_columns(only_float=True)
@@ -920,7 +1647,6 @@ class TaskGenerator:
             # Determine evaluation metric and DBB task type based on target computation
             if isinstance(target_computation, DirectAttributeTarget):
                 # For direct attribute, we need to check the column type
-                target_table = rdb.tables[target_table_name]
                 target_col_idx = target_table.column_names.index(target_column_name)
                 target_data_type = target_table.data_type_configs[
                     target_col_idx
@@ -941,6 +1667,20 @@ class TaskGenerator:
                 evaluation_metric = DBBTaskEvalMetric.accuracy
                 dbb_task_type = DBBTaskType.classification
                 num_classes = 2
+
+            # --- Homophily-controlled label substitution ---
+            homophily_meta = None
+            if (
+                use_homophily_labels
+                and task_type == TaskType.DIRECT_ATTRIBUTE_PREDICTION
+                and dbb_task_type == DBBTaskType.classification
+            ):
+                homophily_meta = _maybe_apply_homophily_label(
+                    rdb, target_table_name, target_column_name,
+                    rdb_index=hash(rdb.name) & 0x7FFFFFFF,
+                )
+                if homophily_meta is not None:
+                    num_classes = 2  # homophily labels are always binary
 
             task = Task(
                 task_name=f"complex_task_{focal_table_name}_{task_type.value}_{i+1}",
@@ -1067,6 +1807,9 @@ class TaskGenerator:
         """
         Randomly select a focal entity table and sample neighbors to create a schema graph.
 
+        Biased toward entity (parent) tables: entity_task_ratio of the time, selects
+        a table that has children, producing RelBench-style aggregation tasks.
+
         Parameters
         ----------
         rdb : RDB
@@ -1085,36 +1828,71 @@ class TaskGenerator:
             - Name of the randomly selected focal table
             - Schema graph containing the focal table and its selected neighbors
         """
-        # Get candidate tables for focal entity selection
-        candidate_tables = []
-        for table_name, table in rdb.tables.items():
-            if exclude_small_tables and table.num_rows < min_table_size:
-                continue
-            candidate_tables.append(table_name)
+        entity_tables, non_entity_tables = self._classify_tables()
 
-        if not candidate_tables:
-            raise ValueError(
-                f"No suitable tables found for focal entity selection "
-                f"(min_size={min_table_size}, exclude_small={exclude_small_tables})"
+        # Filter by size
+        if exclude_small_tables:
+            entity_tables = [
+                t for t in entity_tables
+                if rdb.tables[t].num_rows >= min_table_size
+            ]
+            non_entity_tables = [
+                t for t in non_entity_tables
+                if rdb.tables[t].num_rows >= min_table_size
+            ]
+
+        # Build candidate pools: filter to tables with FK parents for FK bias signal.
+        # In relbench mode: 70% child entity preference within entity tables.
+        # In non-relbench mode: strictly only tables with FK parents.
+        entity_with_parents = [t for t in entity_tables if self._has_parent(t)]
+        leaf_with_parents = [t for t in non_entity_tables if self._has_parent(t)]
+
+        if self.relbench_mode:
+            # Relbench: entity focal, target=root, DIRECT_ATTR.
+            # Prefer child entities (has FK parents) so FK bias gets signal.
+            child_entities = entity_with_parents
+            root_entities = [t for t in entity_tables if t not in child_entities]
+            if child_entities and (random.random() < 0.7 or not root_entities):
+                candidates = child_entities
+            elif root_entities:
+                candidates = root_entities
+            else:
+                candidates = entity_tables
+        else:
+            # Non-relbench: focal=target, DIRECT_ATTR, FK bias must work.
+            # 75% biased toward entity (if any entity has FK parents),
+            # remaining toward non-entity with FK parents.
+            if entity_with_parents and (
+                random.random() < self.entity_task_ratio or not leaf_with_parents
+            ):
+                candidates = entity_with_parents
+            elif leaf_with_parents:
+                candidates = leaf_with_parents
+            elif entity_tables:
+                # Fallback: no tables with FK parents → pick any entity
+                candidates = entity_tables
+            elif non_entity_tables:
+                candidates = non_entity_tables
+            else:
+                candidates = []
+
+        if not candidates:
+            print(
+                f"Warning: No suitable tables found for focal entity selection "
+                f"(min_size={min_table_size}, exclude_small={exclude_small_tables}). "
+                f"All {len(rdb.tables)} tables have < {min_table_size} rows. Skipping."
             )
+            return None, None
 
-        # Randomly select a focal entity table
-        focal_table_name = random.choice(candidate_tables)
-        # print(f"Selected focal table: {focal_table_name}")
+        focal_table_name = random.choice(candidates)
 
-        # * Currently, we only do 2-hop 1-neighbor schema graph
-        schema_graph = rdb.create_multi_hop_schema_graph(
-            focal_table_name, num_hops=2, neighbors_each_hop=1
+        # Build schema graph: when focal is entity, bias first-hop neighbors toward children
+        schema_graph = rdb.create_multi_hop_schema_graph_biased(
+            focal_table_name,
+            num_hops=2,
+            neighbors_each_hop=1,
+            prefer_children=(focal_table_name in entity_tables),
+            get_children_fn=self._get_children,
         )
-
-        # # Select neighbor tables
-        # neighbor_tables = rdb.select_neighbor_tables(focal_table_name, max_neighbors)
-        # print(f"Selected neighbor tables: {neighbor_tables}")
-
-        # # Create sub-schema graph
-        # schema_graph = rdb.create_sub_schema_graph(focal_table_name, neighbor_tables)
-        # print(
-        #     f"Created schema graph with {len(schema_graph.nodes)} tables and {len(schema_graph.edges)} edges"
-        # )
 
         return focal_table_name, schema_graph

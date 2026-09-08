@@ -1,6 +1,6 @@
 # RDB_PFN
 
-This is the official repository for the paper [Relational In-Context Learning via Synthetic Pre-training with Structural Prior](https://arxiv.org/abs/2603.03805). It presents a synthetic pre-training framework for relational-database foundation models.
+This is a modified research fork of the code for the paper [Relational In-Context Learning via Synthetic Pre-training with Structural Prior](https://arxiv.org/abs/2603.03805). It presents a synthetic pre-training framework for relational-database foundation models.
 
 The repository is organized as a staged pipeline:
 
@@ -8,6 +8,30 @@ The repository is organized as a staged pipeline:
 2. Preprocess generated datasets into training formats.
 3. Pretrain the foundation model and evaluate it on downstream benchmark datasets.
 4. Provide a simple inference interface for applying the model to arbitrary user datasets when needed.
+
+## Setup and Current Workflow
+
+The shared environment is defined in [pixi.toml](pixi.toml) and pinned by `pixi.lock` (Linux x86-64, Python 3.10):
+
+```bash
+pixi install
+# Optional for Hugging Face access from mainland China:
+export HF_ENDPOINT=https://hf-mirror.com
+```
+
+This fork adds hierarchical stochastic block model (HSBM) foreign-key sampling, signal-group feature generation, entity temporal snapshots, task quality filtering, and optional FK/entity attention biases. Preprocessing preserves structural metadata through HDF5 loading, training, and evaluation.
+
+From the repository root:
+
+```bash
+bash scripts/run_pipeline.sh 4 0 my_run
+```
+
+This runs generation, pre-DFS/DFS/post-DFS preprocessing, HDF5 merging, evaluation CSV preparation, and training. It needs `data_generation/RDB/datasets/rdb_v1.pth` and the initialization checkpoint configured in `model_pretrain/conf_train/RDBPFN_hsbm.yaml`. Read the positional arguments in [scripts/run_pipeline.sh](scripts/run_pipeline.sh) before launching: its CSV preparation stage replaces `model_pretrain/datasets/clf/` contents. Set GPU visibility explicitly for your machine.
+
+See the stage READMEs below for generation-only commands, HDF5 metadata, and row-aligned evaluation. [Generation details](docs/data_generation_pipeline.md) and [evaluation notes](docs/evaluation.md) contain implementation and historical experiment details; current code/configs define defaults. Scripts for individual experiments may contain machine-specific paths and checkpoint names; inspect them before reuse.
+
+Generated datasets, checkpoints, and local experiment outputs are not installed by `pixi install`.
 
 ## Project Structure
 
@@ -77,23 +101,3 @@ Currently available:
 - model pretraining
 - model evaluation
 - standalone inference
-
-Planned next:
-
-- broader model support for more advanced settings
-
-Processed datasets for pretrain and evaluation:
-
-[RDB_PFN Datasets](https://huggingface.co/datasets/yamboo/RDB_PFN)
-
-## Citation
-
-If you found this work useful, please consider citing:
-```
-@article{wang2026relational,
-  title={Relational In-Context Learning via Synthetic Pre-training with Structural Prior},
-  author={Wang, Yanbo and You, Jiaxuan and Shi, Chuan and Zhang, Muhan},
-  journal={arXiv preprint arXiv:2603.03805},
-  year={2026}
-}
-```

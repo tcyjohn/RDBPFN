@@ -60,7 +60,9 @@ train:
   steps_per_eval: 200
   save_every_evals: 8
   load_model_path: checkpoints/RDBPFN_single/model_eval00360.pt
-  save_model_path: checkpoints/RDBPFN/model.pt 
+  save_model_path: checkpoints/RDBPFN/model.pt
+  full_eval_steps: 0
+  full_eval_dataset_dir: ""
 
 model:
   type: base
@@ -75,6 +77,7 @@ model:
   invariant_noise_encoder: false
   dual_feature_attention: false
   category_as_numeric: false
+  use_fk_bias: false
 
 eval:
   csv_dirs: [datasets/clf] 

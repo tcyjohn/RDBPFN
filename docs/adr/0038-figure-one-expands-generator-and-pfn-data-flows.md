@@ -1,0 +1,3 @@
+# Figure 1 expands generator and PFN data flows
+
+Figure 1 retains its two-panel solution-overview structure while replacing stage-name and “unchanged” black boxes with traceable data transformations. Panel (a) exposes intermediate objects from schema configuration through FK sampling, time/content generation, populated RDB construction, and DFS task materialization; Panel (b) exposes the continuation-task mixture, feature/target encoders, PFN attention blocks, query decoder and loss, plus the shared real-database inference path. Figure implementation is delegated; the manuscript workstream owns only the detailed revision prompt and acceptance criteria.

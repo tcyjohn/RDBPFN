@@ -58,6 +58,39 @@ LimiX note:
 - LimiX is intentionally not included in `pyproject.toml`.
 - If you want to evaluate the LimiX baselines, create a separate environment and follow the guidelines in [LimiX](https://github.com/stableai-org/LimiX).
 
+## Current Fork Entry Points
+
+For the shared Linux environment, run `pixi install` at the repository root. [run_train.py](run_train.py) and [run_eval.py](run_eval.py) are launch wrappers. Additional training presets are:
+
+- [RDBPFN_hsbm.yaml](conf_train/RDBPFN_hsbm.yaml): relational HDF5 training with optional FK/entity attention biases (both enabled in this preset).
+- [RDBPFN_mix_v62_r3.yaml](conf_train/RDBPFN_mix_v62_r3.yaml): source-weighted training from two separate HDF5 corpora, with entity bias enabled and FK bias disabled.
+
+Edit corpus/checkpoint paths before training. For an existing `pretrain_datasets/my_run.h5`, run from the repository root:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 NPROC=2 bash scripts/run_train.sh my_run RDBPFN_hsbm
+```
+
+Training now counts `train.num_steps` in optimizer updates. Gradient accumulation and GPU count must be accounted for when comparing against historical runs. Optional structural arrays (`fk_values`, `entity_ids`, `parent_entity_ids`) are passed through the loader and model; enable the bias settings appropriate to the checkpoint and corpus.
+
+### Row-Aligned Evaluation
+
+Use [src/eval_aligned.py](src/eval_aligned.py) when evaluating structural biases: subsampling applies the same row indices to features, labels, and structural metadata. From the repository root:
+
+```bash
+cd model_pretrain
+CUDA_VISIBLE_DEVICES=0 pixi run python -m src.eval_aligned \
+  dataset=full-512 model=RDBPFN \
+  model.checkpoint_path=checkpoints/RDBPFN/model_eval00528.pt \
+  'dataset.seeds=[0,1,2]' \
+  model.nanopfn.use_fk_bias=false model.nanopfn.use_entity_bias=false \
+  output_path=results/rdbpfn_full512.csv
+```
+
+The example disables the added biases for the original checkpoint. Set them to match a newly trained checkpoint; entity identity also depends on the evaluation dataset metadata. Evaluation writes aggregate results and a companion `*_per_seed.csv`. `model.eval_chunk_size_override` controls prediction chunk size. The [shell wrapper](../scripts/run_eval_aligned.sh) is also available but currently contains a local interpreter path; use the module command above on other machines.
+
+The examples below document the original training and baseline workflows.
+
 ## Data Layout
 
 ### Pretraining Datasets

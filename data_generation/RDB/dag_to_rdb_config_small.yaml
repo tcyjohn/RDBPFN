@@ -23,3 +23,7 @@ num_cols:
   fluctuation_ratio: 1.0
   min: 8
   max: 12
+
+timestamp:
+  entity_prob: 0.0
+  activity_prob: 1.0

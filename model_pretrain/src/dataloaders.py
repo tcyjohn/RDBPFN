@@ -27,6 +27,8 @@ class PriorDumpDataLoader(DataLoader):
             self.dataset_size = f["X"].shape[0]
             self.has_category_mask = "feature_is_categorical" in f
             self.has_available_features = "num_available_features" in f
+            self.has_fk_values = "fk_values" in f
+            self.has_entity_ids = "entity_ids" in f
         self.pointer = start_index % self.dataset_size
         if start_index > 0:
             logger.info("Starting dataset iteration from index %d", self.pointer)
@@ -93,6 +95,18 @@ class PriorDumpDataLoader(DataLoader):
             if self.pointer <= prev_pointer:
                 logger.info("Finished iteration over all stored datasets!")
 
+            # Read FK values from separate dataset for FK attention bias
+            fk_values = None
+            if self.has_fk_values:
+                fk_vals_np = f["fk_values"][indices, :max_seq_in_batch, :]
+                fk_values = torch.from_numpy(fk_vals_np.astype(np.int64))
+
+            # Read entity_ids from separate dataset for same-entity bias
+            entity_ids = None
+            if self.has_entity_ids:
+                eid_np = f["entity_ids"][indices, :max_seq_in_batch]
+                entity_ids = torch.from_numpy(eid_np.astype(np.int64))
+
             batch = dict(
                 x=x.to(self.device),
                 y=y.to(self.device),
@@ -102,6 +116,10 @@ class PriorDumpDataLoader(DataLoader):
             )
             if category_mask is not None:
                 batch["category_mask"] = category_mask.to(self.device)
+            if fk_values is not None:
+                batch["fk_values"] = fk_values.to(self.device)
+            if entity_ids is not None:
+                batch["entity_ids"] = entity_ids.to(self.device)
             yield batch
             step_counter += 1
 

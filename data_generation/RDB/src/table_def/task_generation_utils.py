@@ -153,11 +153,23 @@ class SchemaGraph:
                 return edge
         return None
 
-    def generate_target_table_name(self) -> str:
-        """Generate a target table name."""
-        # Now we only random pick a leaf node as the target table
+    def generate_target_table_name(self, root_p: float = 0.0) -> str:
+        """Generate a target table name.
+
+        Args:
+            root_p: Probability of picking the root node (entity table) as
+                    target, producing RelBench-style DIRECT_ATTRIBUTE_PREDICTION
+                    tasks. Default 0.0 = always pick leaf (old behavior).
+        """
+        order = self.get_topological_order()
+        root = order[0]
         leaf_nodes = [node for node in self.nodes.keys() if not self.get_children(node)]
-        return random.choice(leaf_nodes)
+
+        if root_p > 0 and root in self.nodes and random.random() < root_p:
+            return root
+        if leaf_nodes:
+            return random.choice(leaf_nodes)
+        return order[-1]  # fallback: last in topo order
 
     def compute_table_row_num(self) -> Dict[str, str]:
         """Compute the number of rows for each table. Root Table starts with 1 row.
@@ -184,11 +196,55 @@ class SchemaGraph:
 
         return num_rows_dict
 
+    def find_path(self, from_table: str, to_table: str) -> Optional[List[str]]:
+        """BFS shortest path between two tables (undirected traversal).
+
+        Returns a list of intermediate table names from *from_table* to
+        *to_table* (exclusive of *from_table*, inclusive of *to_table*), or
+        ``None`` if the tables are the same or unreachable.
+        """
+        if from_table == to_table:
+            return None
+
+        from collections import deque
+        visited = {from_table}
+        parent: dict[str, str | None] = {from_table: None}
+        queue: deque[str] = deque([from_table])
+
+        # Build undirected adjacency
+        adj: dict[str, list[str]] = {}
+        for node in self.nodes:
+            adj.setdefault(node, [])
+        for edge in self.edges:
+            adj.setdefault(edge.from_table, []).append(edge.to_table)
+            adj.setdefault(edge.to_table, []).append(edge.from_table)
+
+        while queue:
+            current = queue.popleft()
+            if current == to_table:
+                break
+            for neighbor in adj.get(current, []):
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    parent[neighbor] = current
+                    queue.append(neighbor)
+
+        if to_table not in parent:
+            return None
+
+        path: list[str] = []
+        node = to_table
+        while parent[node] is not None:
+            path.append(node)
+            node = parent[node]
+        path.reverse()
+        return path
+
     def compute_possible_task_types(self, target_table_name: str) -> TaskType:
         """Compute possible task types based on schema graph structure."""
 
         num_rows_dict = self.compute_table_row_num()
-        num_rows = int(num_rows_dict[target_table_name])
+        num_rows = num_rows_dict[target_table_name]
         if num_rows == "1":
             return TaskType.DIRECT_ATTRIBUTE_PREDICTION
         else:
@@ -623,6 +679,29 @@ class RelationalAggregationTarget:
         self.predicate_func = predicate_func
         self.target_type = TaskType.RELATIONAL_AGGREGATION_PREDICTION
 
+    def compute_aggregated_value(self, instance_graph: InstanceGraph) -> float:
+        """Compute the raw aggregated value for this target, without applying the predicate.
+
+        Useful for callers that want to choose a data-driven threshold (e.g. the
+        median of aggregated values) instead of the predicate's hard-coded one.
+
+        Parameters
+        ----------
+        instance_graph : InstanceGraph
+            The instance graph to extract data from.
+
+        Returns
+        -------
+        float
+            The aggregated value (``0`` if the target record set is empty).
+        """
+        target_records = self.target_node_set.get_records(instance_graph)
+        if target_records.empty:
+            return 0
+        return AggregationProcessor.apply_aggregation(
+            target_records, self.aggregation_column, self.aggregation_func
+        )
+
     def compute_label(self, instance_graph: InstanceGraph) -> bool:
         """
         Apply aggregation and predicate to target nodes.
@@ -637,20 +716,8 @@ class RelationalAggregationTarget:
         bool
             The label after applying aggregation and predicate
         """
-        # Get target records
-        target_records = self.target_node_set.get_records(instance_graph)
-        if target_records.empty:
-            aggregated_value = 0
-            # raise ValueError(f"No records found for table {self.target_node_set.table_name}")
-        else:
-            # Apply aggregation
-            aggregated_value = AggregationProcessor.apply_aggregation(
-                target_records, self.aggregation_column, self.aggregation_func
-            )
-
-        # Apply predicate
+        aggregated_value = self.compute_aggregated_value(instance_graph)
         label = int(self.predicate_func.apply(aggregated_value))
-
         return label
 
     def __repr__(self):

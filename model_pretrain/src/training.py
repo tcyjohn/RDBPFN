@@ -2,16 +2,25 @@ from __future__ import annotations
 
 import time
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Sequence
 
+import numpy as np
 import torch
 from accelerate import Accelerator
 from torch import nn
 from torch.utils.data import DataLoader
 
 from .models import NanoTabPFNClassifier, NanoTabPFNModel
+from .eval_utils import (
+    load_task_split,
+    downsample_split,
+    fill_nans,
+    _stable_random_state,
+)
+from .dbinfer_bench_simplified.dataset_meta import DBBTaskType
+from .dbinfer_bench_simplified.rdb_dataset import DBBRDBDataset
 
 
 logger = logging.getLogger(__name__)
@@ -735,6 +744,175 @@ def _handle_evaluation(
     )
 
 
+def _run_full_eval(
+    model: nn.Module,
+    device: torch.device,
+    dataset_dir: str,
+    classifier_factory: Callable,
+    max_test_samples: int = 128,
+    max_train_samples: int = 1024,
+    seed: int = 0,
+) -> dict:
+    """Run full relational eval on all DBBRDBDatasets in a directory.
+
+    Scans ``dataset_dir`` for subdirectories containing ``metadata.yaml``
+    (DBBRDBDataset format), evaluates all classification tasks across all
+    datasets, returns per-task AUROC and average.
+
+    Args:
+        model: unwrapped model (on correct device).
+        device: torch device.
+        dataset_dir: directory containing DBBRDBDataset subdirectories
+            (e.g. ``rdb_datasets/`` → amazon-dfs-2/, avs-dfs-2/, ...).
+        classifier_factory: callable(model, device) → classifier.
+        max_test_samples: max test rows per task (default 128 for "full-128").
+        seed: random seed.
+
+    Returns:
+        dict with keys like ``full128/avg_auroc``, ``full128/N``, etc.
+    """
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+    from sklearn.metrics import roc_auc_score
+
+    dataset_dir = Path(dataset_dir)
+    if not dataset_dir.exists():
+        _log.warning("Full eval dir %s not found, skipping.", dataset_dir)
+        return {}
+
+    # Discover DBBRDBDataset subdirectories (each has metadata.yaml)
+    ds_paths = sorted(
+        p for p in dataset_dir.iterdir()
+        if p.is_dir() and (p / "metadata.yaml").exists()
+    )
+    if not ds_paths:
+        _log.warning("No DBBRDBDataset subdirs found in %s, skipping.", dataset_dir)
+        return {}
+
+    classifier = classifier_factory(model, device)
+    task_aurocs: list[float] = []
+    skipped_train_single_class = 0
+    skipped_test_single_class = 0
+    failed_tasks = 0
+    nonfinite_tasks = 0
+
+    for ds_path in ds_paths:
+        try:
+            dataset = DBBRDBDataset(ds_path)
+        except Exception as exc:
+            _log.warning("Failed to load %s: %s", ds_path.name, exc)
+            continue
+
+        for task in dataset.tasks:
+            if task.metadata.task_type != DBBTaskType.classification:
+                continue
+            try:
+                X_train, y_train, fk_values_train, entity_ids_train, parent_entity_ids_train = load_task_split(task, "train")
+                X_test, y_test, fk_values_test, entity_ids_test, parent_entity_ids_test = load_task_split(task, "test")
+            except ValueError:
+                continue
+
+            train_seed = _stable_random_state(
+                f"{dataset.dataset_name}:{task.metadata.name}:{seed}:train"
+            )
+            test_seed = _stable_random_state(
+                f"{dataset.dataset_name}:{task.metadata.name}:{seed}:test"
+            )
+            idx_train = np.arange(len(X_train))
+            if len(idx_train) > max_train_samples:
+                rng = np.random.default_rng(train_seed)
+                idx_train = rng.choice(idx_train, size=max_train_samples, replace=False)
+                idx_train.sort()
+                X_train = X_train[idx_train]
+                y_train = y_train[idx_train]
+                if fk_values_train is not None:
+                    fk_values_train = fk_values_train[idx_train]
+                if entity_ids_train is not None:
+                    entity_ids_train = entity_ids_train[idx_train]
+                if parent_entity_ids_train is not None:
+                    parent_entity_ids_train = parent_entity_ids_train[idx_train]
+            idx_test = np.arange(len(X_test))
+            if len(idx_test) > max_test_samples:
+                rng = np.random.default_rng(test_seed)
+                idx_test = rng.choice(idx_test, size=max_test_samples, replace=False)
+                idx_test.sort()
+                X_test = X_test[idx_test]
+                y_test = y_test[idx_test]
+                if fk_values_test is not None:
+                    fk_values_test = fk_values_test[idx_test]
+                if entity_ids_test is not None:
+                    entity_ids_test = entity_ids_test[idx_test]
+                if parent_entity_ids_test is not None:
+                    parent_entity_ids_test = parent_entity_ids_test[idx_test]
+            X_train, X_test = fill_nans(X_train, X_test)
+
+            if len(np.unique(y_train)) < 2:
+                skipped_train_single_class += 1
+                _log.warning(
+                    "Skipping full eval %s/%s seed=%s: train split has one class",
+                    dataset.dataset_name,
+                    task.metadata.name,
+                    seed,
+                )
+                continue
+            if len(np.unique(y_test)) < 2:
+                skipped_test_single_class += 1
+                _log.warning(
+                    "Skipping full eval %s/%s seed=%s: test split has one class",
+                    dataset.dataset_name,
+                    task.metadata.name,
+                    seed,
+                )
+                continue
+
+            try:
+                classifier.fit(X_train, y_train, fk_values=fk_values_train,
+                               entity_ids=entity_ids_train,
+                               parent_entity_ids=parent_entity_ids_train)
+                prob = classifier.predict_proba(
+                    X_test,
+                    fk_values_test=fk_values_test,
+                    entity_ids_test=entity_ids_test,
+                    parent_entity_ids_test=parent_entity_ids_test,
+                )
+            except Exception as exc:
+                failed_tasks += 1
+                _log.warning(
+                    "Eval failed %s/%s seed=%s: %s",
+                    dataset.dataset_name, task.metadata.name, seed, exc,
+                )
+                continue
+
+            if prob.shape[1] == 2:
+                auroc = float(roc_auc_score(y_test, prob[:, 1]))
+            else:
+                auroc = float(roc_auc_score(y_test, prob, multi_class="ovr"))
+            if not np.isfinite(auroc):
+                nonfinite_tasks += 1
+                _log.warning(
+                    "Skipping full eval %s/%s seed=%s: non-finite AUROC %s",
+                    dataset.dataset_name,
+                    task.metadata.name,
+                    seed,
+                    auroc,
+                )
+                continue
+            task_aurocs.append(auroc)
+
+    if not task_aurocs:
+        return {}
+
+    avg_auroc = float(np.mean(task_aurocs))
+    return {
+        "full128/avg_auroc": avg_auroc,
+        "full128/num_tasks": float(len(task_aurocs)),
+        "full128/skipped_train_single_class": float(skipped_train_single_class),
+        "full128/skipped_test_single_class": float(skipped_test_single_class),
+        "full128/failed_tasks": float(failed_tasks),
+        "full128/nonfinite_tasks": float(nonfinite_tasks),
+    }
+
+
 def _compute_batch_loss(
     model: NanoTabPFNModel,
     criterion: nn.Module,
@@ -742,6 +920,9 @@ def _compute_batch_loss(
     y_batch: torch.Tensor,
     category_mask: torch.Tensor | None,
     train_test_split_index: int,
+    fk_values: torch.Tensor | None = None,
+    entity_ids: torch.Tensor | None = None,
+    parent_entity_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
     data = (
         x_batch,
@@ -755,7 +936,13 @@ def _compute_batch_loss(
         data = data + (category_mask,)
     targets = y_batch
 
-    output = model(data, train_test_split_index=train_test_split_index)
+    output = model(
+        data,
+        train_test_split_index=train_test_split_index,
+        fk_values=fk_values,
+        entity_ids=entity_ids,
+        parent_entity_ids=parent_entity_ids,
+    )
     targets = targets[:, train_test_split_index:]
 
     targets = targets.reshape((-1,)).to(torch.long)
@@ -810,6 +997,9 @@ def train(
         list[ColumnModificationConfig | None] | None
     ) = None,
     accelerator: Accelerator | None = None,
+    full_eval_steps: int = 0,
+    full_eval_dataset_dir: str = "",
+    full_eval_seeds: Sequence[int] | None = None,
 ):
     device = accelerator.device
 
@@ -828,6 +1018,7 @@ def train(
     )
     eval_checkpoint_template = None
     eval_checkpoint_parent = None
+    full_eval_seeds = list(full_eval_seeds or [0])
     if checkpoint_path and eval_save_interval:
         eval_checkpoint_template = (
             f"{checkpoint_path.stem}_eval{{:05d}}{checkpoint_path.suffix}"
@@ -914,6 +1105,10 @@ def train(
                     full_data, device, batch_sampled_columns, column_sampler_cache
                 )
 
+                fk_values_batch = full_data.get("fk_values")
+                entity_ids_batch = full_data.get("entity_ids")
+                parent_entity_ids_batch = full_data.get("parent_entity_ids")
+
                 with accelerator.accumulate(model):
                     (
                         base_loss_value,
@@ -932,16 +1127,20 @@ def train(
                         dataset_group_size,
                         dataset_column_modify_config,
                         accelerator,
+                        fk_values=fk_values_batch,
+                        entity_ids=entity_ids_batch,
+                        parent_entity_ids=parent_entity_ids_batch,
                     )
-                    original_loss_sum += base_loss_value
-                    original_loss_count += 1
-                    total_loss_sum += base_loss_value + aug_loss_sum
-                    total_loss_count += 1 + aug_loss_count
 
                     if accelerator.sync_gradients:
                         accelerator.clip_grad_norm_(model.parameters(), 1.0)
                     optimizer.step()
                     optimizer.zero_grad()
+
+                    original_loss_sum += base_loss_value
+                    original_loss_count += 1
+                    total_loss_sum += base_loss_value + aug_loss_sum
+                    total_loss_count += 1 + aug_loss_count
 
                 step_train_duration = time.time() - step_start_time
                 train_time += step_train_duration
@@ -989,6 +1188,47 @@ def train(
                                 accelerator=accelerator,
                             )
                         accelerator.wait_for_everyone()
+
+                        # Periodic full relational eval (e.g., full-128)
+                        if (
+                            full_eval_steps > 0
+                            and full_eval_dataset_dir
+                            and global_step % full_eval_steps == 0
+                            and accelerator.is_main_process
+                        ):
+                            model_to_eval = accelerator.unwrap_model(model)
+                            full_scores = {}
+                            seed_avgs = []
+                            for seed in full_eval_seeds:
+                                seed_scores = _run_full_eval(
+                                    model_to_eval,
+                                    device,
+                                    full_eval_dataset_dir,
+                                    classifier_factory,
+                                    seed=seed,
+                                )
+                                for key, value in seed_scores.items():
+                                    full_scores[f"{key}/seed{seed}"] = value
+                                if "full128/avg_auroc" in seed_scores:
+                                    seed_avgs.append(seed_scores["full128/avg_auroc"])
+                            if seed_avgs:
+                                full_scores["full128/avg_auroc"] = float(
+                                    np.mean(seed_avgs)
+                                )
+                            if full_scores and log_callback:
+                                log_callback(
+                                    time.time() - total_start_time,
+                                    {},
+                                    full_scores,
+                                )
+                            logger.info(
+                                "step %7d | full eval | %s",
+                                global_step,
+                                " | ".join(
+                                    f"{k} {v:7.4f}" for k, v in full_scores.items()
+                                ),
+                            )
+
                     elif (
                         steps_per_eval > 0
                         and global_step % steps_per_eval == 0
@@ -1015,7 +1255,10 @@ def train(
 
     if checkpoint_path and best_score == float("-inf") and accelerator.is_main_process:
         torch.save(
-            {"model_state_dict": accelerator.unwrap_model(model).state_dict()},
+            {
+                "model_state_dict": accelerator.unwrap_model(model).state_dict(),
+                "step": global_step,
+            },
             checkpoint_path,
         )
         logger.info("Saved final model checkpoint to %s", checkpoint_path)
@@ -1036,6 +1279,9 @@ def _compute_losses_with_augmentations(
     group_size_for_augment_data: int,
     column_modify_config: ColumnModificationConfig,
     accelerator: Accelerator,
+    fk_values: torch.Tensor | None = None,
+    entity_ids: torch.Tensor | None = None,
+    parent_entity_ids: torch.Tensor | None = None,
 ) -> tuple[float, float, int]:
     # Preserve original feature counts so target sampling ignores added columns.
     base_x, category_mask = _augment_feature_columns(
@@ -1051,6 +1297,9 @@ def _compute_losses_with_augmentations(
         base_y,
         category_mask,
         train_test_split_index,
+        fk_values=fk_values,
+        entity_ids=entity_ids,
+        parent_entity_ids=parent_entity_ids,
     )
     accelerator.backward(original_loss_tensor)
     original_loss = original_loss_tensor.detach().item()
@@ -1082,6 +1331,9 @@ def _compute_losses_with_augmentations(
                 aug_y,
                 aug_mask,
                 aug_split_index,
+                fk_values=fk_values,
+                entity_ids=entity_ids,
+                parent_entity_ids=parent_entity_ids,
             )
             accelerator.backward(aug_loss_tensor)
             aug_loss = aug_loss_tensor.detach().item()
@@ -1113,6 +1365,9 @@ def _compute_losses_with_augmentations(
             concat_y,
             concat_mask,
             split_override,
+            fk_values=fk_values,
+            entity_ids=entity_ids,
+            parent_entity_ids=parent_entity_ids,
         )
         scaled_loss = group_loss * current_group
         accelerator.backward(scaled_loss)

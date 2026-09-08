@@ -1,0 +1,3 @@
+# Three mechanisms cover DFS-facing information channels
+
+The three semantic structural mechanisms are motivated through the fixed DFS task interface: hierarchical foreign-key connectivity controls which records are reachable, calendar-aware temporal structure controls when records are available, and grouped latent feature sources control what shared predictive dependence their attributes carry. Source-row cardinality is the fourth dimension of the complete relational prior and controls generated row counts, while remaining distinct from these three semantic channels and from the PFN support-row budget.

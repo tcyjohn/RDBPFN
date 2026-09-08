@@ -5,7 +5,8 @@ DAG to RDB Generator
 This script converts DAG data into real RDBs. Given DAG structure with source/destination
 nodes and table dimensions, it creates relational databases with proper table relationships.
 
-The script focuses on child tables that have exactly 2 parent tables (excluding timestamp tables).
+Child tables may have any number of parents; optional timestamp columns are configured via
+``dimension_config["timestamp"]``.
 """
 
 import torch
@@ -55,6 +56,14 @@ class DAGToRDBGenerator:
             "fluctuation_ratio": 1.0,
             "min": 8,
             "max": 12,
+        },
+        "timestamp": {
+            "prob": 0.7,
+        },
+        "entity_table": {
+            "snapshots_per_entity_min": 5,
+            "snapshots_per_entity_max": 20,
+            "timestamp_prob": 1.0,
         },
     }
 
@@ -278,11 +287,9 @@ class DAGToRDBGenerator:
             # Fluctuate num_rows by 20%
             parents = dag_structure["in_degree"].get(node, [])
             num_parents = len(parents)
+            out_degree_nodes = dag_structure["out_degree"].get(node, [])
 
             # Calculate num_cols and num_features based on new logic
-            num_rows = self._apply_fluctuation(
-                node_dims["num_rows"], self.dimension_config["num_rows"]
-            )
             original_num_cols = self._apply_fluctuation(
                 node_dims["num_cols"], self.dimension_config["num_cols"]
             )
@@ -291,13 +298,44 @@ class DAGToRDBGenerator:
                 original_num_cols + 1 + num_parents
             )  # num_col from DAG + 1 + parent's tables num
 
-            # Determine if this should be a timestamp table
-            # Only possible if table has exactly 2 parents, randomly determined
-            is_timestamp_table = False
-            if num_parents == 2:
-                is_timestamp_table = random.choice([True, False])
-                if is_timestamp_table:
-                    num_cols += 1  # Add one more column for timestamp
+            # Determine table type
+            is_entity_table = bool(out_degree_nodes)
+            is_source_table = (num_parents == 0)
+
+            # Entity table: num_rows = num_entities × snapshots_per_entity
+            ecfg = self.dimension_config.get("entity_table", {})
+            if is_entity_table:
+                num_entities = self._apply_fluctuation(
+                    node_dims["num_rows"], self.dimension_config["num_rows"]
+                )
+                snap_min = ecfg.get("snapshots_per_entity_min", 5)
+                snap_max = ecfg.get("snapshots_per_entity_max", 20)
+                snapshots_per_entity = random.randint(snap_min, snap_max)
+                num_rows = num_entities * snapshots_per_entity
+            else:
+                num_entities = 0
+                snapshots_per_entity = 1
+                num_rows = self._apply_fluctuation(
+                    node_dims["num_rows"], self.dimension_config["num_rows"]
+                )
+
+            # Timestamp column logic: entity tables always get timestamps (configurable).
+            # Source tables that are NOT entity tables never get timestamps.
+            ts_cfg = self.dimension_config.get("timestamp", {})
+            if is_entity_table:
+                timestamp_prob = float(ecfg.get("timestamp_prob", 1.0))
+            elif is_source_table:
+                timestamp_prob = 0.0
+            else:
+                timestamp_prob = float(ts_cfg.get("activity_prob", 1.0))
+            is_timestamp_table = random.random() < timestamp_prob
+            if is_timestamp_table:
+                num_cols += 1  # Add one more column for timestamp
+
+            # Entity tables get an entity_id column (for same-entity bias)
+            has_entity_id_column = is_entity_table and snapshots_per_entity > 1
+            if has_entity_id_column:
+                num_cols += 1
 
             # Create table config
             table_config = {
@@ -309,6 +347,10 @@ class DAGToRDBGenerator:
                 "parent_nodes": parents,
                 "num_parents": num_parents,
                 "is_timestamp_table": is_timestamp_table,
+                "is_entity_table": is_entity_table,
+                "num_entities": num_entities,
+                "snapshots_per_entity": snapshots_per_entity,
+                "has_entity_id_column": has_entity_id_column,
             }
 
             table_configs.append(table_config)
@@ -385,6 +427,7 @@ class DAGToRDBGenerator:
             Created RDB instance
         """
         rdb = RDB(rdb_name)
+        rdb.timestamp_config = dict(self.dimension_config.get("timestamp", {}))
         if self.use_row_gnn:
             rdb.enable_row_gnn(device=self.gnn_device)
 
@@ -401,6 +444,10 @@ class DAGToRDBGenerator:
             # Add timestamp column if it's a timestamp table
             if config.get("is_timestamp_table", False):
                 column_names.append("timestamp")
+
+            # Add entity_id column for entity tables (for same-entity bias)
+            if config.get("has_entity_id_column", False):
+                column_names.append("entity_id")
 
             # Add feature columns
             for i in range(config["num_features"]):
@@ -421,6 +468,15 @@ class DAGToRDBGenerator:
             # Add timestamp data type if it's a timestamp table
             if config.get("is_timestamp_table", False):
                 data_type_configs.append(DataTypeConfig.timestamp_config())
+
+            # Add entity_id data type (categorical int, one per entity)
+            if config.get("has_entity_id_column", False):
+                data_type_configs.append(
+                    DataTypeConfig.categorical_config(
+                        num_categories=config["num_entities"],
+                        balanced=False,
+                    )
+                )
 
             # Add feature data types
             for i in range(config["num_features"]):
@@ -444,22 +500,42 @@ class DAGToRDBGenerator:
                 # Time column is after PK and FKs but before features
                 time_column = 1 + config["num_parents"]  # PK + FKs
 
+            # Determine entity_id column index
+            entity_column = None
+            if config.get("has_entity_id_column", False):
+                # After PK, FKs, (timestamp) — before features
+                entity_column = 1 + config["num_parents"]
+                if config.get("is_timestamp_table", False):
+                    entity_column += 1
+
+            # Compute num_features (non-PK, non-FK columns for SCM generation)
+            _nf = config["num_features"]
+            if config.get("is_timestamp_table", False):
+                _nf += 1
+            if config.get("has_entity_id_column", False):
+                _nf += 1
+
             # Create table
             table = Table(
                 num_rows=config["num_rows"],
                 num_cols=config["num_cols"],
-                num_features=(
-                    config["num_features"] + 1
-                    if config.get("is_timestamp_table", False)
-                    else config["num_features"]
-                ),
+                num_features=_nf,
                 column_names=column_names,
                 data_type_configs=data_type_configs,
                 time_column=time_column,
                 device="cpu",
             )
+            if entity_column is not None:
+                table.entity_column = entity_column
 
             rdb.add_table(config["name"], table)
+
+            # Set entity table metadata on the TableGenerator
+            if config.get("is_entity_table", False):
+                gen = rdb.table_generators[config["name"]]
+                gen.is_entity_table = True
+                gen.num_entities = config["num_entities"]
+                gen.snapshots_per_entity = config["snapshots_per_entity"]
 
         # Add relationships
         for from_node, from_col, to_node, to_col in relationships:
@@ -479,7 +555,8 @@ class DAGToRDBGenerator:
         Parameters
         ----------
         args : tuple
-            (rdb_index, all_dag_structures, output_base_dir, eta_min, eta_max)
+            (rdb_index, all_dag_structures, output_base_dir, eta_min, eta_max,
+             use_complex_tasks, dimension_config, quality_filter, quality_max_retries)
 
         Returns
         -------
@@ -495,6 +572,12 @@ class DAGToRDBGenerator:
                 eta_max,
                 use_complex_tasks,
                 dimension_config,
+                quality_filter,
+                quality_max_retries,
+                relbench_mode,
+                snr_threshold,
+                use_homophily_labels,
+                use_path_signal,
             ) = args
 
             # Set random seed for reproducibility (each worker gets different seed)
@@ -537,7 +620,7 @@ class DAGToRDBGenerator:
             )
 
             # Initialize SCMs with eta
-            rdb.init_table_SCMs(seed=rdb_index)
+            rdb.init_table_SCMs(seed=rdb_index, use_path_signal=use_path_signal)
 
             # Generate data
             rdb.generate_all_data_from_SCM()
@@ -551,18 +634,51 @@ class DAGToRDBGenerator:
             # Save to file
             rdb.save_to_file(csv_dir)
 
-            # Initialize tasks and save to 4DBInfer format
+            task_quality_info = {}
             if use_complex_tasks:
-                rdb.initialize_tasks_with_complex_tasks(
-                    tasks_per_rdb=5, train_ratio=0.75, valid_ratio=0.05
-                )
+                if quality_filter:
+                    task_quality_info = DAGToRDBGenerator._generate_tasks_with_quality_gate(
+                        rdb, rdb_dir, tasks_per_rdb=5, train_ratio=0.75,
+                        valid_ratio=0.05, max_retries=quality_max_retries,
+                        base_seed=rdb_index, use_complex_tasks=True,
+                        relbench_mode=relbench_mode,
+                        use_homophily_labels=use_homophily_labels,
+                    )
+                else:
+                    rdb.initialize_tasks_with_complex_tasks(
+                        tasks_per_rdb=5, train_ratio=0.75, valid_ratio=0.05,
+                        relbench_mode=relbench_mode,
+                        use_homophily_labels=use_homophily_labels,
+                    )
+                    rdb.save_to_4dbinfer_dataset_with_tasks(rdb_dir)
             else:
-                rdb.initialize_tasks(
-                    tasks_per_rdb=5, train_ratio=0.75, valid_ratio=0.05
-                )
+                if quality_filter:
+                    task_quality_info = DAGToRDBGenerator._generate_tasks_with_quality_gate(
+                        rdb, rdb_dir, tasks_per_rdb=5, train_ratio=0.75,
+                        valid_ratio=0.05, max_retries=quality_max_retries,
+                        base_seed=rdb_index, use_complex_tasks=False,
+                    )
+                else:
+                    rdb.initialize_tasks(
+                        tasks_per_rdb=5, train_ratio=0.75, valid_ratio=0.05
+                    )
+                    rdb.save_to_4dbinfer_dataset_with_tasks(rdb_dir)
 
-            # Save to 4DBInfer format with tasks
-            rdb.save_to_4dbinfer_dataset_with_tasks(rdb_dir)
+            # Dump feature assignment diagnostics for post-hoc analysis
+            diag = DAGToRDBGenerator._dump_feature_diagnostics(rdb, rdb_dir)
+
+            # SNR-based quality pre-filter
+            if snr_threshold is not None and snr_threshold > 0 and diag:
+                snr_proxy = DAGToRDBGenerator._compute_snr_proxy_from_diag(diag)
+                if snr_proxy < snr_threshold:
+                    import shutil
+
+                    shutil.rmtree(rdb_dir, ignore_errors=True)
+                    return (
+                        False,
+                        rdb_index,
+                        f"SNR {snr_proxy:.2f} < threshold {snr_threshold}, RDB discarded",
+                    )
 
             # Return success info
             return (
@@ -575,6 +691,7 @@ class DAGToRDBGenerator:
                     "num_timestamp_tables": len(timestamp_tables),
                     "num_relationships": len(relationships),
                     "rdb_dir": rdb_dir,
+                    **task_quality_info,
                 },
             )
 
@@ -582,6 +699,124 @@ class DAGToRDBGenerator:
             import traceback
 
             return (False, rdb_index, str(e) + "\n" + traceback.format_exc())
+
+    @staticmethod
+    def _generate_tasks_with_quality_gate(rdb, rdb_dir, tasks_per_rdb=5,
+                                           train_ratio=0.75, valid_ratio=0.05,
+                                           max_retries=3, base_seed=42,
+                                           use_complex_tasks=True,
+                                           relbench_mode=False,
+                                           use_homophily_labels=False):
+        """Generate tasks with quality gate (supports both simple and complex tasks).
+
+        Retries up to ``max_retries`` times with different seeds. Keeps the
+        attempt with the most passed tasks. Failed task schemas are pruned
+        from ``rdb.task_generation_schemas`` before saving.
+        """
+        from src.table_def.task_quality import diagnose_dataframe
+
+        best_passed = []
+        best_attempt = -1
+        total_checked = 0
+
+        for attempt in range(max_retries + 1):
+            seed = base_seed + attempt * 1000
+            random.seed(seed)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+
+            rdb.task_generation_schemas = []  # clear from previous retry
+            if use_complex_tasks:
+                rdb.initialize_tasks_with_complex_tasks(
+                    tasks_per_rdb=tasks_per_rdb,
+                    train_ratio=train_ratio,
+                    valid_ratio=valid_ratio,
+                    relbench_mode=relbench_mode,
+                    use_homophily_labels=use_homophily_labels,
+                )
+            else:
+                rdb.initialize_tasks(
+                    tasks_per_rdb=tasks_per_rdb,
+                    train_ratio=train_ratio,
+                    valid_ratio=valid_ratio,
+                )
+
+            passed = []
+            for task in rdb.tasks:
+                if task.task_data is None:
+                    continue
+                train_df = task.task_data["train_df"]
+                result = diagnose_dataframe(train_df)
+                total_checked += 1
+                if result["passed"]:
+                    passed.append(task)
+
+            if len(passed) > len(best_passed):
+                best_passed = passed
+                best_attempt = attempt
+                # Snapshot the matching generation schemas
+                best_task_names = {t.task_name for t in best_passed}
+                best_schemas = [
+                    s for s in rdb.task_generation_schemas
+                    if s.task_name in best_task_names
+                ]
+
+            if len(passed) == tasks_per_rdb:
+                break  # all tasks passed
+
+        # Restore best attempt
+        rdb.tasks = best_passed
+        rdb.task_generation_schemas = best_schemas if best_passed else []
+
+        rdb.save_to_4dbinfer_dataset_with_tasks(rdb_dir)
+
+        return {
+            "quality_tasks_passed": len(best_passed),
+            "quality_tasks_requested": tasks_per_rdb,
+            "quality_attempts": best_attempt + 1,
+            "quality_checked": total_checked,
+        }
+
+    @staticmethod
+    def _dump_feature_diagnostics(rdb, rdb_dir):
+        """Save per-table feature-assignment metadata for post-hoc analysis."""
+        import json  # noqa: PLC0415
+
+        diag = {}
+        for table_name, table_gen in rdb.table_generators.items():
+            scm = getattr(table_gen, "table_SCM", None)
+            if scm is None or not getattr(scm, "use_signal_group_features", False):
+                continue
+            diag[table_name] = scm.get_feature_diagnostics()
+
+        if diag:
+            diag_path = os.path.join(rdb_dir, "_feature_diagnostics.json")
+            with open(diag_path, "w") as f:
+                json.dump(diag, f, indent=2)
+        return diag
+
+    @staticmethod
+    def _compute_snr_proxy_from_diag(diag: dict) -> float:
+        """Compute per-RDB SNR proxy from feature diagnostics dict.
+
+        SNR_proxy = mean(all active group_scales) / mean(residual_sigmas).
+        Returns float('inf') if no signal-group features are present (pass-through).
+        """
+        group_scales = []
+        residual_sigmas = []
+        for _table_name, td in diag.items():
+            for gs_key in ("time", "parent", "path"):
+                gs = td.get("group_scales", {}).get(gs_key, 0.0)
+                if gs > 0:
+                    group_scales.append(gs)
+            rs = td.get("residual_sigma", 0.0)
+            if rs > 0:
+                residual_sigmas.append(rs)
+        if not group_scales or not residual_sigmas:
+            return float("inf")
+        mean_gs = sum(group_scales) / len(group_scales)
+        mean_rs = sum(residual_sigmas) / len(residual_sigmas)
+        return mean_gs / max(mean_rs, 0.001)
 
     def generate_rdbs_from_dags(
         self,
@@ -591,6 +826,11 @@ class DAGToRDBGenerator:
         start_index: int = 0,
         num_processes: int = None,
         use_complex_tasks: bool = False,
+        quality_filter: bool = True,
+        quality_max_retries: int = 3,
+        snr_threshold: float = 5.0,
+        use_homophily_labels: bool = False,
+        use_path_signal: bool = True,
     ) -> List[RDB]:
         """
         Generate RDBs from the loaded DAG data.
@@ -610,6 +850,20 @@ class DAGToRDBGenerator:
             If 1, runs sequentially (original behavior).
         use_complex_tasks : bool
             Whether to use complex tasks
+        quality_filter : bool
+            Whether to run the quality gate on complex tasks (default: True)
+        quality_max_retries : int
+            Maximum retry attempts for the quality gate (default: 3)
+        snr_threshold : float, optional
+            Minimum SNR proxy (mean group_scale / mean residual_sigma) for an RDB
+            to be accepted. RDBs below this threshold are discarded. Set to 0 or None
+            to disable. Default: 5.0 (filters ~12% of RDBs, loses ~8% of tasks).
+        use_homophily_labels : bool, optional
+            If True, conditionally replace target columns with homophily-controlled
+            labels (OPENRFM-style). Default: False.
+        use_path_signal : bool, optional
+            If False, skip path signal in SG feature construction. Use when explicit
+            FK block_id columns are added to the table. Default: True.
         Returns
         -------
         List[RDB]
@@ -656,6 +910,12 @@ class DAGToRDBGenerator:
                 eta_max,
                 use_complex_tasks,
                 self.dimension_config,
+                quality_filter,
+                quality_max_retries,
+                relbench_mode,
+                snr_threshold,
+                use_homophily_labels,
+                use_path_signal,
             )
             for i in range(start_index, start_index + num_rdbs)
         ]
@@ -676,6 +936,10 @@ class DAGToRDBGenerator:
                         f"{info['num_timestamp_tables']} timestamp tables, "
                         f"{info['num_relationships']} relationships)"
                     )
+                    qinfo = info.get("quality_tasks_passed")
+                    if qinfo is not None:
+                        print(f"  [quality] {qinfo}/{info['quality_tasks_requested']} tasks passed"
+                              f" (attempts={info['quality_attempts']})")
                     print(f"  ✓ Saved to {info['rdb_dir']}")
                     successful_generations += 1
                     # Note: We don't append the actual RDB object in parallel mode to save memory
@@ -688,11 +952,10 @@ class DAGToRDBGenerator:
 
             try:
                 with Pool(processes=num_processes) as pool:
-                    # Use map to process all arguments
-                    results = pool.map(self._generate_single_rdb_worker, worker_args)
-
-                    # Process results
-                    for success, rdb_index, result in results:
+                    # Use imap_unordered for real-time progress (non-blocking)
+                    for success, rdb_index, result in pool.imap_unordered(
+                        self._generate_single_rdb_worker, worker_args
+                    ):
                         if success:
                             info = result
                             print(
@@ -701,6 +964,10 @@ class DAGToRDBGenerator:
                                 f"{info['num_timestamp_tables']} timestamp tables, "
                                 f"{info['num_relationships']} relationships) -> {info['rdb_dir']}"
                             )
+                            qinfo = info.get("quality_tasks_passed")
+                            if qinfo is not None:
+                                print(f"  [quality] {qinfo}/{info['quality_tasks_requested']} tasks passed"
+                                      f" (attempts={info['quality_attempts']})")
                             successful_generations += 1
                         else:
                             print(f"✗ Error generating RDB {rdb_index + 1}: {result}")
@@ -718,6 +985,10 @@ class DAGToRDBGenerator:
                             f"{info['num_timestamp_tables']} timestamp tables, "
                             f"{info['num_relationships']} relationships)"
                         )
+                        qinfo2 = info.get("quality_tasks_passed")
+                        if qinfo2 is not None:
+                            print(f"  [quality] {qinfo2}/{info['quality_tasks_requested']} tasks passed"
+                                  f" (attempts={info['quality_attempts']})")
                         print(f"  ✓ Saved to {info['rdb_dir']}")
                         successful_generations += 1
                     else:
@@ -797,7 +1068,6 @@ class DAGToRDBGenerator:
 
             # Show distribution of parent counts
             parent_count_distribution = {}
-            tables_with_2_parents = 0
 
             for i in range(num_dags):
                 try:
@@ -807,8 +1077,6 @@ class DAGToRDBGenerator:
                         parent_count_distribution[num_parents] = (
                             parent_count_distribution.get(num_parents, 0) + 1
                         )
-                        if num_parents == 2:
-                            tables_with_2_parents += 1
                 except Exception:
                     continue
 
@@ -817,11 +1085,18 @@ class DAGToRDBGenerator:
                 count = parent_count_distribution[parent_count]
                 print(f"  {parent_count} parents: {count} tables")
 
+            ts_cfg = self.dimension_config.get("timestamp", {})
+            ecfg = self.dimension_config.get("entity_table", {})
+            entity_prob = ecfg.get("timestamp_prob", 1.0)
+            activity_prob = ts_cfg.get("activity_prob", 1.0)
+            snap_min = ecfg.get("snapshots_per_entity_min", 5)
+            snap_max = ecfg.get("snapshots_per_entity_max", 20)
             print(
-                f"\nTables eligible for timestamp (2 parents): {tables_with_2_parents}"
+                f"\nTables in corpus ({sum(total_table_counts)} total): "
+                f"source→never ts, entity→prob={entity_prob}, leaf→prob={activity_prob}"
             )
             print(
-                f"Expected timestamp tables (50% random): ~{tables_with_2_parents // 2}"
+                f"Entity snapshots: [{snap_min}, {snap_max}] per entity"
             )
 
 
@@ -866,6 +1141,11 @@ def main():
             num_processes=num_processes,
             start_index=start_index,
             use_complex_tasks=use_complex_tasks,
+            quality_filter=quality_filter,
+            quality_max_retries=quality_max_retries,
+            snr_threshold=snr_threshold,
+            use_homophily_labels=use_homophily_labels,
+            use_path_signal=use_path_signal,
         )
         end_time = time.time()
         elapsed_time = end_time - start_time
@@ -933,9 +1213,42 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--use_complex_tasks",
-        type=bool,
+        type=lambda x: x.lower() in ("true", "1", "yes"),
         default=False,
-        help="Whether to use complex tasks",
+        help="Whether to use complex tasks (true/false, default: false)",
+    )
+    parser.add_argument(
+        "--relbench_mode",
+        action="store_true",
+        help="Use RelBench-style tasks: entity as focal + target, DIRECT_ATTRIBUTE_PREDICTION",
+    )
+    parser.add_argument(
+        "--use_homophily_labels",
+        action="store_true",
+        help="Enable homophily-controlled label diversity (OPENRFM-style)",
+    )
+    parser.add_argument(
+        "--no_path_signal",
+        action="store_true",
+        help="Disable path signal in SG feature construction (use with explicit FK block_id columns)",
+    )
+    parser.add_argument(
+        "--snapshots_per_entity_min",
+        type=int,
+        default=None,
+        help="Minimum temporal snapshots per entity (overrides config, default: 5)",
+    )
+    parser.add_argument(
+        "--snapshots_per_entity_max",
+        type=int,
+        default=None,
+        help="Maximum temporal snapshots per entity (overrides config, default: 20)",
+    )
+    parser.add_argument(
+        "--entity_timestamp_prob",
+        type=float,
+        default=None,
+        help="Probability entity tables get timestamps (overrides config, default: 1.0)",
     )
     parser.add_argument(
         "--random_seed",
@@ -954,6 +1267,25 @@ if __name__ == "__main__":
         default="cpu",
         help="Device for row-level GNN (e.g., 'cpu', 'cuda:0')",
     )
+    parser.add_argument(
+        "--no-quality-filter",
+        action="store_true",
+        help="Disable the task quality gate (enabled by default for complex tasks)",
+    )
+    parser.add_argument(
+        "--quality-max-retries",
+        type=int,
+        default=3,
+        help="Maximum retry attempts for the quality gate (default: 3)",
+    )
+    parser.add_argument(
+        "--snr-threshold",
+        type=float,
+        default=5.0,
+        help="Minimum SNR proxy for RDB acceptance. RDBs below this are discarded. "
+        "Recommended: 5.0 (filters ~12%% of RDBs, loses ~8%% of tasks). "
+        "Set to 0 to disable.",
+    )
     args = parser.parse_args()
 
     num_rdbs_to_generate = args.num_rdbs
@@ -965,9 +1297,15 @@ if __name__ == "__main__":
     num_processes = args.num_processes
     start_index = args.start_index
     use_complex_tasks = args.use_complex_tasks
+    relbench_mode = args.relbench_mode
+    use_homophily_labels = args.use_homophily_labels
+    use_path_signal = not args.no_path_signal
     use_row_gnn = args.use_row_gnn
     random_seed = args.random_seed
     gnn_device = args.gnn_device
+    quality_filter = not args.no_quality_filter
+    quality_max_retries = args.quality_max_retries
+    snr_threshold = args.snr_threshold
 
     # Validate num_processes
     if num_processes is not None and num_processes <= 0:
@@ -980,5 +1318,14 @@ if __name__ == "__main__":
     np.random.seed(random_seed)
     torch.manual_seed(random_seed)
     dimension_config = DAGToRDBGenerator.load_dimension_config(config_file)
+
+    # Apply CLI overrides for entity table config
+    entity_cfg = dimension_config.setdefault("entity_table", {})
+    if args.snapshots_per_entity_min is not None:
+        entity_cfg["snapshots_per_entity_min"] = args.snapshots_per_entity_min
+    if args.snapshots_per_entity_max is not None:
+        entity_cfg["snapshots_per_entity_max"] = args.snapshots_per_entity_max
+    if args.entity_timestamp_prob is not None:
+        entity_cfg["timestamp_prob"] = args.entity_timestamp_prob
 
     main()

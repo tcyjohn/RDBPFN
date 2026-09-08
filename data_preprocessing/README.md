@@ -28,6 +28,23 @@ The DFS preprocessing pipeline is partially adapted from the [dbinfer](https://g
 - [merge_dbinfer_to_h5.py](merge_dbinfer_to_h5.py): converts processed RDB tasks into `.h5`.
 - [filter_h5_sampling_columns.py](filter_h5_sampling_columns.py): downsamples columns from unsampled `.h5` files.
 
+## Current Fork Workflow and Structural Metadata
+
+Use `pixi install` at the repository root for the shared environment. [../scripts/run_pipeline.sh](../scripts/run_pipeline.sh) invokes [run_preprocess.py](run_preprocess.py) in three stages: pre-DFS transform, DFS, and post-DFS transform. It writes processed databases under `data_generation/RDB_datasets/<run_name>-processed/` and the merged prior to `model_pretrain/pretrain_datasets/<run_name>.h5`.
+
+To merge an already processed corpus from the repository root:
+
+```bash
+pixi run python data_preprocessing/merge_dbinfer_to_h5.py \
+  --dataset-root data_generation/RDB_datasets/my_run-processed \
+  --output model_pretrain/pretrain_datasets/my_run.h5 \
+  --total-rows 600 --max-columns 90
+```
+
+The updated DFS configs preserve identity information. The merge step carries `fk_values`, `entity_ids`, and, when available, `parent_entity_ids` alongside features and targets. `parent_entity_ids` maps parent rows to entities so temporal snapshots of the same parent can match at entity level. Missing identity values use `-1`; preserve the same row selection for features, labels, and structural arrays. Older HDF5 corpora may lack these fields and should not be assumed to provide entity-level FK matching.
+
+The scripts below retain the original single-table and RDB preprocessing schedules.
+
 ## Workflow 1: Single-Table Preprocessing
 
 ### Purpose

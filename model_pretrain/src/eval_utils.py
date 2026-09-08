@@ -99,26 +99,33 @@ def _subsample_dir_for(csv_dir: Path) -> Path:
 
 
 def _load_local_csv_datasets(data_dirs: list[Path]):
-    dataset_splits = []
-    dataset_names = []
+    grouped_splits: dict[str, list] = {}
+    grouped_names: dict[str, list] = {}
     for directory in data_dirs:
         if not directory.exists():
             continue
+        dir_key = directory.name
+        dir_splits = []
+        dir_names = []
         subsample_dir = _subsample_dir_for(directory)
         subsample_dir.mkdir(parents=True, exist_ok=True)
         for csv_path in sorted(directory.glob("*.csv")):
             npz_path = subsample_dir / f"{csv_path.stem}_split.npz"
             if npz_path.exists():
-                data = np.load(npz_path, allow_pickle=True)
-                X_train, X_test, y_train, y_test = (
-                    data["X_train"],
-                    data["X_test"],
-                    data["y_train"],
-                    data["y_test"],
-                )
-                dataset_splits.append((X_train, X_test, y_train, y_test))
-                dataset_names.append(csv_path.stem)
-                continue
+                try:
+                    data = np.load(npz_path, allow_pickle=True)
+                    X_train, X_test, y_train, y_test = (
+                        data["X_train"],
+                        data["X_test"],
+                        data["y_train"],
+                        data["y_test"],
+                    )
+                    dir_splits.append((X_train, X_test, y_train, y_test))
+                    dir_names.append(csv_path.stem)
+                    continue
+                except Exception as exc:
+                    print(f"Cached {npz_path} corrupted ({exc}), regenerating...")
+                    npz_path.unlink(missing_ok=True)
             try:
                 X, y = _load_csv_dataset(csv_path)
             except Exception as exc:
@@ -148,37 +155,71 @@ def _load_local_csv_datasets(data_dirs: list[Path]):
                 y_train=y_train,
                 y_test=y_test,
             )
-            dataset_splits.append((X_train, X_test, y_train, y_test))
-            dataset_names.append(csv_path.stem)
-    return dataset_splits, dataset_names
+            dir_splits.append((X_train, X_test, y_train, y_test))
+            dir_names.append(csv_path.stem)
+        grouped_splits[dir_key] = dir_splits
+        grouped_names[dir_key] = dir_names
+    return grouped_splits, grouped_names
 
 
 def prepare_eval_splits(
     data_dirs: list[Path] | None = None,
 ):
     dirs = data_dirs if data_dirs else DEFAULT_EVAL_DIRS
-    splits, names = _load_local_csv_datasets(dirs)
-    return splits, names
+    return _load_local_csv_datasets(dirs)
 
 
-def evaluate_classifier(classifier, splits):
-    scores = {"roc_auc": 0, "acc": 0, "balanced_acc": 0}
-    for X_train, X_test, y_train, y_test in splits:
-        classifier.fit(X_train, y_train)
-        prob = classifier.predict_proba(X_test)
-        pred = prob.argmax(axis=1)
-        if prob.shape[1] == 2:
-            roc = roc_auc_score(y_test, prob[:, 1])
-        else:
-            roc = roc_auc_score(y_test, prob, multi_class="ovr")
-        scores["roc_auc"] += float(roc)
-        scores["acc"] += float(accuracy_score(y_test, pred))
-        scores["balanced_acc"] += float(balanced_accuracy_score(y_test, pred))
-    scores = {k: v / len(splits) for k, v in scores.items()}
+def evaluate_classifier(classifier, splits_by_dir: dict[str, list]):
+    metric_names = ["roc_auc", "acc", "balanced_acc"]
+    per_dir_scores: dict[str, float] = {}
+    total_splits = 0
+    overall_sums = {k: 0.0 for k in metric_names}
+
+    for dir_key, dir_splits in splits_by_dir.items():
+        dir_sums = {k: 0.0 for k in metric_names}
+        for X_train, X_test, y_train, y_test in dir_splits:
+            classifier.fit(X_train, y_train)
+            prob = classifier.predict_proba(X_test)
+            pred = prob.argmax(axis=1)
+            if prob.shape[1] == 2:
+                roc = roc_auc_score(y_test, prob[:, 1])
+            else:
+                roc = roc_auc_score(y_test, prob, multi_class="ovr")
+            roc_val = float(roc)
+            acc_val = float(accuracy_score(y_test, pred))
+            bal_val = float(balanced_accuracy_score(y_test, pred))
+            dir_sums["roc_auc"] += roc_val
+            dir_sums["acc"] += acc_val
+            dir_sums["balanced_acc"] += bal_val
+            overall_sums["roc_auc"] += roc_val
+            overall_sums["acc"] += acc_val
+            overall_sums["balanced_acc"] += bal_val
+
+        n = len(dir_splits)
+        total_splits += n
+        if n > 0:
+            for k in metric_names:
+                per_dir_scores[f"{dir_key}/{k}"] = dir_sums[k] / n
+
+    scores: dict[str, float] = {}
+    for k in metric_names:
+        scores[k] = overall_sums[k] / total_splits if total_splits > 0 else 0.0
+    scores.update(per_dir_scores)
     return scores
 
 
-def load_task_split(task: DBBRDBTask, split: str) -> Tuple[np.ndarray, np.ndarray]:
+def load_task_split(
+    task: DBBRDBTask,
+    split: str,
+    *,
+    use_primary_key_as_entity_id: bool = False,
+) -> Tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray | None,
+    np.ndarray | None,
+    np.ndarray | None,
+]:
     if split == "train":
         source = task.train_set
     elif split in {"val", "validation"}:
@@ -190,6 +231,11 @@ def load_task_split(task: DBBRDBTask, split: str) -> Tuple[np.ndarray, np.ndarra
     if source is None:
         raise ValueError(f"Task {task.metadata.name} has no {split} data")
     target_col = task.metadata.target_column
+    fk_cols = [
+        col.name
+        for col in task.metadata.columns
+        if col.dtype == DBBColumnDType.foreign_key and col.name != target_col
+    ]
     feature_cols = [
         col.name
         for col in task.metadata.columns
@@ -198,16 +244,47 @@ def load_task_split(task: DBBRDBTask, split: str) -> Tuple[np.ndarray, np.ndarra
             or col.dtype == DBBColumnDType.category_t
         )
         and col.name != target_col
-        # # If a column is feature includes max, min, sum, remove it
-        # and not any(sub in col.name for sub in ("MAX", "MIN", "SUM"))
     ]
-    # print(feature_cols)
     if not feature_cols:
         raise ValueError(f"Task {task.metadata.name} has no feature columns")
     feature_cols.sort()
     X = np.column_stack([source[col] for col in feature_cols]).astype(np.float32)
     y = np.asarray(source[target_col])
-    return X, y
+
+    # Extract raw FK values for attention bias (not in X)
+    fk_values = None
+    if fk_cols:
+        fk_parts = []
+        for fk_name in fk_cols:
+            fk_raw = source[fk_name].astype(np.float64)
+            fk_raw = np.nan_to_num(fk_raw, nan=-1).astype(np.int64)
+            fk_parts.append(fk_raw)
+        fk_values = np.column_stack(fk_parts)
+
+    # Extract entity_ids for same-entity attention bias (not in X)
+    entity_ids = None
+    if "entity_id" in source:
+        entity_raw = source["entity_id"].astype(np.float64)
+        entity_ids = np.nan_to_num(entity_raw, nan=-1).astype(np.int64)
+    elif use_primary_key_as_entity_id:
+        primary_key_cols = [
+            col.name
+            for col in task.metadata.columns
+            if col.dtype == DBBColumnDType.primary_key and col.name in source
+        ]
+        if primary_key_cols:
+            entity_raw = source[primary_key_cols[0]].astype(np.float64)
+            entity_ids = np.nan_to_num(entity_raw, nan=-1).astype(np.int64)
+
+    # Extract parent_entity_ids for entity-level FK matching (not in X)
+    # Shape: (total_rows, K) where K is number of FK relations, -1 for null.
+    # These may not exist in eval datasets (only in H5 training data).
+    parent_entity_ids = None
+    if "parent_entity_ids" in source:
+        peids_raw = source["parent_entity_ids"].astype(np.float64)
+        parent_entity_ids = np.nan_to_num(peids_raw, nan=-1).astype(np.int64)
+
+    return X, y, fk_values, entity_ids, parent_entity_ids
 
 
 def downsample_split(
@@ -221,14 +298,32 @@ def downsample_split(
 
 
 def predict_proba_in_chunks(
-    classifier, X: np.ndarray, chunk_size: int | None
+    classifier,
+    X: np.ndarray,
+    chunk_size: int | None,
+    fk_values_test: np.ndarray | None = None,
+    entity_ids_test: np.ndarray | None = None,
+    parent_entity_ids_test: np.ndarray | None = None,
 ) -> np.ndarray:
     if chunk_size is None or len(X) <= chunk_size:
-        return classifier.predict_proba(X)
+        return classifier.predict_proba(
+            X,
+            fk_values_test=fk_values_test,
+            entity_ids_test=entity_ids_test,
+            parent_entity_ids_test=parent_entity_ids_test,
+        )
     probs = []
     for start in range(0, len(X), chunk_size):
         end = start + chunk_size
-        probs.append(classifier.predict_proba(X[start:end]))
+        fk_chunk = fk_values_test[start:end] if fk_values_test is not None else None
+        eid_chunk = entity_ids_test[start:end] if entity_ids_test is not None else None
+        peid_chunk = parent_entity_ids_test[start:end] if parent_entity_ids_test is not None else None
+        probs.append(classifier.predict_proba(
+            X[start:end],
+            fk_values_test=fk_chunk,
+            entity_ids_test=eid_chunk,
+            parent_entity_ids_test=peid_chunk,
+        ))
     return np.concatenate(probs, axis=0)
 
 
@@ -376,6 +471,78 @@ def save_results_to_csv(
     df = build_results_dataframe(all_model_results, metric_key=metric_key)
     df.to_csv(output_path, index=False)
     logger.info("Results saved to %s", output_path)
+
+
+PER_SEED_RESULT_COLUMNS = [
+    "model",
+    "dataset",
+    "task",
+    "seed",
+    "metric",
+    "metric_value",
+    "accuracy",
+    "balanced_acc",
+]
+
+
+def derive_per_seed_output_path(output_path: Path) -> Path:
+    """Return the detail CSV path alongside an aggregate result CSV."""
+    return output_path.with_name(f"{output_path.stem}_per_seed{output_path.suffix}")
+
+
+def build_per_seed_results_dataframe(
+    all_model_results: dict[str, list[dict]],
+) -> pd.DataFrame:
+    """Build one row per model, task, and evaluation seed."""
+    rows = []
+    for model_label, results in all_model_results.items():
+        for result in results:
+            rows.append(
+                {
+                    "model": simplify_model_label(model_label),
+                    "dataset": result["dataset"],
+                    "task": result["task"],
+                    "seed": result["seed"],
+                    "metric": result["metric"],
+                    "metric_value": result["metric_value"],
+                    "accuracy": result["accuracy"],
+                    "balanced_acc": result["balanced_acc"],
+                }
+            )
+    dataframe = pd.DataFrame(rows, columns=PER_SEED_RESULT_COLUMNS)
+    if not dataframe.empty:
+        dataframe = dataframe.sort_values(
+            ["model", "dataset", "task", "seed"], kind="stable"
+        ).reset_index(drop=True)
+    return dataframe
+
+
+def save_per_seed_results_to_csv(
+    all_model_results: dict[str, list[dict]], output_path: Path
+) -> None:
+    dataframe = build_per_seed_results_dataframe(all_model_results)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    dataframe.to_csv(output_path, index=False)
+    logger.info("Per-seed results saved to %s", output_path)
+
+
+def append_per_seed_results_to_csv(
+    all_model_results: dict[str, list[dict]], output_path: Path
+) -> None:
+    new_dataframe = build_per_seed_results_dataframe(all_model_results)
+    if output_path.exists():
+        existing_dataframe = pd.read_csv(output_path)
+        combined = pd.concat([existing_dataframe, new_dataframe], ignore_index=True)
+        combined = combined.drop_duplicates(
+            subset=["model", "dataset", "task", "seed"], keep="last"
+        )
+        combined = combined.sort_values(
+            ["model", "dataset", "task", "seed"], kind="stable"
+        ).reset_index(drop=True)
+        combined.to_csv(output_path, index=False)
+        logger.info("Appended per-seed results to %s", output_path)
+    else:
+        save_per_seed_results_to_csv(all_model_results, output_path)
 
 
 def build_results_dataframe(

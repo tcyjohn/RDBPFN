@@ -1,5 +1,4 @@
 from __future__ import annotations
-import torch
 
 import logging
 import os
@@ -8,6 +7,7 @@ from pathlib import Path
 from typing import Literal, Sequence
 
 import hydra
+import torch
 import wandb
 import schedulefree
 from hydra.utils import to_absolute_path
@@ -23,7 +23,7 @@ from .models import (
 )
 from .training import ColumnModificationConfig, train
 from accelerate import Accelerator
-from accelerate.utils import set_seed
+from accelerate.utils import DistributedDataParallelKwargs, set_seed
 
 from .utils import set_randomness_seed
 
@@ -50,8 +50,9 @@ class TrainConfig:
     num_steps: int = 10000
     num_epochs: int = 1
     batch_size: int = 32
-    lr: float = 4e-3
+    lr: float = 3e-4
     weight_decay: float = 0.0
+    warmup_fraction: float = 0.03  # Fraction of total steps for linear warmup (TabPFN convention)
     steps_per_eval: int = 100
     augment_times: int = 0
     augment_split_ratio_range: tuple[float, float] = (0.1, 0.9)
@@ -70,6 +71,10 @@ class TrainConfig:
     )
     num_gpus: int | None = None
     gradient_accumulation_steps: int = 1
+    full_eval_steps: int = 0  # Run full relational eval every N steps (0=disabled)
+    full_eval_dataset_dir: str = ""  # Dir of DBBRDBDataset subdirs (e.g. rdb_datasets)
+    full_eval_seeds: list[int] = field(default_factory=lambda: [0])
+    run_final_eval: bool = True
 
 
 @dataclass
@@ -97,6 +102,19 @@ def _resolve_path(path_str: str | None) -> Path | None:
     if path_str in (None, ""):
         return None
     return Path(to_absolute_path(path_str))
+
+
+def _optimizer_steps_to_data_steps(
+    optimizer_steps: int,
+    num_processes: int,
+    gradient_accumulation_steps: int,
+) -> int:
+    """Expand optimizer updates into the global dataloader iteration budget."""
+    return (
+        int(optimizer_steps)
+        * max(1, num_processes)
+        * max(1, gradient_accumulation_steps)
+    )
 
 
 def _validate_model_config(model_cfg: ModelConfig):
@@ -172,7 +190,10 @@ def _log_training_schedule(train_cfg: TrainConfig, world_size: int):
 @hydra.main(config_path="../conf_train", config_name="config", version_base=None)
 def main(cfg: Config):
     grad_accum_steps = max(1, int(getattr(cfg.train, "gradient_accumulation_steps", 1)))
-    accelerator = Accelerator(gradient_accumulation_steps=grad_accum_steps)
+    accelerator = Accelerator(
+        gradient_accumulation_steps=grad_accum_steps,
+        kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)],
+    )
     set_seed(cfg.seed)
     _validate_model_config(cfg.model)
 
@@ -187,13 +208,21 @@ def main(cfg: Config):
         return evaluate_classifier(classifier, eval_splits)
 
     if cfg.wandb.enabled and accelerator.is_main_process:
-        # Force wandb relogin using WANDB_API_KEY from environment
         wandb_api_key = os.environ.get("WANDB_API_KEY")
         if not wandb_api_key:
+            try:
+                import netrc as _netrc
+                _auth = _netrc.netrc(os.path.expanduser("~/.netrc"))
+                _creds = _auth.authenticators("api.wandb.ai")
+                wandb_api_key = _creds[2] if _creds and len(_creds) > 2 else None
+                if wandb_api_key:
+                    logger.info("Read WANDB_API_KEY from ~/.netrc")
+            except Exception:
+                pass
+        if not wandb_api_key:
             raise ValueError(
-                "WANDB_API_KEY environment variable must be set when wandb is enabled"
+                "WANDB_API_KEY must be set via environment variable or ~/.netrc"
             )
-        logger.info("Found WANDB_API_KEY in environment, forcing wandb relogin")
         wandb.login(key=wandb_api_key, relogin=True)
 
         wandb_config = (
@@ -211,16 +240,18 @@ def main(cfg: Config):
     device = accelerator.device
     model = build_model(cfg.model)
     optimizer = schedulefree.AdamWScheduleFree(
-        model.parameters(), lr=cfg.train.lr, weight_decay=cfg.train.weight_decay
+        model.parameters(), lr=cfg.train.lr, weight_decay=cfg.train.weight_decay,
+        betas=(0.95, 0.999),
     )
 
     load_model_path = _resolve_path(cfg.train.load_model_path)
     optimizer_state = None
 
     if load_model_path:
-        optimizer_state = load_checkpoint(
+        ckpt = load_checkpoint(
             model, load_model_path, device, output_log=accelerator.is_main_process
         )
+        optimizer_state = ckpt.get("optimizer_state_dict")
         load_optimizer_state = getattr(cfg.train, "load_optimizer_state", False)
         if not load_optimizer_state:
             optimizer_state = None
@@ -278,6 +309,12 @@ def main(cfg: Config):
     joint_seed = cfg.seed
     world_size = accelerator.num_processes
     shard_id = accelerator.process_index
+    grad_accum_steps = max(
+        1, int(getattr(cfg.train, "gradient_accumulation_steps", 1))
+    )
+    training_data_steps = _optimizer_steps_to_data_steps(
+        cfg.train.num_steps, world_size, grad_accum_steps
+    )
     weights = [entry["weight"] for entry in dataset_entries]
     if any(weight is not None for weight in weights):
         if not all(weight is not None for weight in weights):
@@ -302,7 +339,7 @@ def main(cfg: Config):
         ]
         joint_dataset = JointDataset(
             datasets=datasets,
-            steps_per_epoch=cfg.train.num_steps,
+            steps_per_epoch=training_data_steps,
             batch_size=cfg.train.batch_size,
             weights=loader_weights,
             seed=joint_seed,
@@ -339,7 +376,7 @@ def main(cfg: Config):
         ]
         prior = JointPriorLoader(
             prior_loaders,
-            steps_per_epoch=cfg.train.num_steps,
+            steps_per_epoch=training_data_steps,
             weights=loader_weights,
             seed=cfg.seed,
         )
@@ -382,13 +419,17 @@ def main(cfg: Config):
         per_dataset_group_size=dataset_group_sizes,
         per_dataset_column_modify_config=dataset_column_modify_config,
         accelerator=accelerator,
+        full_eval_steps=cfg.train.full_eval_steps,
+        full_eval_dataset_dir=cfg.train.full_eval_dataset_dir,
+        full_eval_seeds=cfg.train.full_eval_seeds,
     )
-    if accelerator.is_main_process:
+    if accelerator.is_main_process and cfg.train.run_final_eval:
         final_metrics = eval_fn(build_classifier(model, device, cfg.model))
         logger.info("Final evaluation: %s", final_metrics)
         if cfg.wandb.enabled:
             wandb.log({f"final/{k}": v for k, v in final_metrics.items()})
-            wandb.finish()
+    if accelerator.is_main_process and cfg.wandb.enabled:
+        wandb.finish()
 
 
 if __name__ == "__main__":

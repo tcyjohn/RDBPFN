@@ -28,9 +28,10 @@ def trunc_norm_sampler(mu, sigma):
     ).rvs(1)[0]
 
 
-def beta_sampler(a, b):
-    """Creates a sampler for beta distribution with shape parameters a and b."""
-    return lambda: np.random.beta(a, b)
+def beta_sampler(a, b, scale=1.0, shift=0.0):
+    """Creates a sampler for beta distribution with shape parameters a and b,
+    scaled by ``scale`` and shifted by ``shift``:  beta(a,b) * scale + shift."""
+    return lambda: np.random.beta(a, b) * scale + shift
 
 
 def gamma_sampler(a, b):
@@ -84,7 +85,9 @@ class HpSampler(nn.Module):
         elif self.distribution == "uniform":
             self.sampler = uniform_sampler(self.min, self.max)
         elif self.distribution == "beta":
-            self.sampler = beta_sampler(self.a, self.b)
+            scale = getattr(self, "scale", 1.0)
+            shift = getattr(self, "shift", 0.0)
+            self.sampler = beta_sampler(self.a, self.b, scale, shift)
         elif self.distribution == "uniform_int":
             self.sampler = uniform_int_sampler(self.min, self.max)
         else:
