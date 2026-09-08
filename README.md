@@ -1,103 +1,49 @@
 # SA_RDB_PFN
 
-This is a modified research fork of the code for the paper [Relational In-Context Learning via Synthetic Pre-training with Structural Prior](https://arxiv.org/abs/2603.03805). It presents a synthetic pre-training framework for relational-database foundation models.
+A research fork of RDB-PFN for synthetic pretraining on relational databases, based on [Relational In-Context Learning via Synthetic Pre-training with Structural Prior](https://arxiv.org/abs/2603.03805).
 
-The repository is organized as a staged pipeline:
+The relational generator adds HSBM foreign-key sampling, signal-group features, entity temporal snapshots, and task quality filtering. Training and evaluation support optional foreign-key and entity attention biases.
 
-1. Generate synthetic single-table and relational data.
-2. Preprocess generated datasets into training formats.
-3. Pretrain the foundation model and evaluate it on downstream benchmark datasets.
-4. Provide a simple inference interface for applying the model to arbitrary user datasets when needed.
+## Project Layout
 
-## Setup and Current Workflow
+| Directory | Purpose |
+| --- | --- |
+| [data_generation](data_generation/README.md) | Generate relational databases and single-table priors. |
+| [data_preprocessing](data_preprocessing/README.md) | Apply Deep Feature Synthesis (DFS) and build HDF5 training corpora. |
+| [model_pretrain](model_pretrain/README.md) | Train models and evaluate checkpoints or baselines. |
+| [inference](inference/README.md) | Apply the standalone RDBPFN classifier to flat tables. |
+| [scripts](scripts) | Pipeline launchers and experiment utilities. |
 
-The shared environment is defined in [pixi.toml](pixi.toml) and pinned by `pixi.lock` (Linux x86-64, Python 3.10):
-
-```bash
-pixi install
-# Optional for Hugging Face access from mainland China:
-export HF_ENDPOINT=https://hf-mirror.com
-```
-
-This fork adds hierarchical stochastic block model (HSBM) foreign-key sampling, signal-group feature generation, entity temporal snapshots, task quality filtering, and optional FK/entity attention biases. Preprocessing preserves structural metadata through HDF5 loading, training, and evaluation.
+## Environment
 
 From the repository root:
 
 ```bash
-bash scripts/run_pipeline.sh 4 0 my_run
+pixi install
 ```
 
-This runs generation, pre-DFS/DFS/post-DFS preprocessing, HDF5 merging, evaluation CSV preparation, and training. It needs `data_generation/RDB/datasets/rdb_v1.pth` and the initialization checkpoint configured in `model_pretrain/conf_train/RDBPFN_hsbm.yaml`. Read the positional arguments in [scripts/run_pipeline.sh](scripts/run_pipeline.sh) before launching: its CSV preparation stage replaces `model_pretrain/datasets/clf/` contents. Set GPU visibility explicitly for your machine.
+[pixi.toml](pixi.toml) and `pixi.lock` define the shared Linux x86-64 / Python 3.10 environment, including a CUDA 12.4 PyTorch package source. Run commands through `pixi run` to use it. The single-table generator and optional baseline models have additional dependencies described in their READMEs.
 
-See the stage READMEs below for generation-only commands, HDF5 metadata, and row-aligned evaluation. [Generation details](docs/data_generation_pipeline.md) and [evaluation notes](docs/evaluation.md) describe the implementation and evaluation workflow; current code/configs define defaults. Scripts for individual experiments may contain machine-specific paths and checkpoint names; inspect them before reuse.
+For Hugging Face access through a mirror:
 
-Generated datasets, checkpoints, and local experiment outputs are not installed by `pixi install`.
+```bash
+export HF_ENDPOINT=https://hf-mirror.com
+```
 
-## Project Structure
+Environment installation does not download training corpora or create experiment checkpoints. Upstream data are published separately at [yamboo/RDB_PFN](https://huggingface.co/datasets/yamboo/RDB_PFN); fork-specific experiment paths in configs refer to locally generated corpora.
 
-`data_generation/`
-Generates pretraining corpora. It contains two subprojects:
+## Run the Pipeline
 
-- `data_generation/single_table/`: synthetic single-table task generation.
-- `data_generation/RDB/`: synthetic relational database generation.
+Start with the small generation command in [data_generation/README.md](data_generation/README.md), then follow preprocessing and training in order.
 
-`data_preprocessing/`
-Processes generated data into the formats used by pretraining. It supports both single-table and relational workflows.
+The combined launcher [scripts/run_pipeline.sh](scripts/run_pipeline.sh) generates database candidates, runs pre-DFS/DFS/post-DFS processing, merges an HDF5 prior, prepares evaluation CSVs, and starts training. It requires the DAG file `data_generation/RDB/datasets/rdb_v1.pth`, the initialization checkpoint in [RDBPFN_hsbm.yaml](model_pretrain/conf_train/RDBPFN_hsbm.yaml), and enough GPU memory for the configured run. Its evaluation preparation stage replaces the contents of `model_pretrain/datasets/clf/`. Inspect its positional arguments before use. Supply `+train.run_final_eval=true` (or `false`) through its `extra_train_args` argument: the training entry point reads that field, but the HSBM YAML preset does not define it. The stage READMEs provide explicit commands with the required overrides.
 
-`model_pretrain/`
-Contains model configs, training code, evaluation code, baseline model configs, and local paths for datasets/checkpoints.
+| Artifact | Location |
+| --- | --- |
+| Generated relational databases | `data_generation/RDB_datasets/<run_name>/` |
+| DFS outputs | `data_generation/RDB_datasets/<run_name>-processed/` |
+| Training corpus | `model_pretrain/pretrain_datasets/<run_name>.h5` |
+| Training checkpoints | `model_pretrain/checkpoints/<run_name>/` |
+| Evaluation results | `model_pretrain/results/` |
 
-`inference/`
-Provides a standalone lightweight inference package for quick use on flat data.
-
-## Recommended Reading Order
-
-If you are new to the repository, read the documentation in this order:
-
-0. If you only want a quick trial of the released model on your own data, start with [inference/README.md](inference/README.md). This is the lightweight standalone path and does not require understanding the full generation, preprocessing, or pretraining pipeline.
-1. This README for the overall pipeline.
-2. [data_generation/README.md](data_generation/README.md) to generate raw synthetic data.
-3. [data_preprocessing/README.md](data_preprocessing/README.md) to convert raw data into pretraining and evaluation datasets.
-4. [model_pretrain/README.md](model_pretrain/README.md) to evaluate checkpoints or pretrain a model.
-
-We also provide well-processed pretraining datasets and benchmark datasets formatted for our model at [Huggingface](https://huggingface.co/datasets/yamboo/RDB_PFN). You can download them and use them directly for pretraining and evaluation.
-
-## End-to-End Pipeline
-
-### Stage 1: Data Generation
-
-Use `data_generation/single_table/` to build synthetic single-table priors and `data_generation/RDB/` to build synthetic relational databases.
-
-Outputs from this stage include:
-
-- raw single-table batches under `data_generation/single_table_datasets/`
-- raw synthetic RDBs under `data_generation/RDB_datasets/`
-
-### Stage 2: Data Preprocessing
-
-Use `data_preprocessing/` to convert generation outputs or benchmark datasets into `.h5` or benchmark-specific task directories.
-
-Outputs from this stage include:
-
-- pretraining `.h5` files under `model_pretrain/pretrain_datasets/`
-- optional intermediate `.h5` files under `data_preprocessing/RDB_datasets/`
-
-### Stage 3: Model Pretraining and Evaluation
-
-Use `model_pretrain/` to:
-
-- pretrain a single-table initialization model
-- continue to pretrain the final RDB foundation model from the single-table initialization model
-- evaluate RDB_PFN or baseline models on benchmark datasets
-
-## Repository Status
-
-Currently available:
-
-- synthetic single-table generation
-- synthetic RDB generation
-- single-table preprocessing
-- RDB preprocessing
-- model pretraining
-- model evaluation
-- standalone inference
+Individual ablation and queue scripts contain experiment-specific paths and settings; adapt those before reuse. For prediction on your own flat data, use the independent [inference package](inference/README.md).

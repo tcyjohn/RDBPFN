@@ -1,81 +1,69 @@
-# Model Pretraining
+# Model Training and Evaluation
 
-This directory contains the training and evaluation stage for RDB_PFN. It includes:
+Train on HDF5 priors and evaluate checkpoints on relational task directories or flat classification datasets. Commands below start from the repository root unless a different working directory is specified.
 
-- Hydra configs for training and evaluation
-- model implementation and training loops
-- evaluation code for RDB_PFN and baseline models
-- local directories for checkpoints and datasets
-
-## Directory Highlights
-
-- [src/train.py](src/train.py): main pretraining entry point.
-- [src/eval.py](src/eval.py): main evaluation entry point.
-- [conf_train/RDBPFN_single.yaml](conf_train/RDBPFN_single.yaml): single-table pretraining config.
-- [conf_train/RDBPFN.yaml](conf_train/RDBPFN.yaml): final RDB foundation model pretraining config.
-- [conf_eval/dataset](conf_eval/dataset): dataset presets for evaluation.
-- [conf_eval/model](conf_eval/model): model presets for RDB_PFN and baselines.
-
-## Installation
-
-This stage has a dependency manifest at [pyproject.toml](pyproject.toml).
-
-Recommended installation order:
-
-1. Install a `torch` build that matches your machine.
-2. Install the default dependencies in `model_pretrain/`.
-3. Optionally install the extra baseline dependencies.
-
-The default dependency set includes:
-
-- PyTorch
-- Hydra
-- Accelerate
-- `schedulefree`
-- NumPy and scikit-learn
-- AutoGluon
-
-The optional extra `all-baselines` additionally installs:
-
-- TabPFN
-- TabICL
-
-Example commands after installing the correct Torch build:
+## Environment and Data
 
 ```bash
-pip install -e model_pretrain
-pip install -e model_pretrain[all-baselines]
+pixi install
 ```
 
-Torch note:
-
-- `pyproject.toml` intentionally does not install PyTorch automatically.
-- Users should install Torch manually so they can choose the correct CPU or CUDA build for their platform.
-- This avoids mismatches between the installed Torch wheel and the user GPU environment.
-
-LimiX note:
-
-- LimiX is intentionally not included in `pyproject.toml`.
-- If you want to evaluate the LimiX baselines, create a separate environment and follow the guidelines in [LimiX](https://github.com/stableai-org/LimiX).
-
-## Current Fork Entry Points
-
-For the shared Linux environment, run `pixi install` at the repository root. [run_train.py](run_train.py) and [run_eval.py](run_eval.py) are launch wrappers. Additional training presets are:
-
-- [RDBPFN_hsbm.yaml](conf_train/RDBPFN_hsbm.yaml): relational HDF5 training with optional FK/entity attention biases (both enabled in this preset).
-- [RDBPFN_mix_v62_r3.yaml](conf_train/RDBPFN_mix_v62_r3.yaml): source-weighted training from two separate HDF5 corpora, with entity bias enabled and FK bias disabled.
-
-Edit corpus/checkpoint paths before training. For an existing `pretrain_datasets/my_run.h5`, run from the repository root:
+The root Pixi environment supplies the core training dependencies, including PyTorch, Accelerate, Hydra, and `schedulefree`. Optional baselines may require separate dependencies. [pyproject.toml](pyproject.toml) is an alternative pip dependency manifest: it includes AutoGluon but does **not** install PyTorch. In a separate environment, install a suitable PyTorch build first, then use:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 NPROC=2 bash scripts/run_train.sh my_run RDBPFN_hsbm
+python -m pip install -e model_pretrain
+# Additionally install the pinned TabPFN and TabICL baseline packages:
+python -m pip install -e 'model_pretrain[all-baselines]'
 ```
 
-Training now counts `train.num_steps` in optimizer updates. Gradient accumulation and GPU count must be accounted for when comparing against historical runs. Optional structural arrays (`fk_values`, `entity_ids`, `parent_entity_ids`) are passed through the loader and model; enable the bias settings appropriate to the checkpoint and corpus.
+| Input/output | Path relative to `model_pretrain/` |
+| --- | --- |
+| Training priors | `pretrain_datasets/*.h5` |
+| Relational evaluation tasks | `rdb_datasets/<dataset>/` |
+| Flat evaluation datasets | `datasets/clf_real/`, `datasets/clf_rel/` |
+| Checkpoints | `checkpoints/<run>/` |
+| Evaluation results | `results/` |
 
-### Row-Aligned Evaluation
+Generate fork-specific priors using [preprocessing](../data_preprocessing/README.md). Config paths must match your local files. The upstream data collection is [yamboo/RDB_PFN](https://huggingface.co/datasets/yamboo/RDB_PFN); it is not a download source for every fork-specific experiment named in these configs.
 
-Use [src/eval_aligned.py](src/eval_aligned.py) when evaluating structural biases: subsampling applies the same row indices to features, labels, and structural metadata. From the repository root:
+## Training
+
+[run_train.py](run_train.py) launches [src/train.py](src/train.py). Presets in [conf_train](conf_train) specify corpus paths, checkpoint initialization, model settings, and evaluation cadence:
+
+| Preset | Use |
+| --- | --- |
+| `RDBPFN_single` | Single-table initialization from `single_table_stage1.h5`. |
+| `RDBPFN` | Original multi-corpus relational and single-table mixture. |
+| `RDBPFN_hsbm` | One relational corpus; FK and entity biases enabled. |
+| `RDBPFN_mix_v62_r3` | Two separate source corpora; entity bias enabled and FK bias disabled. |
+
+Single-GPU initialization:
+
+```bash
+cd model_pretrain
+CUDA_VISIBLE_DEVICES=0 pixi run torchrun --standalone --nproc_per_node=1 \
+  run_train.py --config-name=RDBPFN_single \
+  +train.full_eval_steps=0 +train.full_eval_dataset_dir=rdb_datasets \
+  '+train.full_eval_seeds=[0]' +train.run_final_eval=true
+```
+
+For an existing `pretrain_datasets/my_run.h5`, run from `model_pretrain/`:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 pixi run torchrun --standalone --nproc_per_node=2 \
+  run_train.py --config-name=RDBPFN_hsbm \
+  train.datasets.0.path=pretrain_datasets/my_run.h5 \
+  train.save_model_path=checkpoints/my_run/model.pt \
+  wandb.enabled=false +train.run_final_eval=true
+```
+
+The explicit `+train.*` arguments supply fields read by the training entry point but absent from these YAML presets. A Python dataclass default does not automatically add a missing Hydra YAML key.
+
+The relational preset initializes from `checkpoints/RDBPFN_single/model_eval00360.pt`; change `train.load_model_path` to your own compatible checkpoint when needed. Set the launcher process count and `train.num_gpus` consistently for your hardware. `train.num_steps` counts optimizer updates; gradient accumulation changes the number of batches consumed per update. Periodic and final evaluation need the datasets selected by the training config. If W&B is enabled, configure its credentials.
+
+## Relational Evaluation
+
+Use [src/eval_aligned.py](src/eval_aligned.py) to keep sampled features, labels, FK values, entity IDs, and parent entity IDs aligned. From the repository root:
 
 ```bash
 cd model_pretrain
@@ -83,126 +71,23 @@ CUDA_VISIBLE_DEVICES=0 pixi run python -m src.eval_aligned \
   dataset=full-512 model=RDBPFN \
   model.checkpoint_path=checkpoints/RDBPFN/model_eval00528.pt \
   'dataset.seeds=[0,1,2]' \
-  model.nanopfn.use_fk_bias=false model.nanopfn.use_entity_bias=false \
-  output_path=results/rdbpfn_full512.csv
+  +output_path=results/rdbpfn_full512.csv
 ```
 
-The example disables the added biases for the original checkpoint. Set them to match a newly trained checkpoint; entity identity also depends on the evaluation dataset metadata. Evaluation writes aggregate results and a companion `*_per_seed.csv`. `model.eval_chunk_size_override` controls prediction chunk size. The [shell wrapper](../scripts/run_eval_aligned.sh) is also available but currently contains a local interpreter path; use the module command above on other machines.
+[full-512.yaml](conf_eval/dataset/full-512.yaml) lists the relational benchmark directories and limits the training context to 512 rows. Other `full-*` presets change that limit. The default `RDBPFN` model config disables FK/entity biases for the original checkpoint. For a checkpoint trained with them, set `model.nanopfn.use_fk_bias` and `model.nanopfn.use_entity_bias` to match the training configuration and provide the required structural metadata.
 
-The examples below document the original training and baseline workflows.
+Evaluation saves an aggregate CSV and a companion `*_per_seed.csv`. Hydra requires `+output_path` because that key is not present in the base YAML. To override chunk size, add `+model.eval_chunk_size_override=500` to the command. Chunk size changes which test rows are processed together and should be kept consistent when comparing runs.
 
-## Data Layout
+## Flat-Table Evaluation
 
-### Pretraining Datasets
-
-Expected under `model_pretrain/pretrain_datasets/`.
-
-Current training configs reference:
-
-- synthetic single-table `.h5` priors
-- synthetic RDB-derived `.h5` priors
-
-### Evaluation Datasets
-
-Expected under `model_pretrain/datasets/` for single-table evaluation or `model_pretrain/rdb_datasets/` for RDB evaluation.
-
-
-### Checkpoints
-
-Checkpoints are expected under `model_pretrain/checkpoints/`.
-
-Two repository-known checkpoint paths are already referenced by configs:
-
-- `checkpoints/RDBPFN_single/`
-- `checkpoints/RDBPFN/`
-
-## Dataset Download Guide
-
-All pretrain required datasets, and evaluation required datasets are provided at [Huggingface](https://huggingface.co/datasets/yamboo/RDB_PFN). You can download them and use them directly for pretraining and evaluation.
-
-## Evaluate a Model
-
-Evaluation is Hydra-based and starts from [src/eval.py](src/eval.py) for RDB and [src/eval_csv.py](src/eval_csv.py) for single-table.
-
-### Example: Evaluate RDBPFN on all RDBs under a given shot number preset
-
-From the repository root:
+From `model_pretrain/`:
 
 ```bash
-cd model_pretrain
-python -m src.eval dataset=full-1024 model=RDBPFN
+CUDA_VISIBLE_DEVICES=0 pixi run python -m src.eval_aligned \
+  --config-name=eval_csv dataset=clf_npz model=RDBPFN \
+  +output_path=results/rdbpfn_clf.csv
 ```
 
-This uses:
+`clf_npz` selects `datasets/clf_real/`; `clf_rel_npz` selects `datasets/clf_rel/`. Inspect their [dataset configs](conf_eval/dataset) for split, sampling, and caching settings. Flat inputs do not supply relational identity metadata.
 
-- the existing dataset preset `conf_eval/dataset/full-1024.yaml`
-- the model preset `conf_eval/model/RDBPFN.yaml`
-
-### Example: Switch Evaluation Shots or Model Presets
-
-```bash
-python -m src.eval dataset=full-512 model=RDBPFN_single
-```
-
-You can swap `model=` to other provided presets such as:
-
-- `RDBPFN`
-- `RDBPFN_single`
-
-- `xgboost`
-- `random_forest`
-- `autogluon-medium`
-
-- `tabpfnv25`
-- `tabpfnv25_lite`
-- `tabpfnv2`
-- `tabiclv11`
-- `tabiclv11_lite`
-- `tabiclv1`
-- `autogluon-mitra`
-- `limix16m`
-- `limix16m_lite`
-- `limix2m`
-
-
-### Example: Evaluation on Single-Table Datasets
-
-```bash
-cd model_pretrain
-python -m src.eval_csv model=RDBPFN dataset=clf_npz
-```
-
-## Pretrain the Model
-
-Training is Hydra-based and starts from [src/train.py](src/train.py).
-
-### Step 1: Pretrain the Single-Table Initialization Model
-
-The single-table config is [conf_train/RDBPFN_single.yaml](conf_train/RDBPFN_single.yaml).
-
-Example:
-
-```bash
-cd model_pretrain
-python -m accelerate.commands.launch --num_processes 1 -m src.train --config-name RDBPFN_single
-```
-
-This stage trains from single-table priors and saves into `checkpoints/RDBPFN_single/`.
-
-### Step 2: Pretrain the Final RDB Foundation Model
-
-The full RDB config is [conf_train/RDBPFN.yaml](conf_train/RDBPFN.yaml).
-
-Example:
-
-```bash
-python -m accelerate.commands.launch --multi_gpu --num_processes 8 -m src.train --config-name RDBPFN
-```
-
-This config currently mixes multiple RDB-derived and single-table-derived `.h5` datasets and initializes from `checkpoints/RDBPFN_single/`.
-
-### Training Notes
-
-- The training is parallelized across multiple GPUs using `accelerate`.
-- We found that training results can vary slightly across machines, so we also provide the final trained model checkpoints.
-- If `wandb.enabled=true`, `WANDB_API_KEY` must be set in the environment.
+Baseline presets are in [conf_eval/model](conf_eval/model). Choose a preset with `model=<name>` after installing its dependencies. The standalone LimiX baselines require their own environment. [scripts/run_eval_aligned.sh](../scripts/run_eval_aligned.sh) is an experiment wrapper with a machine-specific interpreter path; the module commands above avoid that path.
