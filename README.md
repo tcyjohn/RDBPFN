@@ -1,4 +1,4 @@
-# RDB_PFN
+# SA_RDB_PFN
 
 This is a modified research fork of the code for the paper [Relational In-Context Learning via Synthetic Pre-training with Structural Prior](https://arxiv.org/abs/2603.03805). It presents a synthetic pre-training framework for relational-database foundation models.
 
