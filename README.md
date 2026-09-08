@@ -29,7 +29,7 @@ bash scripts/run_pipeline.sh 4 0 my_run
 
 This runs generation, pre-DFS/DFS/post-DFS preprocessing, HDF5 merging, evaluation CSV preparation, and training. It needs `data_generation/RDB/datasets/rdb_v1.pth` and the initialization checkpoint configured in `model_pretrain/conf_train/RDBPFN_hsbm.yaml`. Read the positional arguments in [scripts/run_pipeline.sh](scripts/run_pipeline.sh) before launching: its CSV preparation stage replaces `model_pretrain/datasets/clf/` contents. Set GPU visibility explicitly for your machine.
 
-See the stage READMEs below for generation-only commands, HDF5 metadata, and row-aligned evaluation. [Generation details](docs/data_generation_pipeline.md) and [evaluation notes](docs/evaluation.md) contain implementation and historical experiment details; current code/configs define defaults. Scripts for individual experiments may contain machine-specific paths and checkpoint names; inspect them before reuse.
+See the stage READMEs below for generation-only commands, HDF5 metadata, and row-aligned evaluation. [Generation details](docs/data_generation_pipeline.md) and [evaluation notes](docs/evaluation.md) describe the implementation and evaluation workflow; current code/configs define defaults. Scripts for individual experiments may contain machine-specific paths and checkpoint names; inspect them before reuse.
 
 Generated datasets, checkpoints, and local experiment outputs are not installed by `pixi install`.
 

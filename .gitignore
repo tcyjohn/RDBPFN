@@ -39,3 +39,33 @@ model_pretrain/wandb/
 /model_pretrain/nohup.out
 /.superpowers/
 /aaai2027_submission/local_texlive/
+
+# Local assistant state, planning notes, and historical backups
+/.agent/
+/.agents/
+/.claude/
+/.codex/
+/.archive/
+/.planning/
+/AGENTS.md
+/CLAUDE.md
+/CONTEXT.md
+/findings.md
+/handoff.md
+/progress.md
+/summary.md
+/task_plan.md
+/docs/adr/
+/docs/superpowers/
+/docs/r3_r2_data_analysis/
+/docs/journey.md
+/docs/signal-group-feature-gen-journey.md
+/docs/generation_pipeline_differences.md
+/docs/modified_generation_pipeline_current.md
+/docs/original_rdbpfn_generation_pipeline_main.md
+
+# Local manuscript and review material
+/aaai2027_submission/
+/paper_draft.md
+/prelim_to_method_symbol_consistency_errors.md
+/review_opinion.txt

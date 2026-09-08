@@ -1,3 +1,0 @@
-# Preliminaries owns the relational PFN workflow
-
-An independent Preliminaries section will make the paper self-contained by tracing the full object lifecycle: schema-DAG and table-configuration sampling, parent-before-child row generation, row-level foreign-key and content generation, target construction, cutoff-aware DFS, support/query formation, relational continuation, and frozen real-database inference. Method will begin from these defined objects and explain how SA-RDB-PFN shapes them rather than presenting inherited RDB-PFN stages as local patches. This supersedes ADR-0028's placement of the complete workflow inside Method.
