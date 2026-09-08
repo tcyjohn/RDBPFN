@@ -55,17 +55,12 @@ model_pretrain/wandb/
 /progress.md
 /summary.md
 /task_plan.md
-/docs/adr/
-/docs/superpowers/
-/docs/r3_r2_data_analysis/
-/docs/journey.md
-/docs/signal-group-feature-gen-journey.md
-/docs/generation_pipeline_differences.md
-/docs/modified_generation_pipeline_current.md
-/docs/original_rdbpfn_generation_pipeline_main.md
 
 # Local manuscript and review material
 /aaai2027_submission/
 /paper_draft.md
 /prelim_to_method_symbol_consistency_errors.md
 /review_opinion.txt
+
+# Local documentation and research notes
+/docs/

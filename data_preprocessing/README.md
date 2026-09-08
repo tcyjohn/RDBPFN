@@ -1,128 +1,59 @@
 # Data Preprocessing
 
-This directory converts generated data and benchmark datasets into the formats required for pretraining and evaluation.
+Convert generated relational databases into DFS task tables and HDF5 priors, or merge single-table prior batches into HDF5. Run `pixi install` at the repository root for the shared environment.
 
-It supports two workflows:
+## Relational Workflow
 
-1. single-table preprocessing
-2. relational-database preprocessing
-
-## Installation
-
-This stage is packaged through [pyproject.toml](pyproject.toml).
-
-From the repository root:
+[run_preprocess.py](run_preprocess.py) runs one preprocessing stage at a time. The current pipeline uses a pre-DFS transform, two-hop DFS, and a post-DFS transform. The following commands start from the repository root and process `dag_rdb_0` from the generation example:
 
 ```bash
-cd data_preprocessing
-pip install -e .
-```
+pixi run python data_preprocessing/run_preprocess.py \
+  data_generation/RDB_datasets/my_run/dag_rdb_0 transform \
+  data_generation/RDB_datasets/my_run-tmp/dag_rdb_0-pre \
+  data_preprocessing/configs/transform/pre-dfs.yaml 2
 
-The DFS preprocessing pipeline is partially adapted from the [dbinfer](https://github.com/awslabs/multi-table-benchmark) project. You can also refer to that repository for additional usage details. We gratefully acknowledge their work.
+pixi run python data_preprocessing/run_preprocess.py \
+  data_generation/RDB_datasets/my_run-tmp/dag_rdb_0-pre dfs \
+  data_generation/RDB_datasets/my_run-tmp/dag_rdb_0-dfs \
+  data_preprocessing/configs/dfs/dfs-2-ft.yaml 2
 
-## Directory Highlights
+pixi run python data_preprocessing/run_preprocess.py \
+  data_generation/RDB_datasets/my_run-tmp/dag_rdb_0-dfs transform \
+  data_generation/RDB_datasets/my_run-processed/dag_rdb_0-dfs-2 \
+  data_preprocessing/configs/transform/post-dfs.yaml 2
 
-- [single_table_processing.sh](single_table_processing.sh): merges generated single-table batches into `.h5` priors.
-- [RDB_processing.sh](RDB_processing.sh): end-to-end relational preprocessing pipeline.
-- [merge_icl_batches_to_h5.py](merge_icl_batches_to_h5.py): merges single-table generation outputs into `.h5`.
-- [merge_dbinfer_to_h5.py](merge_dbinfer_to_h5.py): converts processed RDB tasks into `.h5`.
-- [filter_h5_sampling_columns.py](filter_h5_sampling_columns.py): downsamples columns from unsampled `.h5` files.
-
-## Current Fork Workflow and Structural Metadata
-
-Use `pixi install` at the repository root for the shared environment. [../scripts/run_pipeline.sh](../scripts/run_pipeline.sh) invokes [run_preprocess.py](run_preprocess.py) in three stages: pre-DFS transform, DFS, and post-DFS transform. It writes processed databases under `data_generation/RDB_datasets/<run_name>-processed/` and the merged prior to `model_pretrain/pretrain_datasets/<run_name>.h5`.
-
-To merge an already processed corpus from the repository root:
-
-```bash
 pixi run python data_preprocessing/merge_dbinfer_to_h5.py \
   --dataset-root data_generation/RDB_datasets/my_run-processed \
   --output model_pretrain/pretrain_datasets/my_run.h5 \
   --total-rows 600 --max-columns 90
 ```
 
-The updated DFS configs preserve identity information. The merge step carries `fk_values`, `entity_ids`, and, when available, `parent_entity_ids` alongside features and targets. `parent_entity_ids` maps parent rows to entities so temporal snapshots of the same parent can match at entity level. Missing identity values use `-1`; preserve the same row selection for features, labels, and structural arrays. Older HDF5 corpora may lack these fields and should not be assumed to provide entity-level FK matching.
+Repeat the three preprocessing stages for other generated databases before merging. DFS depth is configured by the YAML's `max_depth`; the final positional argument is accepted by the wrapper but does not override that setting. [scripts/run_pipeline.sh](../scripts/run_pipeline.sh) automates the multi-database workflow and also launches training.
 
-The scripts below retain the original single-table and RDB preprocessing schedules.
+The merger samples task rows and columns. Its optional structural arrays include `fk_values`, `entity_ids`, and `parent_entity_ids`. Parent entity IDs map FK targets to entities across temporal snapshots. Missing identity values use `-1`; features, targets, and structural arrays must keep the same row order. Older corpora may lack this metadata.
 
-## Workflow 1: Single-Table Preprocessing
+Use repeated `--dataset-root` arguments to merge multiple processed corpora. Run the merger with `--help` for row counts, train-split ratios, column limits, and feature-importance options.
 
-### Purpose
+## Single-Table Workflow
 
-This workflow takes raw synthetic single-table batches and merges them into pretraining-ready `.h5` datasets.
-
-### Input
-
-Expected default inputs:
-
-- `../data_generation/single_table_datasets/single_table_stage1`
-- `../data_generation/single_table_datasets/single_table_stage2`
-
-These are produced by [../data_generation/single_table/single_table_generate.sh](../data_generation/single_table/single_table_generate.sh).
-
-### Output
-
-Default outputs:
-
-- `../model_pretrain/pretrain_datasets/single_table_stage1.h5`
-- `../model_pretrain/pretrain_datasets/single_table_stage2.h5`
-
-### Usage
+After generating `single_table_stage1/` and `single_table_stage2/`, run from the repository root:
 
 ```bash
 cd data_preprocessing
-bash single_table_processing.sh
+pixi run bash single_table_processing.sh
 ```
 
-### What the Script Does
+[single_table_processing.sh](single_table_processing.sh) calls [merge_icl_batches_to_h5.py](merge_icl_batches_to_h5.py) and writes:
 
-- reads synthetic batch directories
-- merges them into `.h5`
-- writes pretraining-ready files into `model_pretrain/pretrain_datasets/`
+- `model_pretrain/pretrain_datasets/single_table_stage1.h5`: 600 rows, 18 features.
+- `model_pretrain/pretrain_datasets/single_table_stage2.h5`: 600 rows, 30 features.
 
-## Workflow 2: RDB Preprocessing
+These paths are relative to the repository root; the script itself runs from `data_preprocessing/`.
 
-### Purpose
+## Other Entry Points
 
-This workflow converts raw synthetic RDBs into:
+- [RDB_processing.sh](RDB_processing.sh) retains the original fixed corpus schedule; its dataset names differ from the `my_run` example.
+- [filter_h5_sampling_columns.py](filter_h5_sampling_columns.py) downsamples columns in an existing HDF5 corpus.
+- DFS preprocessing uses code adapted from DBInfer.
 
-- processed task directories produced by the DFS-based preprocessing pipeline.
-- intermediate unsampled `.h5` files
-- final sampled `.h5` files used for RDB_PFN pretraining
-
-### Input
-
-Expected default inputs are the raw RDB directories generated under:
-
-- `../data_generation/RDB_datasets/`
-
-### Output
-
-Default outputs include:
-
-- intermediate `.h5` files under `RDB_datasets/`
-- sampled pretraining `.h5` files under `../model_pretrain/pretrain_datasets/`
-
-### Usage
-
-```bash
-cd data_preprocessing
-bash RDB_processing.sh
-```
-
-### What the Script Does
-
-The current pipeline performs two stages:
-
-1. It runs DFS-based preprocessing on each raw RDB directory.
-2. It converts the processed outputs into `.h5`, then downsamples columns into final pretraining datasets.
-
-Note the DFS preprocessing can take hundreds of hours to complete. You can modify the script to run on a subset of the datasets for testing.
-
-## Handoff to Model Pretraining
-
-After preprocessing:
-
-1. Use `model_pretrain/pretrain_datasets/` as the training corpus for pretraining.
-2. Use benchmark-ready dataset directories under `model_pretrain/rdb_datasets/` for evaluation.
-3. Continue with [../model_pretrain/README.md](../model_pretrain/README.md).
+Continue with [model_pretrain/README.md](../model_pretrain/README.md). Training corpora and evaluation datasets are separate inputs; creating a training HDF5 file does not populate the benchmark directories.
