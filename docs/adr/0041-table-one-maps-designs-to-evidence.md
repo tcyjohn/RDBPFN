@@ -1,3 +1,0 @@
-# Table 1 maps DFS-facing designs to evidence
-
-Table 1 will map each DFS-facing need to its prior design and predefined observable signature rather than compare inherited RDB-PFN components against local SA-RDB-PFN changes. Reachability, availability, and content dependence occupy the three semantic-mechanism rows; source-row cardinality appears after a visual separator as the fourth dimension of the complete relational prior, with row-count accounting and predictive sensitivity as its evidence. This design-to-evidence map connects Method predictions directly to Results measurements and supersedes ADR-0021's inherited-versus-SA method table.

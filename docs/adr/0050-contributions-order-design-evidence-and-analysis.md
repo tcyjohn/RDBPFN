@@ -1,3 +1,0 @@
-# Contributions order prior design, predictive evidence, and mechanism analysis
-
-The Introduction states three contributions in order: a complete relational prior with three semantic structural mechanisms and a source-row cardinality dimension; compact-corpus predictive evidence against the original-prior control with the published checkpoint as a scale reference; and analysis of induced mechanisms and selected prior dimensions through generated-RDB signatures, DFS-task evidence, and cardinality/grouped-source sensitivity. This order establishes the method, then its utility, then the deeper analysis.
